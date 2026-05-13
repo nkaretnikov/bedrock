@@ -127,13 +127,13 @@ impl<'a, X: Vmx, const MAX_VMS: usize> BedrockHandler<'a, X, MAX_VMS> {
     #[cfg(not(feature = "cargo"))]
     pub fn add_vm(&mut self, vm: ParentVmArc) {
         let entry = VmEntry::new(vm.vm_id(), vm);
-        heap_vec_push(&mut self.vm_list, entry);
+        let _ = heap_vec_push(&mut self.vm_list, entry);
     }
 
     #[cfg(feature = "cargo")]
     pub fn add_vm<T>(&mut self, vm: NonNull<T>, vm_id: u64) {
         let entry = VmEntry::new(vm_id, VmRef::new(vm));
-        heap_vec_push(&mut self.vm_list, entry);
+        let _ = heap_vec_push(&mut self.vm_list, entry);
     }
 
     /// Remove a VM from the tracking list.
