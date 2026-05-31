@@ -108,7 +108,7 @@ static int generate_block(uint8_t *hash_out) {
     // [
     //   "0000000000000000000..."
     // ]
-    fp = popen("bitcoin-cli -regtest -rpcuser=user -rpcpassword=password -rpcport=18443 "
+    fp = popen("bitcoin-cli -regtest -rpcconnect=bitcoind1 -rpcuser=user -rpcpassword=password -rpcport=18443 "
                "generatetoaddress 1 2N9hLwkSqr1cPQAPxbrGVUjxyjD11G2e1he 2>&1", "r");
     if (fp == NULL) {
         perror("popen failed");
