@@ -250,15 +250,15 @@ where
         .prepare()
         .map_err(VmRunError::InstructionCounter)?;
 
-    // Configure VMCS auto-save/load of the instruction counter MSRs. The CPU
-    // stores the canonical counter on VM exit and reloads it through the
-    // full-width write alias on VM entry, so any host-side ticks (e.g. from a perf NMI re-enabling
+    // Configure VMCS auto-save/load of the instruction counter MSR. The CPU
+    // stores the counter into the entry on VM exit and reloads it on VM
+    // entry, so any host-side ticks (e.g. from a perf NMI re-enabling
     // PERF_GLOBAL_CTRL.bit32) are wiped on the next entry. Without this, the
     // count between VM exits is non-deterministic when perf's NMI handler
     // runs, since perf's `__intel_pmu_enable_all` rewrites GLOBAL_CTRL based
     // on `intel_ctrl_guest_mask` — which doesn't include our counter when
     // we're not registered with perf.
-    if let Some(entry_phys) = ctx.state().instruction_counter.msr_exit_store_entry_phys() {
+    if let Some(entry_phys) = ctx.state().instruction_counter.msr_save_load_entry_phys() {
         let _ = ctx
             .state()
             .vmcs
@@ -267,8 +267,6 @@ where
             .state()
             .vmcs
             .write32(VmcsField32::VmExitMsrStoreCount, 1);
-    }
-    if let Some(entry_phys) = ctx.state().instruction_counter.msr_entry_load_entry_phys() {
         let _ = ctx
             .state()
             .vmcs
