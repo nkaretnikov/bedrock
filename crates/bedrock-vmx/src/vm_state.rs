@@ -25,11 +25,9 @@ pub type FeedbackBuffersBox = VmallocBox<FeedbackBuffersArray>;
 /// writes the value field of each entry; the index field is set once at
 /// VmState construction by `init_pebs_entry_msr_indexes`.
 ///
-/// Entry 0 is `IA32_A_PMC0` so that armed iterations preserve the
-/// instruction-counter's auto-reload semantics: while armed, the entry-load
-/// list is repointed from the instruction counter's load-entry page to this
-/// page, and entry 0's value is filled from the instruction counter's saved
-/// exit-store value before each VM-entry.
+/// Entry 0 is `IA32_PMC0` with value zero so armed iterations preserve the
+/// instruction counter's per-entry delta semantics while this page replaces
+/// its normal VM-entry load list.
 ///
 /// `IA32_PERF_GLOBAL_STATUS_RESET` clears any lingering overflow bits before
 /// PEBS is re-enabled — without this the architecture flushes a buffered
@@ -47,12 +45,10 @@ pub type FeedbackBuffersBox = VmallocBox<FeedbackBuffersArray>;
 /// re-enable writes satisfies the rule.
 ///
 /// The PEBS counter is `IA32_FIXED_CTR0`; the IC is on `IA32_PMC0`. Entry
-/// 0 preserves the IC value across PEBS-armed iterations using the
-/// full-width-write alias `IA32_A_PMC0` — writes via plain `IA32_PMC0`
-/// truncate to 32 bits and sign-extend from bit 31, which garbles the
-/// counter once it exceeds ~2.1 billion (SDM Vol 3B 21.2.8).
+/// 0 resets the IC hardware delta to zero. The cumulative count is maintained
+/// in software, so no full-width counter value needs to be reloaded.
 pub const PEBS_ENTRY_MSR_INDEXES: [u32; 9] = [
-    msr::IA32_A_PMC0,
+    msr::IA32_PMC0,
     msr::IA32_PERF_GLOBAL_CTRL,
     msr::IA32_FIXED_CTR0,
     msr::IA32_FIXED_CTR_CTRL,

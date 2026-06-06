@@ -7,12 +7,11 @@
 //! achieved by hooking the counter MSR into the VMCS VM-exit MSR-store list
 //! and VM-entry MSR-load lists, so:
 //!
-//! * On VM exit, the CPU atomically saves canonical `IA32_PMC0` into the
-//!   exit-store entry before any host code runs.
-//! * The host copies that value to an entry-load entry for `IA32_A_PMC0`, the
-//!   full-width write alias.
-//! * On the next VM entry, the CPU atomically reloads the saved value, wiping
-//!   any ticks the host counter accumulated in between.
+//! * Each VM entry atomically resets canonical `IA32_PMC0` to zero.
+//! * On VM exit, the CPU atomically saves that iteration's delta before any
+//!   host code runs.
+//! * The host adds each delta to a software `u64` total. Hardware never has
+//!   to round-trip a large cumulative value.
 //!
 //! `IA32_PMC0` is used here (rather than the more obvious `IA32_FIXED_CTR0`)
 //! because the precise-VM-exit PEBS facility wants `IA32_FIXED_CTR0` for its
@@ -26,18 +25,10 @@
 use super::page::{alloc_zeroed_page, KernelPage};
 use crate::c_helpers;
 use crate::vmx::traits::{InstructionCounter, InstructionCounterError};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Canonical read MSR for general-purpose counter 0.
 const IA32_PMC0: u32 = 0xC1;
-/// Full-width-write alias for general-purpose counter 0. `WRMSR` to
-/// `IA32_PMC0` itself truncates the input to 32
-/// bits and sign-extends from bit 31, which garbles the counter once
-/// the value crosses ~2.1 billion. Writing through `IA32_A_PMC0` writes
-/// all physical counter bits directly. Available when
-/// `IA32_PERF_CAPABILITIES.FULL_WRITE` (bit 13) is set; required by the
-/// VMCS auto-load round-trip the IC depends on. See SDM Vol 3B Section
-/// 21.2.8.
-const IA32_A_PMC0: u32 = 0x4C1;
 /// Performance event-select register for `IA32_PMC0`.
 const IA32_PERFEVTSEL0: u32 = 0x186;
 /// Global enable for performance counters (SDM Vol 4 Table 2-2).
@@ -107,10 +98,12 @@ fn wrmsr(addr: u32, value: u64) -> Result<(), InstructionCounterError> {
 pub(crate) struct LinuxInstructionCounter {
     /// VM-exit store entry for canonical `IA32_PMC0` reads.
     msr_exit_store_page: Option<KernelPage>,
-    /// VM-entry load entry for full-width `IA32_A_PMC0` writes.
+    /// VM-entry load entry that resets canonical `IA32_PMC0` to zero.
     msr_entry_load_page: Option<KernelPage>,
     /// Mask for the architectural GP counter width from CPUID leaf 0xA.
     counter_mask: u64,
+    /// Cumulative guest instructions from consumed per-entry PMC deltas.
+    total: AtomicU64,
     /// Saved `IA32_PERFEVTSEL0`, captured in `prepare`, restored in `finish`.
     saved_perfevtsel0: u64,
     /// Value the CPU loads into `IA32_PERF_GLOBAL_CTRL` on VM entry.
@@ -154,7 +147,7 @@ impl LinuxInstructionCounter {
                     core::ptr::write(
                         entry_load.virt.as_u64() as *mut MsrListEntry,
                         MsrListEntry {
-                            msr_index: IA32_A_PMC0,
+                            msr_index: IA32_PMC0,
                             reserved: 0,
                             msr_data: 0,
                         },
@@ -169,6 +162,7 @@ impl LinuxInstructionCounter {
             msr_exit_store_page,
             msr_entry_load_page,
             counter_mask,
+            total: AtomicU64::new(0),
             saved_perfevtsel0: 0,
             guest_perf_global_ctrl: 0,
             host_perf_global_ctrl: 0,
@@ -179,7 +173,7 @@ impl LinuxInstructionCounter {
     /// Read the MSR-data field of the VMCS list entry. The CPU writes this
     /// atomically on VM exit, so it's the counter value at exit time.
     #[inline]
-    fn saved_counter(&self) -> u64 {
+    fn consume_delta(&self) -> u64 {
         match (
             self.msr_exit_store_page.as_ref(),
             self.msr_entry_load_page.as_ref(),
@@ -187,18 +181,19 @@ impl LinuxInstructionCounter {
             (Some(exit_store), Some(entry_load)) => {
                 // SAFETY: the entry was initialized in `new` and lives as
                 // long as `self`. Between exits, no CPU accesses either page.
-                // Masking matches Linux perf's treatment of raw PMU values:
-                // bits above the CPUID-reported physical width are undefined.
+                // Consume the saved delta exactly once. Clearing the store
+                // slot makes repeated reads between VM entries idempotent.
                 unsafe {
-                    let exit_entry = exit_store.virt.as_u64() as *const MsrListEntry;
+                    let exit_entry = exit_store.virt.as_u64() as *mut MsrListEntry;
                     let entry_load_entry = entry_load.virt.as_u64() as *mut MsrListEntry;
-                    let value =
+                    let delta =
                         core::ptr::read_volatile(&(*exit_entry).msr_data) & self.counter_mask;
-                    core::ptr::write_volatile(&mut (*entry_load_entry).msr_data, value);
-                    value
+                    core::ptr::write_volatile(&mut (*exit_entry).msr_data, 0);
+                    core::ptr::write_volatile(&mut (*entry_load_entry).msr_data, 0);
+                    self.total.fetch_add(delta, Ordering::Relaxed) + delta
                 }
             }
-            _ => 0,
+            _ => self.total.load(Ordering::Relaxed),
         }
     }
 }
@@ -241,11 +236,9 @@ impl InstructionCounter for LinuxInstructionCounter {
     }
 
     fn read(&self) -> u64 {
-        // The MSR-data field grows monotonically across iterations and across
-        // run loops: each VM entry reloads the saved value through
-        // `IA32_A_PMC0`, so guest ticks land back in the canonical exit-store
-        // entry and host ticks between exits are overwritten on the next entry.
-        self.saved_counter()
+        // Each VM exit contributes one hardware delta to the software total.
+        // Repeated reads before the next entry return the same cumulative value.
+        self.consume_delta()
     }
 
     fn is_configured(&self) -> bool {

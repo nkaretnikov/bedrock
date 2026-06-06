@@ -250,10 +250,10 @@ where
         .prepare()
         .map_err(VmRunError::InstructionCounter)?;
 
-    // Configure VMCS auto-save/load of the instruction counter MSRs. The CPU
-    // stores the canonical counter on VM exit and reloads it through the
-    // full-width write alias on VM entry, so any host-side ticks (e.g. from a perf NMI re-enabling
-    // PERF_GLOBAL_CTRL.bit32) are wiped on the next entry. Without this, the
+    // Configure VMCS auto-save/load of the instruction counter MSR. The CPU
+    // stores each guest delta on VM exit and resets the counter to zero on VM
+    // entry, so any host-side ticks (e.g. from a perf NMI re-enabling
+    // PERF_GLOBAL_CTRL.bit32) are discarded. Without this, the
     // count between VM exits is non-deterministic when perf's NMI handler
     // runs, since perf's `__intel_pmu_enable_all` rewrites GLOBAL_CTRL based
     // on `intel_ctrl_guest_mask` — which doesn't include our counter when

@@ -67,9 +67,8 @@ pub trait InstructionCounter {
 
     /// Physical address of the 16-byte VMCS MSR-load entry used on VM entry.
     ///
-    /// This may differ from the exit-store entry when the architecture uses a
-    /// separate full-width write alias. The implementation must keep its value
-    /// synchronized with the most recent exit-store value.
+    /// This may differ from the exit-store entry when the implementation loads
+    /// a reset value rather than round-tripping the saved hardware value.
     #[inline]
     fn msr_entry_load_entry_phys(&self) -> Option<u64> {
         None
