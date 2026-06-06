@@ -42,17 +42,16 @@ const IA32_PERF_GLOBAL_CTRL: u32 = 0x38F;
 const PERFEVTSEL0_INST_RETIRED_ANY_P: u64 = (1u64 << 16) | (1u64 << 17) | (1u64 << 22) | 0xC0;
 /// Bit 0 in `IA32_PERF_GLOBAL_CTRL` enables `IA32_PMC0`.
 const PERF_GLOBAL_CTRL_PMC0: u64 = 1;
-/// Only the low 32 bits of a canonical `IA32_PMC0` VM-exit store are stable
-/// across the nested-PMU implementations Bedrock supports. This is sufficient
-/// because the hardware counter is reset on every VM entry.
-const PMC_DELTA_MASK: u64 = u32::MAX as u64;
 
-#[inline]
-fn normalize_pmc_delta(raw: u64) -> u64 {
-    raw & PMC_DELTA_MASK
+fn pmc_mask(width: u32) -> Option<u64> {
+    match width {
+        1..=63 => Some((1u64 << width) - 1),
+        64 => Some(u64::MAX),
+        _ => None,
+    }
 }
 
-fn architectural_pmc_available() -> bool {
+fn architectural_pmc_mask() -> Option<u64> {
     // CPUID leaf 0xA is architectural. EAX[23:16] reports the GP counter
     // width.
     let eax = core::arch::x86_64::__cpuid(0xA).eax;
@@ -60,7 +59,10 @@ fn architectural_pmc_available() -> bool {
     let counter_count = (eax >> 8) & 0xff;
     let width = (eax >> 16) & 0xff;
 
-    version != 0 && counter_count != 0 && width >= 32
+    if version == 0 || counter_count == 0 {
+        return None;
+    }
+    pmc_mask(width)
 }
 
 /// VMCS MSR-list entry layout (SDM Vol 3C Table 26-16).
@@ -100,6 +102,8 @@ pub(crate) struct LinuxInstructionCounter {
     msr_exit_store_page: Option<KernelPage>,
     /// VM-entry load entry that resets `IA32_PMC0` through its write alias.
     msr_entry_load_page: Option<KernelPage>,
+    /// Mask for the architectural GP counter width from CPUID leaf 0xA.
+    counter_mask: u64,
     /// Cumulative guest instructions from consumed per-entry PMC deltas.
     total: AtomicU64,
     /// Saved `IA32_PERFEVTSEL0`, captured in `prepare`, restored in `finish`.
@@ -120,7 +124,8 @@ unsafe impl Send for LinuxInstructionCounter {}
 
 impl LinuxInstructionCounter {
     pub(crate) fn new() -> Self {
-        let pages = if architectural_pmc_available() {
+        let counter_mask = architectural_pmc_mask().unwrap_or(0);
+        let pages = if counter_mask != 0 {
             alloc_zeroed_page().and_then(|exit_store| {
                 alloc_zeroed_page().map(|entry_load| (exit_store, entry_load))
             })
@@ -158,6 +163,7 @@ impl LinuxInstructionCounter {
         Self {
             msr_exit_store_page,
             msr_entry_load_page,
+            counter_mask,
             total: AtomicU64::new(0),
             saved_perfevtsel0: 0,
             guest_perf_global_ctrl: 0,
@@ -183,7 +189,7 @@ impl LinuxInstructionCounter {
                     let exit_entry = exit_store.virt.as_u64() as *mut MsrListEntry;
                     let entry_load_entry = entry_load.virt.as_u64() as *mut MsrListEntry;
                     let delta =
-                        normalize_pmc_delta(core::ptr::read_volatile(&(*exit_entry).msr_data));
+                        core::ptr::read_volatile(&(*exit_entry).msr_data) & self.counter_mask;
                     core::ptr::write_volatile(&mut (*exit_entry).msr_data, 0);
                     core::ptr::write_volatile(&mut (*entry_load_entry).msr_data, 0);
                     self.total.fetch_add(delta, Ordering::Relaxed) + delta
@@ -263,8 +269,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pmc_delta_ignores_unstable_upper_bits() {
-        assert_eq!(normalize_pmc_delta(0x0000_001b_6fe7_0a4c), 0x6fe7_0a4c);
-        assert_eq!(normalize_pmc_delta(0xffff_ffff_0000_0001), 1);
+    fn pmc_mask_covers_exact_width() {
+        assert_eq!(pmc_mask(0), None);
+        assert_eq!(pmc_mask(32), Some(0xffff_ffff));
+        assert_eq!(pmc_mask(48), Some(0xffff_ffff_ffff));
+        assert_eq!(pmc_mask(64), Some(u64::MAX));
+        assert_eq!(pmc_mask(65), None);
     }
 }
