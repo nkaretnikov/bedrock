@@ -461,7 +461,7 @@ pub fn arm_for_next_iteration<C: VmContext>(ctx: &mut C) {
 /// flushed the previous run's buffered PEBS record into user memory.
 ///
 /// Repoints the VM-entry MSR-load list from the instruction counter's
-/// load-entry page to the PEBS page (which resets `IA32_PMC0` as
+/// load-entry page to the PEBS page (which resets `IA32_A_PMC0` as
 /// entry 0 to start a fresh hardware delta, followed by the PEBS MSRs).
 /// `pebs_post_vm_exit` switches it back so disarmed iterations only pay the
 /// cost of reloading the instruction counter.
@@ -505,7 +505,7 @@ pub fn pebs_pre_vm_entry<C: VmContext, M: MsrAccess>(ctx: &mut C, msr: &M) {
     pebs.host_msrs.pebs_data_cfg = host_pebs_data_cfg;
 
     // Same order as `PEBS_ENTRY_MSR_INDEXES` in vm_state.rs:
-    //   0 IA32_PMC0 = 0              — start a fresh instruction delta
+    //   0 IA32_A_PMC0 = 0            — start a fresh instruction delta
     //   1 IA32_PERF_GLOBAL_CTRL = 0  — disable counters before reconfig
     //   2 IA32_FIXED_CTR0            — counter reload value
     //   3 IA32_FIXED_CTR_CTRL        — enable FC0 in OS+USR

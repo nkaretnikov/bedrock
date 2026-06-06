@@ -29,6 +29,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Canonical read MSR for general-purpose counter 0.
 const IA32_PMC0: u32 = 0xC1;
+/// Full-width write alias used to reset general-purpose counter 0 on VM entry.
+const IA32_A_PMC0: u32 = 0x4C1;
 /// Performance event-select register for `IA32_PMC0`.
 const IA32_PERFEVTSEL0: u32 = 0x186;
 /// Global enable for performance counters (SDM Vol 4 Table 2-2).
@@ -98,7 +100,7 @@ fn wrmsr(addr: u32, value: u64) -> Result<(), InstructionCounterError> {
 pub(crate) struct LinuxInstructionCounter {
     /// VM-exit store entry for canonical `IA32_PMC0` reads.
     msr_exit_store_page: Option<KernelPage>,
-    /// VM-entry load entry that resets canonical `IA32_PMC0` to zero.
+    /// VM-entry load entry that resets `IA32_PMC0` through its write alias.
     msr_entry_load_page: Option<KernelPage>,
     /// Mask for the architectural GP counter width from CPUID leaf 0xA.
     counter_mask: u64,
@@ -147,7 +149,7 @@ impl LinuxInstructionCounter {
                     core::ptr::write(
                         entry_load.virt.as_u64() as *mut MsrListEntry,
                         MsrListEntry {
-                            msr_index: IA32_PMC0,
+                            msr_index: IA32_A_PMC0,
                             reserved: 0,
                             msr_data: 0,
                         },
