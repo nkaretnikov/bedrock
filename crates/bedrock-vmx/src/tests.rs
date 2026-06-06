@@ -195,6 +195,11 @@ fn test_cpuid_leaf_1_feature_flags() {
     // Check ECX feature flags
     let ecx = ctx.gprs().rcx as u32;
     assert_eq!(ecx & (1 << 5), 0, "VMX bit should be hidden from guest");
+    assert_ne!(
+        ecx & (1 << 24),
+        0,
+        "TSC-deadline timer support should be advertised"
+    );
     assert_ne!(ecx & (1 << 31), 0, "Hypervisor bit should be set");
 
     // Check EAX processor signature: Family 6, Model 85, Stepping 7
@@ -205,6 +210,46 @@ fn test_cpuid_leaf_1_feature_flags() {
     assert_eq!(stepping, 7, "Stepping should be 7");
     assert_eq!(model, 85, "Model should be 85 (0x55)");
     assert_eq!(family, 6, "Family should be 6");
+}
+
+#[test]
+fn test_tsc_deadline_msr_read_write() {
+    const IA32_TSC_DEADLINE: u64 = 0x6E0;
+    const DEADLINE: u64 = 0x1234_5678_9ABC_DEF0;
+
+    let mut ctx = MockVmContext::new();
+    ctx.set_exit_qualification(0);
+    ctx.set_guest_rip(0x1000);
+    ctx.set_instruction_len(2);
+
+    ctx.set_exit_reason(ExitReason::MsrWrite);
+    ctx.gprs_mut().rcx = IA32_TSC_DEADLINE;
+    ctx.gprs_mut().rax = DEADLINE & 0xFFFF_FFFF;
+    ctx.gprs_mut().rdx = DEADLINE >> 32;
+
+    let result = handle_exit(&mut ctx, &MockKernel, &mut MockFrameAllocator::new());
+    assert_eq!(result, ExitHandlerResult::Continue);
+    assert_eq!(ctx.state().devices.apic.timer_deadline, DEADLINE);
+    assert_eq!(ctx.get_guest_rip(), Some(0x1002));
+
+    ctx.set_exit_reason(ExitReason::MsrRead);
+    ctx.gprs_mut().rcx = IA32_TSC_DEADLINE;
+
+    let result = handle_exit(&mut ctx, &MockKernel, &mut MockFrameAllocator::new());
+    assert_eq!(result, ExitHandlerResult::Continue);
+    assert_eq!(ctx.gprs().rax, DEADLINE & 0xFFFF_FFFF);
+    assert_eq!(ctx.gprs().rdx, DEADLINE >> 32);
+    assert_eq!(ctx.get_guest_rip(), Some(0x1004));
+
+    ctx.set_exit_reason(ExitReason::MsrWrite);
+    ctx.gprs_mut().rcx = IA32_TSC_DEADLINE;
+    ctx.gprs_mut().rax = 0;
+    ctx.gprs_mut().rdx = 0;
+
+    let result = handle_exit(&mut ctx, &MockKernel, &mut MockFrameAllocator::new());
+    assert_eq!(result, ExitHandlerResult::Continue);
+    assert_eq!(ctx.state().devices.apic.timer_deadline, 0);
+    assert_eq!(ctx.get_guest_rip(), Some(0x1006));
 }
 
 #[test]
