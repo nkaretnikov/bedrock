@@ -42,9 +42,9 @@ pub fn handle_cpuid<C: VmContext>(ctx: &mut C) -> ExitHandlerResult {
             // Clear VMX (bit 5 of ECX) - guest shouldn't see VMX capability
             ecx &= !(1 << 5);
 
-            // Advertise TSC-deadline mode. IA32_TSC_DEADLINE writes are
-            // handled by the emulated local APIC timer.
-            ecx |= 1 << 24;
+            // Clear TSC_DEADLINE_TIMER (bit 24 of ECX) - not supported
+            // Guest will fall back to regular one-shot APIC timer (like bhyve)
+            ecx &= !(1 << 24);
 
             // Set hypervisor present bit (bit 31 of ECX) - indicate we're running in a VM
             ecx |= 1 << 31;

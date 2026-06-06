@@ -47,7 +47,11 @@ pub fn handle_msr_read<C: VmContext>(ctx: &mut C) -> ExitHandlerResult {
             // KVM stores per-vCPU value, bhyve exits to userspace
             0
         }
-        msr::IA32_TSC_DEADLINE => ctx.state().devices.apic.timer_deadline,
+        msr::IA32_TSC_DEADLINE => {
+            // Return 0 - TSC-deadline mode not supported
+            // (CPUID bit 24 is cleared, guest uses regular APIC timer instead)
+            0
+        }
         msr::IA32_MTRRCAP => {
             // MTRR capabilities (like bhyve):
             // - VCNT = 10 (10 variable range MTRRs)
@@ -256,8 +260,8 @@ pub fn handle_msr_write<C: VmContext>(ctx: &mut C) -> ExitHandlerResult {
             // Ignore writes - we don't support TSC adjustment
         }
         msr::IA32_TSC_DEADLINE => {
-            // A zero deadline disarms the timer.
-            ctx.state_mut().devices.apic.timer_deadline = value;
+            // Ignore writes - TSC-deadline mode not supported
+            // (CPUID bit 24 is cleared, guest uses regular APIC timer instead)
         }
         msr::IA32_MTRRCAP => {
             // MTRRcap is read-only, ignore writes (bhyve returns error, we just ignore)
