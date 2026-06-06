@@ -27,11 +27,9 @@ pub type FeedbackBuffersBox = VmallocBox<FeedbackBuffersArray>;
 ///
 /// Entry 0 is `IA32_A_PMC0` so that armed iterations preserve the
 /// instruction-counter's auto-reload semantics: while armed, the entry-load
-/// list is repointed from the instruction counter's single-entry page to this
+/// list is repointed from the instruction counter's load-entry page to this
 /// page, and entry 0's value is filled from the instruction counter's saved
-/// value before each VM-entry. The VM-exit MSR-store list still points at the
-/// instruction counter's page, so that page remains the single source of
-/// truth for the counter value.
+/// exit-store value before each VM-entry.
 ///
 /// `IA32_PERF_GLOBAL_STATUS_RESET` clears any lingering overflow bits before
 /// PEBS is re-enabled — without this the architecture flushes a buffered

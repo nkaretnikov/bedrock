@@ -56,20 +56,22 @@ pub trait InstructionCounter {
     /// Only valid after `prepare` has been called.
     fn perf_global_ctrl_values(&self) -> Option<(u64, u64)>;
 
-    /// Physical address of a single 16-byte VMCS MSR list entry that should be
-    /// hooked into both the VM-exit MSR-store list and the VM-entry MSR-load
-    /// list. The entry's MSR-data field is what `read` returns.
+    /// Physical address of the 16-byte VMCS MSR-store entry used on VM exit.
     ///
-    /// The CPU saves the counter MSR into this entry on VM exit, and reloads
-    /// it on the next VM entry, so anything the host (NMI handlers, perf, …)
-    /// does to the live counter MSR between exits is wiped on the next entry.
-    /// This is what makes the count deterministic without registering a perf
-    /// event for the host's PMU subsystem to coordinate around.
-    ///
-    /// Returns `None` for implementations that don't need VMCS auto-save/load
-    /// (null counters, mocks).
+    /// The CPU saves the counter's canonical read MSR into this entry. Returns
+    /// `None` for implementations that don't need VMCS auto-save/load.
     #[inline]
-    fn msr_save_load_entry_phys(&self) -> Option<u64> {
+    fn msr_exit_store_entry_phys(&self) -> Option<u64> {
+        None
+    }
+
+    /// Physical address of the 16-byte VMCS MSR-load entry used on VM entry.
+    ///
+    /// This may differ from the exit-store entry when the architecture uses a
+    /// separate full-width write alias. The implementation must keep its value
+    /// synchronized with the most recent exit-store value.
+    #[inline]
+    fn msr_entry_load_entry_phys(&self) -> Option<u64> {
         None
     }
 }

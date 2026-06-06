@@ -461,7 +461,7 @@ pub fn arm_for_next_iteration<C: VmContext>(ctx: &mut C) {
 /// flushed the previous run's buffered PEBS record into user memory.
 ///
 /// Repoints the VM-entry MSR-load list from the instruction counter's
-/// single-entry page to the PEBS page (which carries `IA32_PMC0` as
+/// load-entry page to the PEBS page (which carries `IA32_A_PMC0` as
 /// entry 0 to preserve the IC's count, followed by the PEBS MSRs).
 /// `pebs_post_vm_exit` switches it back so disarmed iterations only pay the
 /// cost of reloading the instruction counter.
@@ -571,7 +571,7 @@ pub fn pebs_post_vm_exit<C: VmContext, M: MsrAccess>(ctx: &mut C, msr: &M) {
     // Hand the VM-entry MSR-load list back to the instruction counter so
     // disarmed iterations only reload `IA32_FIXED_CTR0`. If the IC has no
     // backing page (null counter), drop the count to 0 instead.
-    if let Some(ic_phys) = ctx.state().instruction_counter.msr_save_load_entry_phys() {
+    if let Some(ic_phys) = ctx.state().instruction_counter.msr_entry_load_entry_phys() {
         let _ = ctx
             .state()
             .vmcs
