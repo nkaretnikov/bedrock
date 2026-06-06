@@ -85,7 +85,7 @@ pub fn handle_apic_access<C: VmContext>(
     // Handle the access based on direction
     if qual.read {
         // APIC read - get value from emulated APIC and write to destination register
-        let value = read_apic_register(&ctx.state().devices.apic, offset, ctx.state().emulated_tsc);
+        let value = read_apic_register(&ctx.state().devices.apic, offset);
 
         // Write to the destination register (zero-extended, APIC registers are 32-bit)
         let reg_value = u64::from(value);
@@ -128,7 +128,7 @@ pub fn handle_apic_access<C: VmContext>(
 /// Read from an emulated APIC register.
 ///
 /// Intel SDM Vol 3A, Table 12-1 defines the register map.
-fn read_apic_register(apic: &ApicState, offset: u32, current_tsc: u64) -> u32 {
+fn read_apic_register(apic: &ApicState, offset: u32) -> u32 {
     match offset {
         // APIC ID (bits 31:24 contain the ID)
         0x020 => apic.id << 24,
@@ -176,8 +176,8 @@ fn read_apic_register(apic: &ApicState, offset: u32, current_tsc: u64) -> u32 {
         0x370 => apic.lvt_error,
         // Timer Initial Count
         0x380 => apic.timer_initial,
-        // Timer Current Count
-        0x390 => apic_timer_current_count(apic, current_tsc),
+        // Timer Current Count is not modeled; reads return 0.
+        0x390 => 0,
         // Timer Divide Configuration
         0x3E0 => apic.timer_divide,
         // Reserved/unknown registers return 0
@@ -186,21 +186,6 @@ fn read_apic_register(apic: &ApicState, offset: u32, current_tsc: u64) -> u32 {
             0
         }
     }
-}
-
-/// Calculate the APIC timer's current count from its emulated TSC deadline.
-///
-/// The counter decrements once per divided timer tick. Round up partial ticks
-/// so a newly programmed timer reads back its full initial count and reaches
-/// zero only when the deadline has elapsed.
-fn apic_timer_current_count(apic: &ApicState, current_tsc: u64) -> u32 {
-    if apic.timer_deadline == 0 || current_tsc >= apic.timer_deadline {
-        return 0;
-    }
-
-    let remaining = apic.timer_deadline - current_tsc;
-    let divisor = u64::from(apic_timer_divisor(apic.timer_divide));
-    remaining.div_ceil(divisor).min(u64::from(u32::MAX)) as u32
 }
 
 /// Write to an emulated APIC register.
@@ -293,44 +278,6 @@ fn apic_timer_divisor(dcr: u32) -> u32 {
         0b110 => 128,
         0b111 => 1,
         _ => 1,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn apic_timer_current_count_tracks_elapsed_ticks() {
-        let mut apic = ApicState::default();
-        apic.timer_initial = 100;
-        apic.timer_divide = 0; // Divide by 2.
-        apic.timer_deadline = 1_200;
-
-        assert_eq!(apic_timer_current_count(&apic, 1_000), 100);
-        assert_eq!(apic_timer_current_count(&apic, 1_001), 100);
-        assert_eq!(apic_timer_current_count(&apic, 1_002), 99);
-        assert_eq!(apic_timer_current_count(&apic, 1_199), 1);
-        assert_eq!(apic_timer_current_count(&apic, 1_200), 0);
-        assert_eq!(apic_timer_current_count(&apic, 1_201), 0);
-    }
-
-    #[test]
-    fn apic_timer_current_count_honors_divide_by_one() {
-        let mut apic = ApicState::default();
-        apic.timer_initial = 10;
-        apic.timer_divide = 0b1011; // Divide by 1.
-        apic.timer_deadline = 510;
-
-        assert_eq!(apic_timer_current_count(&apic, 500), 10);
-        assert_eq!(apic_timer_current_count(&apic, 505), 5);
-        assert_eq!(apic_timer_current_count(&apic, 510), 0);
-    }
-
-    #[test]
-    fn apic_timer_current_count_is_zero_when_disarmed() {
-        let apic = ApicState::default();
-        assert_eq!(apic_timer_current_count(&apic, 100), 0);
     }
 }
 
