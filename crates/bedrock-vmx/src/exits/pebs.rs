@@ -377,18 +377,28 @@ pub fn arm_for_next_iteration<C: VmContext>(ctx: &mut C) {
     // still catches any case where PEBS skids past or is disarmed.
     let stop_deadline = ctx.state().stop_at_tsc;
 
-    // Pick the earliest of the three pending deadlines. Zero means "no APIC
+    // The start of a single-step TSC range is armed as a precise target so
+    // the first single-step VM-exit lands on `count + tsc_offset == start`
+    // deterministically. Without it, single-stepping begins on whichever
+    // exit first crosses the boundary — possibly a non-deterministic
+    // host-interrupt exit — and two forks start logging at different
+    // instruction counts (their streams then compare as divergent despite
+    // identical guest execution).
+    let single_step_start = super::next_single_step_start_tsc(ctx);
+
+    // Pick the earliest of the pending deadlines. Zero means "no APIC
     // timer arming" (Option-style absence encoded as 0 in the existing
-    // code); `None` means "not pending" for the other two. The chosen
+    // code); `None` means "not pending" for the others. The chosen
     // target plus `apic_vector` are passed into `arm_precise_exit`; the
     // vector field of `PebsAction::InjectInterrupt` is informational (the
     // actual injection on PEBS fire is done by the normal pre-entry path's
     // `check_apic_timer` / `check_io_channel`), so it's fine to reuse the
-    // APIC vector for all three event types.
+    // APIC vector for all event types.
     let chosen_target = [
         Some(apic_deadline).filter(|&t| t != 0),
         io_channel_deadline,
         stop_deadline,
+        single_step_start,
     ]
     .into_iter()
     .flatten()

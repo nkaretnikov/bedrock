@@ -130,6 +130,35 @@ pub(super) fn next_io_channel_exit_count<C: VmContext>(ctx: &C) -> Option<u64> {
     next_io_channel_target_tsc(ctx).map(|t| t.saturating_sub(ctx.state().tsc_offset))
 }
 
+/// Emulated-TSC target at which single-stepping should *begin* for the
+/// configured single-step TSC range, or `None` if no range is configured
+/// or the window has already been entered.
+///
+/// Activating single-step lazily — "enable MTF on the first exit whose
+/// `count + tsc_offset` has crossed `start`" — makes the start point
+/// non-deterministic: whichever exit happens to cross the boundary first
+/// wins, and that can be a non-deterministic host-interrupt VM-exit which
+/// lands at a different instruction count in each fork. The forks then
+/// begin logging at different counts and their per-instruction streams
+/// compare as divergent even though the guest executed identically.
+///
+/// Treating the window start as a precise-exit target — armed by
+/// `arm_for_next_iteration` and approached via the MTF margin in
+/// `update_mtf_state`, exactly like the APIC timer / I/O channel /
+/// `stop_at_tsc` targets — lands the first single-step VM-exit on
+/// `count + tsc_offset == start` deterministically across forks.
+pub(super) fn next_single_step_start_tsc<C: VmContext>(ctx: &C) -> Option<u64> {
+    let (start, _end) = ctx.state().single_step_tsc_range?;
+    let current = ctx.state().last_instruction_count + ctx.state().tsc_offset;
+    (current < start).then_some(start)
+}
+
+/// Instruction-count-space counterpart of `next_single_step_start_tsc`,
+/// for the MTF margin / boundary checks (which work in count space).
+fn next_single_step_start_count<C: VmContext>(ctx: &C) -> Option<u64> {
+    next_single_step_start_tsc(ctx).map(|t| t.saturating_sub(ctx.state().tsc_offset))
+}
+
 /// Width of the MTF single-step window approaching an APIC timer deadline.
 ///
 /// PEBS arms to fire at `target - PEBS_MARGIN`. When the encoded distance
@@ -203,7 +232,8 @@ pub fn update_mtf_state<C: VmContext>(ctx: &mut C) -> Result<(), ExitError> {
     let in_pebs_margin = pebs_registered
         && (in_margin(next_timer_exit_count(ctx))
             || in_margin(next_io_channel_exit_count(ctx))
-            || in_margin(stop_at_count));
+            || in_margin(stop_at_count)
+            || in_margin(next_single_step_start_count(ctx)));
 
     let should_enable = in_single_step || in_pebs_margin;
 
@@ -501,4 +531,44 @@ pub fn handle_exit<C: VmContext, K: Kernel, A: CowAllocator<C::CowPage>>(
     }
 
     result
+}
+
+#[cfg(test)]
+mod single_step_target_tests {
+    use super::*;
+    use crate::tests::MockVmContext;
+
+    /// The single-step window start is armed as a precise-exit target only
+    /// while the guest is still *before* the window, so the first
+    /// single-step exit lands on `count + tsc_offset == start`
+    /// deterministically. Once at/inside the window the range check in
+    /// `update_mtf_state` keeps MTF on and the target falls away.
+    #[test]
+    fn single_step_start_armed_before_window_only() {
+        let mut ctx = MockVmContext::new();
+        // Window: emulated-TSC [10_000, 20_000). With tsc_offset = 1_000 the
+        // count-space start is 10_000 - 1_000 = 9_000.
+        ctx.state_mut().single_step_tsc_range = Some((10_000, 20_000));
+        ctx.state_mut().tsc_offset = 1_000;
+
+        // Before the window: armed at the start in both spaces.
+        ctx.state_mut().last_instruction_count = 5_000; // emulated_tsc = 6_000
+        assert_eq!(next_single_step_start_tsc(&ctx), Some(10_000));
+        assert_eq!(next_single_step_start_count(&ctx), Some(9_000));
+
+        // Exactly at the start: already entered, nothing left to arm.
+        ctx.state_mut().last_instruction_count = 9_000; // emulated_tsc = 10_000
+        assert_eq!(next_single_step_start_tsc(&ctx), None);
+        assert_eq!(next_single_step_start_count(&ctx), None);
+
+        // Inside the window: not armed (the range check keeps MTF on).
+        ctx.state_mut().last_instruction_count = 14_000; // emulated_tsc = 15_000
+        assert_eq!(next_single_step_start_tsc(&ctx), None);
+
+        // No range configured: never armed.
+        ctx.state_mut().single_step_tsc_range = None;
+        ctx.state_mut().last_instruction_count = 5_000;
+        assert_eq!(next_single_step_start_tsc(&ctx), None);
+        assert_eq!(next_single_step_start_count(&ctx), None);
+    }
 }
