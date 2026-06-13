@@ -246,7 +246,42 @@ pub const PEBS_MIN_DELTA: u64 = 257;
 /// always arrives at the requested deadline rather than off-by-one. The
 /// MTF single-step path (`update_mtf_state` in `exits/mod.rs`) takes over
 /// once the count is within `PEBS_MARGIN` of the target.
-pub const PEBS_MARGIN: u64 = 2;
+pub const PEBS_MARGIN: u64 = get_pebs_margin();
+
+/// Returns `PEBS_MARGIN` based on the CPU name in `/proc/cpuinfo` or falls
+/// back to the default. These values were tested on the Bitcoin workload and
+/// should produce 0 timer late injects in the child VM.
+#[allow(clippy::if_same_then_else)]
+const fn get_pebs_margin() -> u64 {
+    let cpuinfo = include_str!("/proc/cpuinfo").as_bytes();
+    if contains(cpuinfo, b"Intel(R) Xeon(R) Gold 5412") {
+        3
+    } else if contains(cpuinfo, b"Intel(R) Xeon(R) Silver 4310") {
+        8
+    } else {
+        8
+    }
+}
+
+/// Returns `true` if `haystack` contains `needle`. This implementation has the
+/// O(n*m) time complexity and should only be used on small inputs.
+const fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let mut i = 0;
+    while i + needle.len() <= haystack.len() {
+        let mut j = 0;
+        while j < needle.len() && haystack[i + j] == needle[j] {
+            j += 1;
+        }
+        if j == needle.len() {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
 
 /// Outcome of arming a precise exit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -985,6 +1020,37 @@ mod tests {
         assert!(!is_pebs_induced(&ept_qual(true, false)));
         // Neither — instruction fetch, normal read fault.
         assert!(!is_pebs_induced(&ept_qual(false, false)));
+    }
+
+    #[test]
+    fn contains_empty_needle_is_always_true() {
+        assert!(contains(b"foo", b""));
+        assert!(contains(b"", b""));
+    }
+
+    #[test]
+    fn contains_empty_haystack_does_not_match_nonempty_needle() {
+        assert!(!contains(b"", b"foo"));
+    }
+
+    #[test]
+    fn contains_haystack_smaller_than_needle_is_false() {
+        assert!(!contains(b"fo", b"foo"));
+    }
+
+    #[test]
+    fn contains_needle_equal_to_haystack_is_true() {
+        assert!(contains(b"foo", b"foo"));
+    }
+
+    #[test]
+    fn contains_finds_needle_in_larger_haystack() {
+        assert!(contains(b"a foo bar", b"foo"));
+    }
+
+    #[test]
+    fn contains_absent_needle_in_larger_haystack_is_false() {
+        assert!(!contains(b"a foo bar", b"fooo"));
     }
 }
 
