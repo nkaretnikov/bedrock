@@ -248,18 +248,19 @@ pub const PEBS_MIN_DELTA: u64 = 257;
 /// once the count is within `PEBS_MARGIN` of the target.
 pub const PEBS_MARGIN: u64 = get_pebs_margin();
 
-/// Returns `PEBS_MARGIN` based on the CPU name in `/proc/cpuinfo` or falls
+/// Returns `PEBS_MARGIN` based on the CPU model in `/proc/cpuinfo` or falls
 /// back to the default. These values were tested on the Bitcoin workload and
 /// should produce 0 timer late injects in the child VM.
 #[allow(clippy::if_same_then_else)]
 const fn get_pebs_margin() -> u64 {
+    // See `intel-family.h` in the Linux source code for model names.
     let cpuinfo = include_str!("/proc/cpuinfo").as_bytes();
-    if contains(cpuinfo, b"Intel(R) Xeon(R) Gold 5412") {
-        3
-    } else if contains(cpuinfo, b"Intel(R) Xeon(R) Silver 4310") {
-        8
+    if contains(cpuinfo, b"\nmodel\t\t: 143\n") {
+        3  // Sapphire Rapids-SP (ex: Xeon Gold 5412U)
+    } else if contains(cpuinfo, b"\nmodel\t\t: 106\n") {
+        8  // Ice Lake-SP (ex: Xeon Silver 4310)
     } else {
-        8
+        8  // default for untested models
     }
 }
 
