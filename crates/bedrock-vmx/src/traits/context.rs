@@ -56,7 +56,7 @@ pub trait VmContext {
     /// this based on how it accesses guest memory.
     ///
     /// Does nothing if there is no pending log entry.
-    fn finalize_log_entry<K: Kernel>(&mut self, kernel: &K);
+    fn finalize_exit_record<K: Kernel>(&mut self, kernel: &K);
 
     // ========== Copy-on-Write Methods ==========
 

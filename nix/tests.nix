@@ -65,15 +65,15 @@ let
       )
       ${pkgs.lib.optionalString (bitcoinInitrd != null) ''
         # Boot podman guest (runs workload, shuts down via VMCALL).
-        # `--io-action vt=100.0:list` exercises the deterministic I/O
-        # channel: at virtual-time 100s the host queues a "list running
-        # containers" request, the guest module receives the IRQ on pin
-        # 9, runs `podman ps`, and returns the container names to the
-        # host.
+        # `--io-action 'vt=100.0:rec:exec:host:podman ps'` exercises the
+        # deterministic I/O channel: at virtual-time 100s the host queues a
+        # bash command, the guest module receives the IRQ on pin 9, runs
+        # `podman ps`, records its combined output into the output feedback
+        # buffer (the `rec:` prefix), and the CLI prints the container names.
         machine.succeed(
           "bedrock-cli -m 5120"
           " -i ${bitcoinInitrd}"
-          " --io-action vt=100.0:list"
+          " --io-action 'vt=100.0:rec:exec:host:podman ps'"
           " ${guestKernel}/vmlinux"
           " >&2"
         )

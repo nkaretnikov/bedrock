@@ -7,9 +7,9 @@
 //! 32-bit aligned at 16-byte boundaries per Intel SDM Vol 3A, Table 12-1.
 
 #[cfg(not(feature = "cargo"))]
-use super::super::logging::{StateHash, Xxh64Hasher};
+use super::super::exit_record::{StateHash, Xxh64Hasher};
 #[cfg(feature = "cargo")]
-use crate::logging::{StateHash, Xxh64Hasher};
+use crate::exit_record::{StateHash, Xxh64Hasher};
 
 /// Default IA32_APIC_BASE value: APIC enabled, BSP, base at 0xFEE00000.
 pub const APIC_BASE_DEFAULT: u64 = 0xFEE0_0900;

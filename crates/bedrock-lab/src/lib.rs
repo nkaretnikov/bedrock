@@ -64,9 +64,9 @@ mod rng;
 mod time;
 mod tree;
 
-pub use bash::{ActionResponse, BashOutput, BashTarget, WorkloadDriver};
-pub use bedrock_vm::{LogConfig, LogEntry, LogMode};
-pub use branch::{Branch, BranchId, RunOutcome};
+pub use bash::{BashOutput, BashTarget};
+pub use bedrock_vm::{EventCategories, EventRecord};
+pub use branch::{Branch, BranchId, EventConfig, ExitCapture, RunOutcome};
 pub use checkpoint::{Checkpoint, CheckpointId, LabOpts};
 pub use error::LabError;
 pub use event::{Event, EventSink};

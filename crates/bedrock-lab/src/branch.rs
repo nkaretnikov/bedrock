@@ -4,16 +4,136 @@
 
 use std::sync::Arc;
 
-use bedrock_vm::{ExitKind, LogConfig, LogEntry, Vm, VmError};
+use bedrock_vm::events::EventKind;
+use bedrock_vm::{
+    EventCategories, EventConfig as VmEventConfig, EventStream, ExitKind, ExitTrigger, Vm, VmError,
+};
 
-use crate::bash::{self, ActionResponse, BashOutput, BashTarget, WorkloadDriver};
+use crate::bash::{self, BashOutput, BashTarget};
 use crate::checkpoint::{Checkpoint, CheckpointId, CheckpointInner};
 use crate::error::{LabError, Result};
-use crate::event::{drain_serial_into_sink, emit_feedback_buffer_registered, Event, PartialLine};
+use crate::event::{emit_feedback_buffer_registered, serial_record_into_sink, Event, PartialLine};
 use crate::inner::{BranchMeta, LabInner};
-use crate::rng::{InputRecording, InputSource, IoInput, RngInput};
+use crate::rng::{InputRecording, InputSource, IoInput};
 use crate::time::VirtTime;
 use crate::tree::Tree;
+
+/// Event categories the lab forces on while a branch has an [`InputSource`]
+/// attached. The deterministic *inputs* a branch consumes — served RDRAND/RDSEED
+/// values and queued I/O requests — are reconstructed from these records into
+/// the branch's [`InputRecording`], so they must be captured even when the
+/// caller's [`EventConfig`] asks for nothing. They are cheap: one small record
+/// per consumed input, far below the cost of `Exit` capture.
+const RECORDING_CATEGORIES: EventCategories =
+    EventCategories::RANDOMNESS.union(EventCategories::IO_CHANNEL);
+
+/// `Exit`-record trigger policy for a branch — which VM exits emit an `Exit`
+/// event into the stream. Set as the [`exits`](EventConfig::exits) field of an
+/// [`EventConfig`]: choosing anything other than [`Disabled`](Self::Disabled)
+/// turns on the [`EXIT`](EventCategories::EXIT) category and decides which exits
+/// emit a record.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExitCapture {
+    /// Don't emit `Exit` records.
+    #[default]
+    Disabled,
+    /// Emit a record for every exit. `memory_hash` adds a full guest-memory
+    /// hash to each record — thorough for divergence detection but slow;
+    /// disable it when register and device-state hashes are enough.
+    AllExits { memory_hash: bool },
+    /// Emit one record every `interval` emulated-TSC ticks.
+    Checkpoints { interval: u64, memory_hash: bool },
+    /// Emit a single record at guest shutdown.
+    AtShutdown { memory_hash: bool },
+}
+
+impl ExitCapture {
+    /// Decompose into the kernel trigger fields: `(trigger, target_tsc, memory_hash)`.
+    /// `target_tsc` is the `Checkpoints` interval (0 for the other policies);
+    /// `memory_hash` is whether to hash full guest memory into each record.
+    fn to_trigger(self) -> (ExitTrigger, u64, bool) {
+        match self {
+            ExitCapture::Disabled => (ExitTrigger::Disabled, 0, false),
+            ExitCapture::AllExits { memory_hash } => (ExitTrigger::AllExits, 0, memory_hash),
+            ExitCapture::Checkpoints {
+                interval,
+                memory_hash,
+            } => (ExitTrigger::Checkpoints, interval, memory_hash),
+            ExitCapture::AtShutdown { memory_hash } => (ExitTrigger::AtShutdown, 0, memory_hash),
+        }
+    }
+}
+
+/// What a branch captures into its unified event stream.
+///
+/// One config drives both halves of capture: the category mask (which kinds of
+/// records to emit) and the `Exit`-record trigger policy. Apply it with
+/// [`Branch::set_event_config`]. `Default` captures nothing.
+///
+/// The [`EXIT`](EventCategories::EXIT) category is governed entirely by
+/// [`exits`](Self::exits) — you never set it in [`categories`](Self::categories).
+/// Use `categories` for the cheap always-on-or-off kinds (`SERIAL`, `INJECT`,
+/// `RANDOMNESS`, `IO_CHANNEL`) and `exits` for the heavyweight, policy-driven
+/// `Exit` records:
+///
+/// ```ignore
+/// // Randomness only (a cheap determinism input):
+/// branch.set_event_config(&EventConfig {
+///     categories: EventCategories::RANDOMNESS,
+///     ..Default::default()
+/// })?;
+///
+/// // Every exit, no memory hashing:
+/// branch.set_event_config(&EventConfig {
+///     exits: ExitCapture::AllExits { memory_hash: false },
+///     ..Default::default()
+/// })?;
+/// ```
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EventConfig {
+    /// Non-exit kinds to capture: [`SERIAL`](EventCategories::SERIAL),
+    /// [`INJECT`](EventCategories::INJECT),
+    /// [`RANDOMNESS`](EventCategories::RANDOMNESS), and
+    /// [`IO_CHANNEL`](EventCategories::IO_CHANNEL). Any
+    /// [`EXIT`](EventCategories::EXIT) bit set here is ignored — exits are
+    /// governed by [`exits`](Self::exits).
+    pub categories: EventCategories,
+    /// `Exit`-record trigger policy. Anything other than
+    /// [`ExitCapture::Disabled`] (the default) turns on the `EXIT` category.
+    pub exits: ExitCapture,
+}
+
+impl EventConfig {
+    /// The effective category mask sent to the kernel: `categories` with the
+    /// `EXIT` bit forced to match `exits`.
+    fn effective_categories(&self) -> EventCategories {
+        let non_exit = EventCategories(self.categories.0 & !EventCategories::EXIT.0);
+        if self.exits == ExitCapture::Disabled {
+            non_exit
+        } else {
+            non_exit.union(EventCategories::EXIT)
+        }
+    }
+
+    /// Lower to the kernel ioctl payload: the effective category mask (plus
+    /// `extra`, which the lab uses to force on `RECORDING_CATEGORIES` for
+    /// branches that reconstruct their [`InputRecording`](crate::InputRecording)
+    /// from the stream) and the exit trigger fields. An empty mask yields a
+    /// disabled config (frees the buffer); otherwise the stream is enabled with
+    /// the exit trigger applied.
+    fn to_vm_config_with(self, extra: EventCategories) -> VmEventConfig {
+        let categories = self.effective_categories().union(extra);
+        if categories == EventCategories::empty() {
+            return VmEventConfig::disabled();
+        }
+        let (trigger, target_tsc, memory_hash) = self.exits.to_trigger();
+        let mut config = VmEventConfig::enabled(categories).with_exit_trigger(trigger, target_tsc);
+        if !memory_hash {
+            config = config.with_no_memory_hash();
+        }
+        config
+    }
+}
 
 /// A stable identifier for a branch within its tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -30,9 +150,9 @@ pub enum RunOutcome {
     /// The guest signaled it has finished boot/initialization and is ready
     /// for host-driven workload (VMCALL with the ready hypercall).
     Ready,
-    /// A scheduled I/O action's response arrived. The branch is paused at
+    /// A scheduled bash command's response arrived. The branch is paused at
     /// the moment the response landed; call `run_until` again to keep going.
-    ActionResponse { response: ActionResponse },
+    ActionResponse { output: BashOutput },
     /// The guest executed `RDRAND`/`RDSEED` and the attached [`InputSource`](crate::InputSource)
     /// returned `None` — out of randomness. The branch is paused on the trapping instruction;
     /// Calling `run_until` again will just re-trap on the same instruction.
@@ -78,6 +198,10 @@ pub struct Branch {
     /// current stop_at_tsc setting is unknown (post-fork, or never set on
     /// this branch); the next `set_stop_at` call always sends an ioctl.
     last_stop_at: Option<Option<u64>>,
+    /// The capture config last set via [`Branch::set_event_config`]. Tracked so
+    /// [`Branch::disable_single_step`] can restore it after the temporary
+    /// single-step override. Defaults to "capture nothing".
+    event_config: EventConfig,
 }
 
 impl Branch {
@@ -115,6 +239,7 @@ impl Branch {
             input_io_exhausted,
             input_recording,
             last_stop_at: None,
+            event_config: EventConfig::default(),
         };
         lab.sink.on_event(Event::BranchCreated {
             branch: id,
@@ -151,48 +276,78 @@ impl Branch {
         &self.origin
     }
 
-    /// Configure deterministic exit logging for this branch.
+    /// Configure the unified event stream on this branch: which categories it
+    /// captures and the `Exit`-record trigger policy, in one call (see
+    /// [`EventConfig`]).
     ///
-    /// When enabled, every covered VM exit is captured as a [`LogEntry`]
-    /// (guest registers + device state hashes) and forwarded to the tree's
-    /// [`EventSink`](crate::EventSink) as [`Event::ExitLogged`]. Diffing two
-    /// runs' exit streams pinpoints where they diverged, which is the main
-    /// non-determinism debugging primitive.
+    /// Captured records are forwarded to the tree's [`EventSink`](crate::EventSink)
+    /// as [`Event::Record`]. Forked VMs start with the stream disabled
+    /// regardless of the parent's setting, so each branch enables it explicitly.
     ///
-    /// Forked VMs start with logging disabled regardless of the parent's
-    /// setting, so each branch must enable logging explicitly. See
-    /// [`LogConfig`] for the available modes ([`LogMode::AllExits`](crate::LogMode::AllExits),
-    /// [`AtTsc`](crate::LogMode::AtTsc), [`Checkpoints`](crate::LogMode::Checkpoints),
-    /// [`TscRange`](crate::LogMode::TscRange)).
-    pub fn set_log_config(&mut self, config: LogConfig) -> Result<()> {
-        self.vm_mut().set_log_config(&config).map_err(|source| {
+    /// On a branch with an [`InputSource`], the `RANDOMNESS` and `IO_CHANNEL`
+    /// categories are always added on top of `config` so the branch's
+    /// [`InputRecording`](crate::InputRecording) keeps being reconstructed from
+    /// the stream — passing a `config` that omits them does not turn recording
+    /// off.
+    pub fn set_event_config(&mut self, config: &EventConfig) -> Result<()> {
+        self.event_config = *config;
+        self.apply_event_config()
+    }
+
+    /// Lower [`self.event_config`](Self::event_config) to the kernel, forcing on
+    /// the lab's always-captured categories: `SERIAL` on every branch (so guest
+    /// console output surfaces as [`Event::SerialLine`]), plus
+    /// `RECORDING_CATEGORIES` while this branch has an [`InputSource`] so its
+    /// [`InputRecording`](crate::InputRecording) can be reconstructed from the
+    /// stream. Every path that (re)installs the branch's capture config goes
+    /// through here so these categories are never accidentally dropped.
+    fn apply_event_config(&mut self) -> Result<()> {
+        let mut extra = EventCategories::SERIAL;
+        if self.input_source.is_some() {
+            extra = extra.union(RECORDING_CATEGORIES);
+        }
+        let vm_config = self.event_config.to_vm_config_with(extra);
+        self.send_event_config(&vm_config)
+    }
+
+    /// Enable the lab's always-on event capture on a freshly forked branch:
+    /// turn on `SERIAL` (for [`Event::SerialLine`]) and, when the branch carries
+    /// an [`InputSource`], `RECORDING_CATEGORIES` (so consumed RDRAND/RDSEED
+    /// values and I/O requests are captured into
+    /// [`input_recording`](Self::input_recording)). Called once at branch
+    /// creation. Forked VMs start with the stream disabled, so this is what
+    /// turns it on.
+    pub(crate) fn enable_event_capture(&mut self) -> Result<()> {
+        self.apply_event_config()
+    }
+
+    /// Send a lowered kernel event config to the VM. Internal: the public
+    /// surface is [`EventConfig`].
+    fn send_event_config(&mut self, config: &VmEventConfig) -> Result<()> {
+        self.vm_mut().set_event_config(config).map_err(|source| {
             LabError::Vm(VmError::Ioctl {
-                operation: "SET_LOG_CONFIG",
+                operation: "SET_EVENT_CONFIG",
                 source,
             })
-        })?;
-        Ok(())
+        })
     }
 
-    /// Disable exit logging on this branch and release the kernel log
-    /// buffer. Equivalent to `set_log_config(LogConfig::disabled())`.
-    pub fn disable_logging(&mut self) -> Result<()> {
-        self.set_log_config(LogConfig::disabled())
-    }
-
-    /// Enable single-step (MTF) execution within the half-open virtual
-    /// time range `[start, end)` and log every exit that fires inside it.
+    /// Enable single-step (MTF) execution within the half-open virtual time
+    /// range `[start, end)`, capturing an `Exit` record for every instruction
+    /// in the window.
     ///
     /// The kernel sets the VMCS Monitor-Trap-Flag whenever
-    /// `emulated_tsc ∈ [start, end)`, so the guest exits after every
-    /// retired instruction in that window. Combined with
-    /// [`LogMode::TscRange`](crate::LogMode::TscRange) logging, this gives
-    /// an instruction-by-instruction trace of guest state — the highest-
-    /// resolution divergence-debugging tool available.
+    /// `emulated_tsc ∈ [start, end)`, so the guest exits after every retired
+    /// instruction in that window and each one is emitted as an
+    /// [`Event::Record`] — the highest-resolution divergence-debugging tool
+    /// available. The event stream's `EXIT` category is enabled automatically.
     ///
-    /// Single-stepping is expensive (~1 vmexit per guest instruction);
-    /// pick the smallest range that brackets the suspected divergence
-    /// point. Disable with [`Self::disable_single_step`] when done.
+    /// This is a temporary override of the branch's [`set_event_config`](Self::set_event_config)
+    /// capture; [`disable_single_step`](Self::disable_single_step) restores it.
+    ///
+    /// Single-stepping is expensive (~1 vmexit per guest instruction); pick the
+    /// smallest range that brackets the suspected divergence point. Disable with
+    /// [`Self::disable_single_step`] when done.
     pub fn single_step(&mut self, start: VirtTime, end: VirtTime) -> Result<()> {
         self.check_freq(start.frequency())?;
         self.check_freq(end.frequency())?;
@@ -210,13 +365,25 @@ impl Branch {
                     source,
                 })
             })?;
-        // Memory hashing on every single-stepped instruction would dominate
-        // run time and adds no signal — register state already pins down
-        // divergence at instruction granularity.
-        self.set_log_config(LogConfig::tsc_range().with_no_memory_hash())
+        // Capture every exit within the range via the `TscRange` trigger. Memory
+        // hashing on every single-stepped instruction would dominate run time
+        // and adds no signal — register state already pins down divergence at
+        // instruction granularity. Keep `SERIAL` on (and the input-recording
+        // categories, when sourced) so console output and consumed randomness/IO
+        // inside the window still surface.
+        let mut categories = EventCategories::EXIT.union(EventCategories::SERIAL);
+        if self.input_source.is_some() {
+            categories = categories.union(RECORDING_CATEGORIES);
+        }
+        let config = VmEventConfig::enabled(categories)
+            .with_exit_trigger(ExitTrigger::TscRange, 0)
+            .with_no_memory_hash();
+        self.send_event_config(&config)
     }
 
-    /// Disable single-step execution and release the log buffer.
+    /// Disable single-step execution and restore the branch's prior
+    /// [`set_event_config`](Self::set_event_config) capture (which defaults to
+    /// capturing nothing).
     pub fn disable_single_step(&mut self) -> Result<()> {
         self.vm_mut().disable_single_step().map_err(|source| {
             LabError::Vm(VmError::Ioctl {
@@ -224,7 +391,7 @@ impl Branch {
                 source,
             })
         })?;
-        self.disable_logging()
+        self.apply_event_config()
     }
 
     fn check_freq(&self, freq: u64) -> Result<()> {
@@ -263,37 +430,66 @@ impl Branch {
         }
     }
 
-    fn drain_serial(&mut self, serial_len: usize, exit_at: VirtTime) {
-        drain_serial_into_sink(
-            self.vm.as_ref().expect("Branch.vm taken"),
-            serial_len,
-            exit_at,
-            self.id,
-            self.lab.sink.as_ref(),
-            &mut self.partial,
-        );
-    }
-
-    /// Forward newly-written exit-log entries to the sink as
-    /// [`Event::ExitLogged`]. `count` is `VmExit::log_entry_count` from the
-    /// just-returned `vm.run()` ioctl.
+    /// Drain the branch's event stream after a `vm.run()`. For each record:
+    /// `Serial` records are reassembled into complete lines and surfaced as
+    /// [`Event::SerialLine`] (see [`serial_record_into_sink`]); every other
+    /// record reconstructs the branch's
+    /// [`InputRecording`](Self::input_recording) (served randomness, queued I/O
+    /// requests) and is forwarded to the sink as [`Event::Record`]. `event_len`
+    /// is `VmExit::event_len` from the just-returned `vm.run()` ioctl — the
+    /// number of valid bytes in the event buffer.
     ///
-    /// The kernel resets `log_entry_count` to 0 at the start of every
-    /// `vm.run()` ioctl (`handlers.rs` `log_clear`), so `count` is
-    /// *per-call*, not cumulative — emit `entries[0..count]` and trust the
-    /// next ioctl to reset.
-    fn drain_log_entries(&mut self, count: usize) {
-        if count == 0 {
+    /// Inputs are captured only while a source is attached, matching the old
+    /// imperative path (kernel-side RNG and direct `bash`/`sched_bash` on a
+    /// sourceless branch leave the recording empty).
+    ///
+    /// The kernel resets the event cursor at the start of every `vm.run()`
+    /// ioctl (`handlers.rs` `event_clear`), so `event_len` is *per-call*, not
+    /// cumulative.
+    fn drain_events(&mut self, event_len: usize) {
+        if event_len == 0 {
             return;
         }
-        let vm = self.vm.as_ref().expect("Branch.vm taken");
-        let Some(buffer) = vm.log_buffer() else {
+        // Destructure into disjoint field borrows so we can read the event
+        // buffer (inside `self.vm`) while appending to `self.input_recording`
+        // and `self.partial` — the borrow checker only allows these together
+        // when the fields are borrowed separately rather than through `&mut self`.
+        let Self {
+            vm,
+            lab,
+            id,
+            input_source,
+            input_recording,
+            partial,
+            ..
+        } = self;
+        let vm = vm.as_ref().expect("Branch.vm taken");
+        let Some(buffer) = vm.event_buffer() else {
             return;
         };
-        for entry in LogEntry::from_buffer(buffer, count) {
-            self.lab.sink.on_event(Event::ExitLogged {
-                branch: self.id,
-                entry,
+        let drained = &buffer[..event_len.min(buffer.len())];
+        let record_inputs = input_source.is_some();
+        let freq = lab.tsc_frequency;
+        for record in EventStream::new(drained) {
+            if record.kind() == EventKind::Serial.as_u16() {
+                // Console output: reassemble into `SerialLine` rather than
+                // forwarding the raw record, preserving the historical surface.
+                serial_record_into_sink(
+                    record.payload,
+                    record.tsc(),
+                    freq,
+                    *id,
+                    lab.sink.as_ref(),
+                    partial,
+                );
+                continue;
+            }
+            if record_inputs {
+                input_recording.record_event(&record, freq);
+            }
+            lab.sink.on_event(Event::Record {
+                branch: *id,
+                record,
             });
         }
     }
@@ -416,8 +612,7 @@ impl Branch {
             })?;
             let at = VirtTime::from_instructions(exit.emulated_tsc, self.lab.tsc_frequency);
             self.advance_time(at);
-            self.drain_serial(exit.serial_len as usize, at);
-            self.drain_log_entries(exit.log_entry_count as usize);
+            self.drain_events(exit.event_len as usize);
             match exit.kind() {
                 ExitKind::StopTscReached => {
                     if at >= target {
@@ -433,8 +628,8 @@ impl Branch {
                             source,
                         })
                     })?;
-                    let response = bash::decode_response(&bytes).map_err(LabError::BadResponse)?;
-                    return Ok((at, RunOutcome::ActionResponse { response }));
+                    let output = self.bash_output_from_response(&bytes)?;
+                    return Ok((at, RunOutcome::ActionResponse { output }));
                 }
                 ExitKind::FeedbackBufferRegistered => {
                     self.on_feedback_buffer_registered(at)?;
@@ -447,7 +642,7 @@ impl Branch {
                         return Ok((at, RunOutcome::Yielded { kind: exit.kind() }))
                     }
                 },
-                ExitKind::Continue | ExitKind::LogBufferFull => continue,
+                ExitKind::Continue | ExitKind::EventBufferFull => continue,
                 kind => return Ok((at, RunOutcome::Yielded { kind })),
             }
         }
@@ -476,8 +671,7 @@ impl Branch {
             })?;
             let at = VirtTime::from_instructions(exit.emulated_tsc, self.lab.tsc_frequency);
             self.advance_time(at);
-            self.drain_serial(exit.serial_len as usize, at);
-            self.drain_log_entries(exit.log_entry_count as usize);
+            self.drain_events(exit.event_len as usize);
             match exit.kind() {
                 ExitKind::IoResponse => {
                     return self.vm_mut().drain_io_response().map_err(|source| {
@@ -500,7 +694,7 @@ impl Branch {
                         })
                     }
                 },
-                ExitKind::Continue | ExitKind::LogBufferFull | ExitKind::VmcallReady => continue,
+                ExitKind::Continue | ExitKind::EventBufferFull | ExitKind::VmcallReady => continue,
                 kind => return Err(LabError::UnexpectedExit { at, kind }),
             }
         }
@@ -510,6 +704,10 @@ impl Branch {
     /// from it and feed it to the VM via `SET_RDRAND_VALUE` so the next
     /// `vm.run()` re-executes the trapped `RDRAND`/`RDSEED` with that
     /// value. See [`FeedRng`] for the three possible outcomes.
+    ///
+    /// The served value is not recorded here: the re-execution emits a
+    /// `Randomness` event, which [`drain_events`](Self::drain_events) captures
+    /// into the branch's [`InputRecording`](Self::input_recording).
     fn feed_rng(&mut self) -> Result<FeedRng> {
         let Some(source) = self.input_source.as_mut() else {
             return Ok(FeedRng::NoSource);
@@ -523,10 +721,6 @@ impl Branch {
                 source,
             })
         })?;
-        self.input_recording.push_rng(RngInput {
-            at: self.current_time,
-            value,
-        });
         Ok(FeedRng::Fed)
     }
 
@@ -572,11 +766,12 @@ impl Branch {
             .pending_input_io
             .take()
             .expect("pending_input_io was checked above");
-        let request = bash::encode_bash_request(input.target.clone(), &input.command);
+        let request = bash::encode_request(&input.target, &input.command, input.record_output);
         match self.vm().queue_io_action(&request, 0) {
-            Ok(()) => {
-                self.input_recording.push_io(input);
-            }
+            // The recording captures this request when its `IoChannel` request
+            // event is signaled to the guest and drained, not here at queue time
+            // (see `drain_events`).
+            Ok(()) => {}
             Err(source) if source.kind() == std::io::ErrorKind::ResourceBusy => {
                 self.pending_input_io = Some(input);
                 return Ok(target);
@@ -642,51 +837,66 @@ impl Branch {
     ///
     /// Note: if there are previously [`sched_bash`](Self::sched_bash)'d
     /// actions still pending, the next response may be for one of *those*
-    /// and not this blocking call. In that case this method returns
-    /// [`LabError::BadResponse`]. Avoid mixing blocking and scheduled bash
+    /// and not this blocking call. Avoid mixing blocking and scheduled bash
     /// calls without first draining all pending responses via `run_until`.
-    pub fn bash(&mut self, target: BashTarget, cmd: &str) -> Result<BashOutput> {
-        let request = bash::encode_bash_request(target, cmd);
+    ///
+    /// The command's combined stdout+stderr always streams to the guest
+    /// journal. When `record_output` is set it is *also* captured into the
+    /// output feedback buffer and returned in [`BashOutput::output`]; otherwise
+    /// `output` is empty.
+    pub fn bash(
+        &mut self,
+        target: BashTarget,
+        cmd: &str,
+        record_output: bool,
+    ) -> Result<BashOutput> {
+        let request = bash::encode_request(&target, cmd, record_output);
         let bytes = self.run_io_action(&request)?;
-        match bash::decode_response(&bytes).map_err(LabError::BadResponse)? {
-            ActionResponse::Bash(out) => Ok(out),
-            other => Err(LabError::BadResponse(format!(
-                "expected bash response, got {other:?}"
-            ))),
-        }
+        self.bash_output_from_response(&bytes)
     }
 
     /// Schedule a bash command to fire at virtual time `at`.
     ///
     /// Returns immediately; the response is delivered asynchronously when
     /// [`Branch::run_until`] reaches the I/O response exit and yields
-    /// [`RunOutcome::ActionResponse`].
+    /// [`RunOutcome::ActionResponse`]. `record_output` behaves as in
+    /// [`bash`](Self::bash).
     ///
     /// `at.instructions() == 0` is the special "fire as soon as the guest is
     /// interruptible" value the hypervisor's I/O channel honors. For non-zero
     /// values the action lands at exactly that emulated-TSC.
-    pub fn sched_bash(&mut self, at: VirtTime, target: BashTarget, cmd: &str) -> Result<()> {
+    pub fn sched_bash(
+        &mut self,
+        at: VirtTime,
+        target: BashTarget,
+        cmd: &str,
+        record_output: bool,
+    ) -> Result<()> {
         self.check_freq(at.frequency())?;
-        let request = bash::encode_bash_request(target, cmd);
+        let request = bash::encode_request(&target, cmd, record_output);
         self.vm_mut().queue_io_action(&request, at.instructions())?;
         Ok(())
     }
 
-    /// Query the guest's workload listing — the set of containers and their
-    /// invocable drivers — and block until the response arrives.
-    ///
-    /// Requires the guest to have `bedrock-io.ko` loaded and registered.
-    /// See [`Branch::bash`] for the same caveat about mixing with scheduled
-    /// actions.
-    pub fn workload_details(&mut self) -> Result<Vec<WorkloadDriver>> {
-        let request = bash::encode_workload_details_request();
-        let bytes = self.run_io_action(&request)?;
-        match bash::decode_response(&bytes).map_err(LabError::BadResponse)? {
-            ActionResponse::WorkloadDetails(drivers) => Ok(drivers),
-            other => Err(LabError::BadResponse(format!(
-                "expected workload-details response, got {other:?}"
-            ))),
-        }
+    /// Decode an I/O channel response and, when the command recorded its
+    /// output, read it back from the output feedback buffer.
+    fn bash_output_from_response(&mut self, resp: &[u8]) -> Result<BashOutput> {
+        let r = bedrock_vm::io_channel::decode_response(resp)
+            .ok_or_else(|| LabError::BadResponse("malformed I/O channel response".to_string()))?;
+        let output = if r.output_len > 0 {
+            let want = r.output_len as usize;
+            let bufs = self.feedback_buffers(bedrock_vm::io_channel::IO_OUTPUT_BUFFER_ID)?;
+            bufs.first()
+                .map(|b| b[..want.min(b.len())].to_vec())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        Ok(BashOutput {
+            status: r.status,
+            exit_code: r.exit_code,
+            output,
+        })
     }
 
     /// Carve out an immutable [`Checkpoint`] at the current point, consuming

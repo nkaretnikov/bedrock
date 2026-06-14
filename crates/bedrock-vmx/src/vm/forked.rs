@@ -655,21 +655,21 @@ impl<V: VirtualMachineControlStructure, P: Page, I: InstructionCounter> VmContex
         );
     }
 
-    fn finalize_log_entry<K: Kernel>(&mut self, _kernel: &K) {
-        let log_idx = match self.state.pending_log_idx.take() {
-            Some(idx) => idx,
-            None => return,
-        };
+    fn finalize_exit_record<K: Kernel>(&mut self, _kernel: &K) {
+        // Nothing to do unless an `Exit` event awaits its deferred memory hash.
+        if self.state.pending_exit_loc.is_none() {
+            return;
+        }
 
         let memory_hash = if self.state.skip_memory_hash {
             0
         } else {
-            match self.state.log_mode {
-                LogMode::AtTsc
-                | LogMode::AtShutdown
-                | LogMode::AllExits
-                | LogMode::Checkpoints
-                | LogMode::TscRange => {
+            match self.state.exit_trigger {
+                ExitTrigger::AtTsc
+                | ExitTrigger::AtShutdown
+                | ExitTrigger::AllExits
+                | ExitTrigger::Checkpoints
+                | ExitTrigger::TscRange => {
                     // Hash only COW (modified) pages for forked VMs.
                     // This captures the delta from parent, which is what matters
                     // for comparing forked VM states.
@@ -686,21 +686,15 @@ impl<V: VirtualMachineControlStructure, P: Page, I: InstructionCounter> VmContex
 
                     hasher.finish()
                 }
-                LogMode::Disabled => 0,
+                ExitTrigger::Disabled => 0,
             }
         };
 
-        // Update the log entry's memory_hash field
-        if let Some(ptr) = self.state.log_buffer_ptr {
-            // SAFETY: log_idx was valid when set; ptr is valid for the log buffer region.
-            unsafe {
-                let entry_ptr = ptr
-                    .add(log_idx * core::mem::size_of::<LogEntry>())
-                    .cast::<LogEntry>();
-                (*entry_ptr).memory_hash = memory_hash;
-                (*entry_ptr).cow_page_count = self.cow_pages.len() as u32;
-            }
-        }
+        // Patch the pending `Exit` record's memory_hash and cow_page_count in
+        // the event buffer.
+        let cow_page_count = self.cow_pages.len() as u32;
+        self.state
+            .finalize_exit_memory_hash(memory_hash, cow_page_count);
     }
 }
 

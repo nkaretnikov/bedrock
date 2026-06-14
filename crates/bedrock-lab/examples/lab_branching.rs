@@ -13,6 +13,9 @@
 //! branch with a custom `InputSource`. The lab uses that source to serve
 //! guest RDRAND/RDSEED exits and to schedule bash commands on the
 //! deterministic I/O channel.
+//!
+//! Pass `--events-dir <dir>` to capture each run's event stream to
+//! `<dir>/run-NNN/events.jsonl` for divergence debugging.
 
 use std::error::Error;
 use std::fs;
@@ -20,10 +23,10 @@ use std::io::{BufWriter, Write};
 use std::sync::{Arc, Mutex};
 
 use bedrock_lab::{
-    ActionResponse, BashTarget, BranchId, Checkpoint, Event, EventSink, InputSource, IoInput,
-    LabError, LabOpts, LogConfig, RngMode, RunOutcome, VirtDuration, VirtTime,
+    BashOutput, BashTarget, BranchId, Checkpoint, Event, EventConfig, EventSink, ExitCapture,
+    InputSource, IoInput, LabError, LabOpts, RngMode, RunOutcome, VirtDuration, VirtTime,
 };
-use bedrock_vm::{boot::defaults, load_kernel, write_jsonl, LinuxBootConfig, VmBuilder};
+use bedrock_vm::{boot::defaults, load_kernel, LinuxBootConfig, VmBuilder};
 use clap::Parser;
 
 bedrock_lab::define_virt_time_macros!($, bedrock_vm::DEFAULT_TSC_FREQUENCY);
@@ -65,7 +68,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Advance an idle branch up to the first I/O time and re-checkpoint
     // there. The input-driven branch then forks from this point, so the
-    // exit log only covers the part the lab is actively driving — the
+    // captured exits only cover the part the lab is actively driving — the
     // pre-I/O idle window (which is uninteresting for divergence
     // debugging) doesn't end up in the JSONL.
     let first_io_time = ready_cp.time() + VirtDuration::from_secs(1, ready_cp.tsc_frequency());
@@ -80,8 +83,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let deadline = pre_io_cp.time() + VirtDuration::from_secs(5, pre_io_cp.tsc_frequency());
     for iter in 0..args.iterations {
-        if let Some(dir) = &args.exit_log_dir {
-            sink.open_exit_log(&format!("{dir}/run-{iter:03}"))?;
+        if let Some(dir) = &args.events_dir {
+            sink.open_events(&format!("{dir}/run-{iter:03}"))?;
         }
         println!("=== iteration {iter} ===");
 
@@ -90,15 +93,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         // the input-driven branch), rather than another 1s in the future.
         let source = DemoInputSource::new(ready_cp.time());
         let mut branch = pre_io_cp.branch_with_input_source(source)?;
-        if args.exit_log_dir.is_some() {
-            // AllExits captures every deterministic exit (used by
-            // `contrib/determ-divergence.py` to find the divergence point)
-            // and routes non-deterministic exits + PEBS diagnostic entries
-            // to `exit-log-nondeterm.jsonl` for use in the divergence
-            // window. Memory hashing is skipped — register state already
-            // pins down divergence and hashing every exit dominates run
-            // time.
-            branch.set_log_config(LogConfig::all_exits(0).with_no_memory_hash())?;
+        if args.events_dir.is_some() {
+            // Capture every exit (deterministic and non-deterministic). Memory
+            // hashing is skipped — register state already pins down divergence,
+            // and hashing every exit dominates run time.
+            branch.set_event_config(&EventConfig {
+                exits: ExitCapture::AllExits { memory_hash: false },
+                ..Default::default()
+            })?;
         }
 
         loop {
@@ -108,8 +110,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                     println!("reached deadline at {:.3}s", at.as_secs_f64());
                     break;
                 }
-                RunOutcome::ActionResponse { response } => {
-                    print_action_response(branch.id(), at, response)
+                RunOutcome::ActionResponse { output } => {
+                    print_action_response(branch.id(), at, output)
                 }
                 RunOutcome::Ready => continue,
                 RunOutcome::RngExhausted => {
@@ -122,7 +124,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
         print_input_recording(branch.input_recording());
-        sink.close_exit_log();
+        sink.close_events();
         // `branch` drops here, releasing its slot in `lab.live_branches`
         // so the next iteration's fork starts from a clean slate.
     }
@@ -140,24 +142,16 @@ struct Args {
     /// Path to an initramfs/initrd image.
     initramfs: String,
 
-    /// If set, capture every VM exit on the input-driven branch and write
-    /// them as JSONL to two files under this directory:
-    ///
-    /// - `exit-log.jsonl` — deterministic exits (used by
-    ///   `contrib/determ-divergence.py` to find the divergence point)
-    /// - `exit-log-nondeterm.jsonl` — non-deterministic exits + PEBS
-    ///   diagnostic entries (used to show what happened around the
-    ///   divergence window; these are not compared directly because PEBS
-    ///   skid fields and host-timing-dependent counts drift across runs)
-    ///
-    /// Boot-phase exits are not captured.
+    /// If set, capture the input-driven branch's event stream to
+    /// `<dir>/run-NNN/events.jsonl` (one dir per iteration), which
+    /// `contrib/determ-divergence.py` reads to locate where two runs diverge.
+    /// Without this flag the branch runs without capture.
     #[arg(long)]
-    exit_log_dir: Option<String>,
+    events_dir: Option<String>,
 
-    /// Run the input-driven phase this many times from the same pre-IO
-    /// checkpoint. Each iteration's exit log lands in
-    /// `<exit-log-dir>/run-NNN/` so `contrib/determ-divergence.py` can
-    /// diff any two. The boot+pre-IO phase happens once and is shared.
+    /// Re-run the input-driven phase this many times from the same pre-IO
+    /// checkpoint, each into its own `run-NNN/` under `--events-dir`. The
+    /// boot + pre-IO phase happens once and is shared across iterations.
     #[arg(long, default_value_t = 1)]
     iterations: u32,
 }
@@ -178,11 +172,15 @@ impl DemoInputSource {
                     at: base + VirtDuration::from_secs(1, base.frequency()),
                     target: BashTarget::Host,
                     command: "echo input-source: first command".to_string(),
+                    // Record this command's output so it comes back on the
+                    // resulting `ActionResponse` (via the output feedback buffer).
+                    record_output: true,
                 },
                 IoInput {
                     at: base + VirtDuration::from_secs(1, base.frequency()),
                     target: BashTarget::Host,
                     command: "printf 'input-source: second command\\n'".to_string(),
+                    record_output: true,
                 },
             ],
             io_pos: 0,
@@ -212,24 +210,14 @@ impl InputSource for DemoInputSource {
     }
 }
 
-fn print_action_response(branch: BranchId, at: VirtTime, response: ActionResponse) {
-    match response {
-        ActionResponse::Bash(out) => {
-            println!(
-                "[br {branch:?} vt {:>8.3}] bash status={} exit={}",
-                at.as_secs_f64(),
-                out.status,
-                out.exit_code,
-            );
-        }
-        ActionResponse::WorkloadDetails(drivers) => {
-            println!(
-                "[br {branch:?} vt {:>8.3}] workload details: {} drivers",
-                at.as_secs_f64(),
-                drivers.len()
-            );
-        }
-    }
+fn print_action_response(branch: BranchId, at: VirtTime, out: BashOutput) {
+    println!(
+        "[br {branch:?} vt {:>8.3}] bash status={} exit={} output={:?}",
+        at.as_secs_f64(),
+        out.status,
+        out.exit_code,
+        out.output_lossy(),
+    );
 }
 
 fn print_input_recording(recording: &bedrock_lab::InputRecording) {
@@ -254,50 +242,38 @@ fn print_input_recording(recording: &bedrock_lab::InputRecording) {
     }
 }
 
-/// Lab sink: serial lines to stdout; `ExitLogged` entries split by the
-/// determinism flag into two JSONL files (consumed by
-/// `contrib/determ-divergence.py`). The exit-log file pair can be swapped
-/// between iterations via [`LabSink::open_exit_log`] / [`LabSink::close_exit_log`]
-/// so a single tree (and a single boot) can produce N independent run dirs.
+/// Lab sink: serial lines go to stdout; `Record` events are written to an
+/// `events.jsonl` that can be swapped between iterations via
+/// [`LabSink::open_events`] / [`LabSink::close_events`], so a single tree (and a
+/// single boot) produces N independent run dirs.
 struct LabSink {
-    exit_logs: Mutex<Option<ExitLogs>>,
-}
-
-struct ExitLogs {
-    determ: BufWriter<fs::File>,
-    nondeterm: BufWriter<fs::File>,
+    events: Mutex<Option<BufWriter<fs::File>>>,
 }
 
 impl LabSink {
     fn new() -> Self {
         Self {
-            exit_logs: Mutex::new(None),
+            events: Mutex::new(None),
         }
     }
 
-    /// Direct subsequent `ExitLogged` entries into `<dir>/exit-log.jsonl`
-    /// and `<dir>/exit-log-nondeterm.jsonl`. Closes any previously-open
-    /// pair first. The `dir` is created if it doesn't exist.
-    fn open_exit_log(&self, dir: &str) -> std::io::Result<()> {
+    /// Direct subsequent `Record` events into `<dir>/events.jsonl`, closing any
+    /// previously-open file first. The `dir` is created if it doesn't exist.
+    fn open_events(&self, dir: &str) -> std::io::Result<()> {
         fs::create_dir_all(dir)?;
-        let determ = fs::File::create(format!("{dir}/exit-log.jsonl"))?;
-        let nondeterm = fs::File::create(format!("{dir}/exit-log-nondeterm.jsonl"))?;
-        let mut g = self.exit_logs.lock().unwrap();
-        *g = Some(ExitLogs {
-            determ: BufWriter::new(determ),
-            nondeterm: BufWriter::new(nondeterm),
-        });
+        let events = fs::File::create(format!("{dir}/events.jsonl"))?;
+        let mut g = self.events.lock().unwrap();
+        *g = Some(BufWriter::new(events));
         Ok(())
     }
 
-    /// Flush and drop the current file pair so the next iteration starts
-    /// with a fresh `--exit-log-dir`. Subsequent `ExitLogged` events are
-    /// dropped until the next `open_exit_log` call.
-    fn close_exit_log(&self) {
-        let mut g = self.exit_logs.lock().unwrap();
-        if let Some(mut logs) = g.take() {
-            let _ = logs.determ.flush();
-            let _ = logs.nondeterm.flush();
+    /// Flush and drop the current file so the next iteration starts with a
+    /// fresh `--events-dir`. Subsequent `Record` events are dropped until the
+    /// next `open_events` call.
+    fn close_events(&self) {
+        let mut g = self.events.lock().unwrap();
+        if let Some(mut events) = g.take() {
+            let _ = events.flush();
         }
     }
 }
@@ -325,15 +301,11 @@ impl EventSink for LabSink {
                     String::from_utf8_lossy(id),
                 );
             }
-            Event::ExitLogged { entry, .. } => {
-                let mut g = self.exit_logs.lock().unwrap();
-                if let Some(logs) = g.as_mut() {
-                    let target = if entry.is_deterministic() {
-                        &mut logs.determ
-                    } else {
-                        &mut logs.nondeterm
-                    };
-                    let _ = write_jsonl(target, std::slice::from_ref(entry));
+            Event::Record { record, .. } => {
+                let mut g = self.events.lock().unwrap();
+                if let Some(w) = g.as_mut() {
+                    let _ = serde_json::to_writer(&mut *w, &record.to_json());
+                    let _ = writeln!(w);
                 }
             }
             other => eprintln!("lab event: {other:?}"),

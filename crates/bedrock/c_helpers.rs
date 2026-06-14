@@ -130,15 +130,6 @@ extern "C" {
         pgoff: core::ffi::c_ulong,
     ) -> core::ffi::c_int;
 
-    /// Map a single page into a userspace VMA.
-    /// Uses remap_pfn_range internally.
-    ///
-    /// Returns: 0 on success, negative error code on failure.
-    pub(crate) fn bedrock_remap_page(
-        vma: *mut kernel::bindings::vm_area_struct,
-        page: *mut kernel::bindings::page,
-    ) -> core::ffi::c_int;
-
     /// Map multiple (potentially non-contiguous) physical pages into a userspace VMA.
     ///
     /// The hpas array contains page-aligned host physical addresses.

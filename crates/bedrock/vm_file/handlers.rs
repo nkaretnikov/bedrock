@@ -13,13 +13,13 @@ use kernel::bindings;
 use super::super::c_helpers::{bedrock_copy_from_user, bedrock_copy_to_user, PreemptionGuard};
 use super::super::factory::KernelFrameAllocator;
 use super::super::machine::MACHINE;
-use super::super::page::{LogBuffer, PagePool};
+use super::super::page::{EventBuffer, PagePool};
 use super::super::vmx::registers::GuestRegisters;
 use super::super::vmx::traits::{
     CowAllocator, InstructionCounterError, Machine, VmContext, VmRunError,
 };
 use super::super::vmx::ExitReason;
-use super::super::vmx::{LogMode, RdrandMode};
+use super::super::vmx::{EventCategories, ExitTrigger, RdrandMode};
 use super::super::vmx_asm::RealVmRunner;
 use super::structs::*;
 
@@ -43,11 +43,11 @@ pub(crate) trait VmFileOps {
     /// Get a reference to the running flag.
     fn running(&self) -> &AtomicBool;
 
-    /// Get a reference to the optional log buffer.
-    fn log_buffer(&self) -> Option<&LogBuffer>;
+    /// Get a reference to the optional unified event buffer.
+    fn event_buffer(&self) -> Option<&EventBuffer>;
 
-    /// Get a mutable reference to the optional log buffer.
-    fn log_buffer_mut(&mut self) -> &mut Option<LogBuffer>;
+    /// Get a mutable reference to the optional unified event buffer.
+    fn event_buffer_mut(&mut self) -> &mut Option<EventBuffer>;
 
     /// Check if this VM can be run (no children for forkable VMs).
     fn can_run(&self) -> bool;
@@ -223,9 +223,10 @@ where
         let (vm, pool) = vm_file.vm_and_pool();
 
         if first_iteration {
-            // Clear serial/log buffers only on first entry
-            vm.state_mut().serial_clear();
-            vm.state_mut().log_clear();
+            // Clear the event buffer only on first entry (after userspace has
+            // drained the previous run's output). `event_clear` also re-appends
+            // any event staged when the buffer filled mid-run.
+            vm.state_mut().event_clear();
             first_iteration = false;
         }
 
@@ -255,26 +256,22 @@ where
         }
     };
 
-    // Finalize serial metadata (line TSC entries) before reading output
-    let vm = vm_file.vm_mut();
-    vm.state_mut().serial_finalize_metadata();
-
     // Get exit info
+    let vm = vm_file.vm();
     let exit_qualification = vm.state().last_exit_qualification;
     let guest_physical_addr = vm.state().last_guest_physical_addr;
-    let serial_len = vm.state().serial_output().len();
-    let log_entry_count = vm.state().log_entry_count();
+    let event_len = vm.state().event_buffer_len();
     let emulated_tsc = vm.state().emulated_tsc;
     let tsc_frequency = vm.state().tsc_frequency;
 
     // Build exit info struct
     let exit_info = BedrockVmExit {
         exit_reason: exit_reason as u32,
-        serial_len: serial_len as u32,
+        _reserved: 0,
         exit_qualification,
         guest_physical_addr,
-        log_entry_count: log_entry_count as u32,
-        _reserved: 0,
+        event_len: event_len as u32,
+        _pad: 0,
         emulated_tsc,
         tsc_frequency,
     };
@@ -388,24 +385,21 @@ pub(crate) fn handle_set_rdrand_value<F: VmFileOps>(vm_file: &mut F, arg: usize)
     0
 }
 
-/// Handle SET_LOG_CONFIG ioctl - unified logging configuration.
-///
-/// This replaces the following ioctls:
-/// - ENABLE_LOGGING / DISABLE_LOGGING (buffer allocation)
-/// - SET_LOG_MODE (mode and target_tsc)
-/// - SET_LOG_START_TSC (start threshold)
-/// - SET_LOG_THRESHOLD (legacy, now uses start_tsc)
-pub(crate) fn handle_set_log_config<F: VmFileOps>(vm_file: &mut F, arg: usize) -> isize {
-    let mut config = core::mem::MaybeUninit::<BedrockLogConfig>::uninit();
+/// Handle SET_EVENT_CONFIG ioctl — enable/disable the event stream (allocating
+/// or freeing the 1 MB event buffer), install the category include mask, and set
+/// the `Exit`-record trigger policy (`ExitTrigger`, target/start TSC thresholds,
+/// and the memory-hash / #PF flags).
+pub(crate) fn handle_set_event_config<F: VmFileOps>(vm_file: &mut F, arg: usize) -> isize {
+    let mut config = core::mem::MaybeUninit::<BedrockEventConfig>::uninit();
 
     // SAFETY: `config.as_mut_ptr()` points to valid, aligned, writable memory for a
-    // BedrockLogConfig. `arg` is a user-provided pointer from the ioctl syscall.
+    // BedrockEventConfig. `arg` is a user-provided pointer from the ioctl syscall.
     // bedrock_copy_from_user performs a bounded copy.
     let not_copied = unsafe {
         bedrock_copy_from_user(
             config.as_mut_ptr().cast::<core::ffi::c_void>(),
             arg as *const core::ffi::c_void,
-            size_of::<BedrockLogConfig>() as core::ffi::c_ulong,
+            size_of::<BedrockEventConfig>() as core::ffi::c_ulong,
         )
     };
 
@@ -417,70 +411,73 @@ pub(crate) fn handle_set_log_config<F: VmFileOps>(vm_file: &mut F, arg: usize) -
     // have been written and it is now fully initialized.
     let config = unsafe { config.assume_init() };
 
-    // Convert mode value to LogMode enum
-    let mode = match config.mode {
-        0 => LogMode::Disabled,
-        1 => LogMode::AllExits,
-        2 => LogMode::AtTsc,
-        3 => LogMode::AtShutdown,
-        4 => LogMode::Checkpoints,
-        5 => LogMode::TscRange,
-        _ => {
-            log_err!("SET_LOG_CONFIG: invalid mode {}\n", config.mode);
-            return -(bindings::EINVAL as isize);
-        }
-    };
-
-    let was_enabled = vm_file.log_buffer().is_some();
+    let was_enabled = vm_file.event_buffer().is_some();
     let want_enabled = config.enabled != 0;
 
-    // Handle buffer allocation state changes
+    // Handle buffer allocation state changes.
     if want_enabled && !was_enabled {
-        // Allocate the log buffer
-        let buffer = match LogBuffer::new() {
+        let buffer = match EventBuffer::new() {
             Some(b) => b,
             None => {
-                log_err!("SET_LOG_CONFIG: failed to allocate log buffer\n");
+                log_err!("SET_EVENT_CONFIG: failed to allocate event buffer\n");
                 return -(bindings::ENOMEM as isize);
             }
         };
 
-        // Set the buffer pointer in the VM
-        // SAFETY: buffer.as_ptr() returns a valid pointer to the log buffer's vmalloc'd
-        // memory region. The buffer is kept alive in vm_file.log_buffer for the
-        // lifetime of the VM.
-        unsafe { vm_file.vm_mut().state_mut().set_log_buffer(buffer.as_ptr()) };
-        vm_file.vm_mut().state_mut().enable_logging();
-        *vm_file.log_buffer_mut() = Some(buffer);
+        // Set the buffer pointer in the VM. The buffer is kept alive in
+        // vm_file.event_buffer for the lifetime of the VM (or until disabled).
+        vm_file
+            .vm_mut()
+            .state_mut()
+            .set_event_buffer(buffer.as_ptr());
+        *vm_file.event_buffer_mut() = Some(buffer);
     } else if !want_enabled && was_enabled {
-        // Free the buffer
-        vm_file.vm_mut().state_mut().disable_logging();
-        vm_file.vm_mut().state_mut().clear_log_buffer_ptr();
-        *vm_file.log_buffer_mut() = None;
+        vm_file.vm_mut().state_mut().clear_event_buffer_ptr();
+        *vm_file.event_buffer_mut() = None;
     }
 
-    // Set the log mode and thresholds
+    // Install the category mask regardless of the enable transition (lets a
+    // caller adjust categories while the stream stays enabled).
     vm_file
         .vm_mut()
         .state_mut()
-        .set_log_mode(mode, config.target_tsc);
-    vm_file
-        .vm_mut()
-        .state_mut()
-        .set_log_start_tsc(config.start_tsc);
-    vm_file.vm_mut().state_mut().skip_memory_hash = (config.flags & 1) != 0;
-    vm_file
-        .vm_mut()
-        .state_mut()
-        .set_intercept_pf((config.flags & 2) != 0);
+        .set_event_categories(EventCategories(config.categories));
+
+    // Apply the `Exit`-record trigger policy. The stream's `enabled` flag gates
+    // the buffer; capturing exits additionally needs the EXIT category (above)
+    // and a non-Disabled trigger.
+    let trigger = match config.exit_trigger {
+        0 => ExitTrigger::Disabled,
+        1 => ExitTrigger::AllExits,
+        2 => ExitTrigger::AtTsc,
+        3 => ExitTrigger::AtShutdown,
+        4 => ExitTrigger::Checkpoints,
+        5 => ExitTrigger::TscRange,
+        _ => {
+            log_err!(
+                "SET_EVENT_CONFIG: invalid exit_trigger {}\n",
+                config.exit_trigger
+            );
+            return -(bindings::EINVAL as isize);
+        }
+    };
+    let trigger = if want_enabled {
+        trigger
+    } else {
+        ExitTrigger::Disabled
+    };
+    let state = vm_file.vm_mut().state_mut();
+    state.set_exit_trigger(trigger, config.exit_target_tsc);
+    state.set_exit_start_tsc(config.exit_start_tsc);
+    state.skip_memory_hash = (config.exit_flags & 1) != 0;
+    state.set_intercept_pf((config.exit_flags & 2) != 0);
 
     log_info!(
-        "SET_LOG_CONFIG: enabled={}, mode={:?}, target_tsc={}, start_tsc={}, flags={:#x} for VM {}\n",
+        "SET_EVENT_CONFIG: enabled={}, categories={:#x}, exit_trigger={:?}, exit_flags={:#x} for VM {}\n",
         want_enabled,
-        mode,
-        config.target_tsc,
-        config.start_tsc,
-        config.flags,
+        config.categories,
+        trigger,
+        config.exit_flags,
         vm_file.vm_id()
     );
     0

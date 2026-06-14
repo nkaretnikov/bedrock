@@ -10,6 +10,9 @@ freebsd-src/
 
 __pycache__/
 
+# Event-stream / determinism run output
+*.jsonl
+
 # Nix
 result
 result-*

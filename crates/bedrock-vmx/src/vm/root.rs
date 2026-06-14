@@ -199,11 +199,11 @@ impl<V: VirtualMachineControlStructure, G: GuestMemory, I: InstructionCounter> V
         Ok(())
     }
 
-    fn finalize_log_entry<K: Kernel>(&mut self, _kernel: &K) {
-        let log_idx = match self.state.pending_log_idx.take() {
-            Some(idx) => idx,
-            None => return,
-        };
+    fn finalize_exit_record<K: Kernel>(&mut self, _kernel: &K) {
+        // Nothing to do unless an `Exit` event awaits its deferred memory hash.
+        if self.state.pending_exit_loc.is_none() {
+            return;
+        }
 
         let mem_ptr = self.memory.as_ptr();
         let mem_size = self.memory.size();
@@ -211,12 +211,12 @@ impl<V: VirtualMachineControlStructure, G: GuestMemory, I: InstructionCounter> V
         let memory_hash = if self.state.skip_memory_hash {
             0
         } else {
-            match self.state.log_mode {
-                LogMode::AtTsc
-                | LogMode::AtShutdown
-                | LogMode::AllExits
-                | LogMode::Checkpoints
-                | LogMode::TscRange => {
+            match self.state.exit_trigger {
+                ExitTrigger::AtTsc
+                | ExitTrigger::AtShutdown
+                | ExitTrigger::AllExits
+                | ExitTrigger::Checkpoints
+                | ExitTrigger::TscRange => {
                     // Hash full guest memory
                     let mut hasher = Xxh64Hasher::new();
                     // SAFETY: mem_ptr is valid and mem_size is the correct size
@@ -224,20 +224,13 @@ impl<V: VirtualMachineControlStructure, G: GuestMemory, I: InstructionCounter> V
                     hasher.write_bytes(memory);
                     hasher.finish()
                 }
-                LogMode::Disabled => 0,
+                ExitTrigger::Disabled => 0,
             }
         };
 
-        // Update the log entry's memory_hash field
-        if let Some(ptr) = self.state.log_buffer_ptr {
-            // SAFETY: log_idx was valid when set, ptr is valid for 1MB
-            unsafe {
-                let entry_ptr = ptr
-                    .add(log_idx * core::mem::size_of::<LogEntry>())
-                    .cast::<LogEntry>();
-                (*entry_ptr).memory_hash = memory_hash;
-            }
-        }
+        // Patch the pending `Exit` record's memory_hash in the event buffer
+        // (root VMs have no COW pages, so cow_page_count stays 0).
+        self.state.finalize_exit_memory_hash(memory_hash, 0);
     }
 }
 

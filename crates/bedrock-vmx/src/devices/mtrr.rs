@@ -7,9 +7,9 @@
 //! EPT mappings are created as write-back elsewhere. Following bhyve's approach.
 
 #[cfg(not(feature = "cargo"))]
-use super::super::logging::{StateHash, Xxh64Hasher};
+use super::super::exit_record::{StateHash, Xxh64Hasher};
 #[cfg(feature = "cargo")]
-use crate::logging::{StateHash, Xxh64Hasher};
+use crate::exit_record::{StateHash, Xxh64Hasher};
 
 /// Number of variable range MTRRs (like bhyve's VMM_MTRR_VAR_MAX).
 pub const MTRR_VAR_MAX: usize = 10;

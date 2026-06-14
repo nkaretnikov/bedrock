@@ -6,9 +6,9 @@
 //! Port 0x70 selects which register to access, port 0x71 reads/writes it.
 
 #[cfg(not(feature = "cargo"))]
-use super::super::logging::{StateHash, Xxh64Hasher};
+use super::super::exit_record::{StateHash, Xxh64Hasher};
 #[cfg(feature = "cargo")]
-use crate::logging::{StateHash, Xxh64Hasher};
+use crate::exit_record::{StateHash, Xxh64Hasher};
 
 /// RTC (CMOS clock) state for time emulation.
 ///

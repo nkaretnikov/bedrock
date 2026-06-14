@@ -9,8 +9,14 @@ description = "VMX (Virtual Machine Extensions) support for x86-64 virtualizatio
 memory = { package = "bedrock-memory", path = "../bedrock-memory" }
 bedrock-log = { path = "../bedrock-log", default-features = false }
 bedrock-ept = { path = "../bedrock-ept", default-features = false }
+# Userspace-only (the `cargo` build): derive checked-cast (`zerocopy`) and
+# `serde::Serialize` impls on the shared event-stream types so the userspace
+# reader in `bedrock-vm` can cast and serialize them. The kernel-module build is
+# Kbuild, not Cargo, so it never pulls these crates.io dependencies.
+zerocopy = { version = "0.8", features = ["derive"], optional = true }
+serde = { version = "1.0", features = ["derive"], optional = true }
 
 [features]
 default = ["cargo"]
-cargo = ["bedrock-log/cargo", "bedrock-ept/cargo"]
+cargo = ["bedrock-log/cargo", "bedrock-ept/cargo", "dep:zerocopy", "dep:serde"]
 test-utils = []

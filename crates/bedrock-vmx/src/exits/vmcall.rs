@@ -86,12 +86,11 @@ fn copy_response_from_guest<C: VmContext>(
     Ok(())
 }
 
-/// Copy `len` bytes out of the registered serial-console page (at `gpa`)
-/// into `VmState.serial_console.pending_buf`, then reset the pending cursor
-/// so `serial_console_flush` drains from the start. Chunked through a small
-/// stack buffer for the same borrow/stack reasons as
-/// `copy_response_from_guest`. `len` must be `<= SERIAL_CONSOLE_PAGE_SIZE`,
-/// which is the capacity of `pending_buf`.
+/// Copy `len` bytes out of the registered serial-console page (at `gpa`) into
+/// `VmState.serial_console.pending_buf`, from where the caller emits them as one
+/// `Serial` event (`event_emit_console`). Chunked through a small stack buffer
+/// for the same borrow/stack reasons as `copy_response_from_guest`. `len` must
+/// be `<= SERIAL_CONSOLE_PAGE_SIZE`, which is the capacity of `pending_buf`.
 fn copy_serial_console_from_guest<C: VmContext>(
     ctx: &mut C,
     gpa: GuestPhysAddr,
@@ -106,9 +105,6 @@ fn copy_serial_console_from_guest<C: VmContext>(
         ctx.state_mut().serial_console.pending_buf[offset..offset + n].copy_from_slice(&chunk[..n]);
         offset += n;
     }
-    let console = &mut ctx.state_mut().serial_console;
-    console.pending_len = len;
-    console.pending_pos = 0;
     Ok(())
 }
 
@@ -122,7 +118,11 @@ pub fn handle_vmcall<C: VmContext, A: CowAllocator<C::CowPage>>(
     match hypercall_nr {
         HYPERCALL_SHUTDOWN => {
             // Log shutdown state if AtShutdown mode is enabled
-            ctx.state_mut().log_shutdown();
+            ctx.state_mut().capture_exit_at_shutdown();
+            // Event stream: flush any final non-newline-terminated early-boot
+            // line so it is not lost at shutdown (rare — the kernel
+            // newline-terminates records). No-op if the accumulator is empty.
+            let _ = ctx.state_mut().event_flush_serial_line();
 
             if let Err(e) = advance_rip(ctx) {
                 return ExitHandlerResult::Error(e);
@@ -131,7 +131,7 @@ pub fn handle_vmcall<C: VmContext, A: CowAllocator<C::CowPage>>(
         }
         HYPERCALL_SNAPSHOT => {
             // Log snapshot state (if logging is enabled)
-            ctx.state_mut().log_snapshot();
+            ctx.state_mut().capture_exit_at_snapshot();
 
             if let Err(e) = advance_rip(ctx) {
                 return ExitHandlerResult::Error(e);
@@ -424,6 +424,23 @@ pub fn handle_vmcall<C: VmContext, A: CowAllocator<C::CowPage>>(
             if let Err(e) = advance_rip(ctx) {
                 return ExitHandlerResult::Error(e);
             }
+            // Record the response delivery on the event stream: the metadata
+            // followed by the actual response bytes (just copied into
+            // `io_channel.response_buf`). Those bytes are host-derived, so the
+            // record clears the deterministic flag (handled in
+            // `event_emit_io_channel`). `status`/`exit_code` are 0 — the
+            // hypervisor treats the response as opaque bytes — and `target_tsc`
+            // is 0 on a response. The event buffer is drained by userspace on
+            // this VmcallIoResponse exit; a pending record (if the buffer filled)
+            // re-appends on the next RUN.
+            if result == 0 {
+                let payload = IoChannelPayload {
+                    phase: IoChannelPhase::Response as u8,
+                    _pad: [0; 7],
+                    target_tsc: 0,
+                };
+                let _ = ctx.state_mut().event_emit_io_channel(&payload);
+            }
             // Userspace drains the response via ioctl on this exit.
             ExitHandlerResult::ExitToUserspace(ExitReason::VmcallIoResponse)
         }
@@ -470,15 +487,11 @@ pub fn handle_vmcall<C: VmContext, A: CowAllocator<C::CowPage>>(
             ExitHandlerResult::Continue
         }
         HYPERCALL_SERIAL_WRITE => {
-            // RBX = number of bytes at the start of the registered console
-            // page to emit (clamped to PAGE_SIZE). Copy them into the host
-            // pending buffer, then drain into the existing serial sink so the
-            // per-line TSC metadata and buffer-full handling are reused. If
-            // the serial buffer fills mid-drain, the unsent tail stays pending
-            // and we exit to userspace exactly like the per-byte OUT path —
-            // the next serial_clear() flushes the tail into the drained
-            // buffer. RIP is advanced exactly once so the VMCALL is counted a
-            // single time (no non-deterministic double-counting on resume).
+            // RBX = number of bytes at the start of the registered console page
+            // to emit (clamped to PAGE_SIZE). Copy them into the host pending
+            // buffer and emit them as one `Serial` event. RIP is advanced
+            // exactly once so the VMCALL is counted a single time (no
+            // non-deterministic double-counting on resume).
             let len = (ctx.state().gprs.rbx as usize).min(SERIAL_CONSOLE_PAGE_SIZE);
             let page_gpa = ctx.state().serial_console.page_gpa;
             let result: u64 = if page_gpa == 0 {
@@ -501,11 +514,15 @@ pub fn handle_vmcall<C: VmContext, A: CowAllocator<C::CowPage>>(
             if let Err(e) = advance_rip(ctx) {
                 return ExitHandlerResult::Error(e);
             }
-            // Drain the freshly-copied bytes into the serial sink. On overflow,
-            // exit to userspace so the host drains the full buffer; the pending
-            // tail is resumed by the next serial_clear().
-            if result == 0 && !ctx.state_mut().serial_console_flush() {
-                return ExitHandlerResult::ExitToUserspace(ExitReason::IoInstruction);
+            if result == 0 {
+                // Emit this console record as one Serial event. First flush any
+                // residual early-boot line accumulator (cheap insurance — empty
+                // by construction at a clean handover) so a partial byte-path
+                // line never merges with a hypercall line. A full event buffer
+                // is handled centrally by the dispatcher (`event_buffer_full` ->
+                // drain), so the returns are ignored.
+                let _ = ctx.state_mut().event_flush_serial_line();
+                let _ = ctx.state_mut().event_emit_console(len);
             }
             ExitHandlerResult::Continue
         }

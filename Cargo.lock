@@ -109,6 +109,7 @@ version = "0.1.0"
 dependencies = [
  "bedrock-vm",
  "clap",
+ "serde_json",
 ]
 
 [[package]]
@@ -128,6 +129,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "zerocopy",
 ]
 
 [[package]]
@@ -137,6 +139,8 @@ dependencies = [
  "bedrock-ept",
  "bedrock-log",
  "bedrock-memory",
+ "serde",
+ "zerocopy",
 ]
 
 [[package]]

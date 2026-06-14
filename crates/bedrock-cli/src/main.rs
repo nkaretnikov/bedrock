@@ -12,9 +12,11 @@ use std::process;
 use clap::Parser;
 use log::{debug, info, trace, warn};
 
+use bedrock_vm::events::EventKind;
+use bedrock_vm::io_channel;
 use bedrock_vm::{
-    load_kernel, parse_line_tsc_entries, ExitKind, ExitStatsReport, LineTscEntry, LinuxBootConfig,
-    LogConfig, LogEntry, RdrandConfig, Vm, VmBuilder, BEDROCK_DEVICE_PATH, DEFAULT_TSC_FREQUENCY,
+    load_kernel, EventCategories, EventConfig, EventStream, ExitKind, ExitStatsReport, ExitTrigger,
+    LinuxBootConfig, RdrandConfig, Vm, VmBuilder, BEDROCK_DEVICE_PATH, DEFAULT_TSC_FREQUENCY,
 };
 
 use args::{Args, IoAction, RdrandMode, ScheduledIoAction};
@@ -22,11 +24,14 @@ use args::{Args, IoAction, RdrandMode, ScheduledIoAction};
 /// Line-buffered output that prefixes each line with a virtual time timestamp.
 ///
 /// The timestamp format is `[vt x.xxx]` where x.xxx is the emulated TSC
-/// converted to seconds since VM start. Uses per-line TSC values from
-/// serial buffer metadata when available for accurate timestamps.
+/// converted to seconds since VM start. Console output arrives as `Serial`
+/// event records, each stamped with the emulated TSC of its first byte; a line
+/// continued across records keeps that first record's TSC.
 struct LineBufferedOutput {
     /// Partial line buffer (content before newline received).
     buffer: String,
+    /// Emulated TSC at the start of the line currently in `buffer`.
+    line_tsc: u64,
     /// Optional file to write raw output (without timestamps).
     log_file: Option<File>,
 }
@@ -35,60 +40,34 @@ impl LineBufferedOutput {
     fn new(log_file: Option<File>) -> Self {
         Self {
             buffer: String::new(),
+            line_tsc: 0,
             log_file,
         }
     }
 
-    /// Process output from the guest, adding timestamps to each complete line.
-    ///
-    /// If `line_entries` is provided, uses per-line TSC values for accurate timestamps.
-    /// Otherwise falls back to using `fallback_tsc` for all lines.
-    fn write_with_line_tsc(
-        &mut self,
-        output: &str,
-        line_entries: Option<&[LineTscEntry]>,
-        fallback_tsc: u64,
-        tsc_frequency: u64,
-    ) {
-        // Write raw output to log file if present
+    /// Process one `Serial` event record (a chunk of console bytes stamped with
+    /// the emulated TSC of the chunk's first byte), printing each completed line
+    /// with a `[vt x.xxx]` timestamp. A fresh line takes `record_tsc` as its
+    /// start time; a line continued from a previous record keeps the earlier
+    /// start TSC. Bytes not yet terminated by `\n` stay buffered.
+    fn write_serial_record(&mut self, bytes: &[u8], record_tsc: u64, tsc_frequency: u64) {
+        // Write raw output to log file if present.
         if let Some(ref mut f) = self.log_file {
-            let _ = f.write_all(output.as_bytes());
+            let _ = f.write_all(bytes);
             let _ = f.flush();
         }
 
-        // Track current byte offset to match with line entries
-        let mut byte_offset: usize = 0;
-        let mut line_idx: usize = 0;
-
-        // Process output character by character
-        for ch in output.chars() {
+        for ch in String::from_utf8_lossy(bytes).chars() {
+            if self.buffer.is_empty() {
+                self.line_tsc = record_tsc;
+            }
             if ch == '\n' {
-                // Complete line - find the TSC for this line
-                let tsc = if let Some(entries) = line_entries {
-                    // Find the entry whose offset matches the start of this line
-                    // The buffer contains the line content (excluding newline)
-                    // The line started at (byte_offset - buffer.len())
-                    let line_start = byte_offset.saturating_sub(self.buffer.len());
-                    entries
-                        .iter()
-                        .skip(line_idx)
-                        .find(|e| e.offset as usize == line_start)
-                        .map(|e| {
-                            line_idx += 1;
-                            e.tsc
-                        })
-                        .unwrap_or(fallback_tsc)
-                } else {
-                    fallback_tsc
-                };
-
-                let secs = tsc as f64 / tsc_frequency as f64;
+                let secs = self.line_tsc as f64 / tsc_frequency as f64;
                 println!("[vt {:>8.3}] {}", secs, self.buffer);
                 self.buffer.clear();
             } else {
                 self.buffer.push(ch);
             }
-            byte_offset += ch.len_utf8();
         }
 
         let _ = std::io::stdout().flush();
@@ -117,74 +96,30 @@ fn log_vm_exit(vm: &Vm, msg: &str) {
     warn!("VM exit: {} at RIP {:#018x}", msg, rip);
 }
 
-/// Request-side magic on the I/O channel shared page; must match the
-/// `IO_REQUEST_MAGIC` constant in `bedrock-io.c`.
-const IO_REQUEST_MAGIC: u32 = 0xB10C1010;
-/// Response-side magic.
-const IO_RESPONSE_MAGIC: u32 = 0x1010B10C;
-/// Action ID for "list running containers".
-const ACTION_GET_WORKLOAD_DETAILS: u32 = 0;
-/// Action ID for "exec bash command in a container".
-const ACTION_EXEC_BASH: u32 = 1;
-/// Action ID for "exec bash command on the guest itself (outside any container)".
-const ACTION_EXEC_HOST_BASH: u32 = 2;
-
-/// Serialize an `IoAction` into the wire format the guest module parses.
-///
-/// Header layout: `u32 magic | u32 action_id | u32 payload_len`, followed
-/// by `payload_len` bytes of action-specific payload. For `ExecBash` the
-/// payload is two NUL-terminated strings (`container\0cmd\0`) so the guest
-/// can use plain `strnlen` to find the boundary. For `ExecHostBash` the
-/// payload is a single NUL-terminated `cmd\0`.
+/// Serialize an `IoAction` into the I/O channel request wire format.
 fn encode_io_action(action: &IoAction) -> Vec<u8> {
-    let (action_id, payload) = match action {
-        IoAction::GetWorkloadDetails => (ACTION_GET_WORKLOAD_DETAILS, Vec::new()),
-        IoAction::ExecBash { container, cmd } => {
-            let mut p = Vec::with_capacity(container.len() + cmd.len() + 2);
-            p.extend_from_slice(container.as_bytes());
-            p.push(0);
-            p.extend_from_slice(cmd.as_bytes());
-            p.push(0);
-            (ACTION_EXEC_BASH, p)
-        }
-        IoAction::ExecHostBash { cmd } => {
-            let mut p = Vec::with_capacity(cmd.len() + 1);
-            p.extend_from_slice(cmd.as_bytes());
-            p.push(0);
-            (ACTION_EXEC_HOST_BASH, p)
-        }
-    };
-    let mut bytes = Vec::with_capacity(12 + payload.len());
-    bytes.extend_from_slice(&IO_REQUEST_MAGIC.to_le_bytes());
-    bytes.extend_from_slice(&action_id.to_le_bytes());
-    bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    bytes.extend_from_slice(&payload);
-    bytes
+    io_channel::encode_request(
+        action.container.as_deref(),
+        &action.command,
+        action.record_output,
+    )
 }
 
-/// Parse the response header out of the bytes drained from the I/O channel.
-/// Returns `(status, exit_code, data)` where `data` is a borrow into the
-/// caller's buffer covering only the payload region.
-fn decode_io_response(bytes: &[u8]) -> Result<(i32, i32, &[u8]), String> {
-    if bytes.len() < 16 {
-        return Err(format!("response too short: {} bytes", bytes.len()));
+/// Read `len` bytes of recorded command output from the output feedback
+/// buffer (registered by the guest under `IO_OUTPUT_BUFFER_ID`).
+fn read_io_output(vm: &mut Vm, len: usize) -> io::Result<Vec<u8>> {
+    let slots = vm.feedback_buffer_slots_for_id(io_channel::IO_OUTPUT_BUFFER_ID)?;
+    let slot = match slots.first() {
+        Some(&s) => s,
+        None => return Ok(Vec::new()),
+    };
+    if vm.feedback_buffer_at(slot).is_none() {
+        vm.map_feedback_buffer_at(slot)?;
     }
-    let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-    if magic != IO_RESPONSE_MAGIC {
-        return Err(format!("bad response magic {:#x}", magic));
-    }
-    let status = i32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-    let exit_code = i32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
-    let data_len = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) as usize;
-    let data_end = 16 + data_len;
-    if data_end > bytes.len() {
-        return Err(format!(
-            "response data overruns: {} > {}",
-            data_end,
-            bytes.len()
-        ));
-    }
-    Ok((status, exit_code, &bytes[16..data_end]))
+    Ok(vm
+        .feedback_buffer_at(slot)
+        .map(|b| b[..len.min(b.len())].to_vec())
+        .unwrap_or_default())
 }
 
 /// Dump the feedback buffer to a file.
@@ -262,37 +197,67 @@ fn build_rdrand_config(args: &Args) -> RdrandConfig {
     }
 }
 
-/// Build log config from command-line arguments.
-/// Returns None if logging is not enabled.
-fn build_log_config(args: &Args) -> Option<LogConfig> {
-    let log_start_tsc = args.log_after_tsc.unwrap_or(0);
+/// Build the unified event-stream config from command-line arguments.
+///
+/// `--event-categories` selects the non-exit kinds; `--exit-capture` /
+/// `--single-step` set the `Exit` trigger policy and, when active, add the
+/// `EXIT` category. Returns an enabled config; the caller only applies it when
+/// `--events-jsonl` provides a drain sink.
+fn build_event_config(args: &Args) -> EventConfig {
+    // `--exit-capture`/`--single-step` own the EXIT category; ignore any `exit`
+    // token in `--event-categories` so the two can't disagree.
+    let mut categories = parse_event_categories(&args.event_categories);
+    categories.0 &= !EventCategories::EXIT.0;
+    // Serial is the console: always captured so guest output is printed,
+    // regardless of `--event-categories`.
+    categories = categories.union(EventCategories::SERIAL);
 
-    let config = if args.single_step.is_some() {
-        // Single-step mode uses TscRange logging
-        Some(LogConfig::tsc_range().with_start_tsc(log_start_tsc))
-    } else if args.log_at_shutdown {
-        Some(LogConfig::at_shutdown().with_start_tsc(log_start_tsc))
-    } else if let Some(target_tsc) = args.log_at_tsc {
-        Some(LogConfig::at_tsc(target_tsc).with_start_tsc(log_start_tsc))
-    } else if let Some(interval) = args.log_checkpoints {
-        Some(LogConfig::checkpoints(interval).with_start_tsc(log_start_tsc))
-    } else if args.should_enable_log() {
-        Some(LogConfig::all_exits(0).with_start_tsc(log_start_tsc))
-    } else {
-        None
-    };
-
-    let config = if args.no_memory_hash {
-        config.map(|c| c.with_no_memory_hash())
-    } else {
-        config
-    };
-
-    if args.intercept_pf {
-        config.map(|c| c.with_intercept_pf())
-    } else {
-        config
+    let (trigger, target_tsc) = args.exit_trigger();
+    if trigger != ExitTrigger::Disabled {
+        categories = categories.union(EventCategories::EXIT);
     }
+
+    let mut config = EventConfig::enabled(categories)
+        .with_exit_trigger(trigger, target_tsc)
+        .with_exit_start_tsc(args.exit_after_tsc.unwrap_or(0));
+    if args.no_memory_hash {
+        config = config.with_no_memory_hash();
+    }
+    if args.intercept_pf {
+        config = config.with_intercept_pf();
+    }
+    config
+}
+
+/// Parse a comma-separated list of event categories into a mask.
+fn parse_event_categories(s: &str) -> EventCategories {
+    let all = EventCategories::EXIT
+        .union(EventCategories::SERIAL)
+        .union(EventCategories::INJECT)
+        .union(EventCategories::RANDOMNESS)
+        .union(EventCategories::IO_CHANNEL)
+        .union(EventCategories::DIAGNOSTIC);
+    let mut mask = EventCategories::empty();
+    for tok in s.split(',') {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        mask = mask.union(match tok.to_ascii_lowercase().as_str() {
+            "exit" => EventCategories::EXIT,
+            "serial" => EventCategories::SERIAL,
+            "inject" => EventCategories::INJECT,
+            "randomness" | "random" => EventCategories::RANDOMNESS,
+            "io_channel" | "iochannel" | "io" => EventCategories::IO_CHANNEL,
+            "diagnostic" | "diag" => EventCategories::DIAGNOSTIC,
+            "all" => all,
+            other => {
+                warn!("unknown event category '{}', ignoring", other);
+                EventCategories::empty()
+            }
+        });
+    }
+    mask
 }
 
 fn run() -> io::Result<()> {
@@ -328,10 +293,10 @@ fn run() -> io::Result<()> {
             RdrandMode::Userspace => "userspace (exit to userspace)".to_string(),
         }
     );
-    if args.should_enable_log() {
-        debug!("  {:<14}enabled", "Exit logging:");
-        debug_opt!("Log JSONL:", args.log_jsonl);
+    if args.should_capture_exits() {
+        debug!("  {:<14}enabled", "Exit capture:");
     }
+    debug_opt!("Events JSONL:", args.events_jsonl);
     debug_opt!(
         "Single-step:",
         args.single_step
@@ -345,7 +310,6 @@ fn run() -> io::Result<()> {
 
     // Build configs from args
     let rdrand_config = build_rdrand_config(&args);
-    let log_config = build_log_config(&args);
 
     // Build VM configuration
     let mut builder = VmBuilder::new().rdrand(rdrand_config);
@@ -361,9 +325,6 @@ fn run() -> io::Result<()> {
             .tsc_frequency(tsc_frequency);
     }
 
-    if let Some(config) = log_config {
-        builder = builder.logging(config);
-    }
     if let Some((start, end)) = args.single_step {
         builder = builder.single_step(start, end);
     }
@@ -404,28 +365,31 @@ fn run() -> io::Result<()> {
         );
     }
 
-    // Open JSONL files for logging (deterministic + non-deterministic)
-    let mut log_jsonl_file: Option<std::io::BufWriter<File>> =
-        if let Some(ref path) = args.log_jsonl {
-            let f = File::create(path)?;
-            Some(std::io::BufWriter::new(f))
+    // Enable the unified event stream. `--event-categories` chooses which kinds
+    // are captured; `--exit-capture` / `--single-step` add `Exit` records and
+    // set their trigger policy. `--events-jsonl` is the sole sink — exit records
+    // are just events with `kind: "exit"`.
+    let mut events_jsonl_file: Option<std::io::BufWriter<File>> =
+        if let Some(ref path) = args.events_jsonl {
+            Some(std::io::BufWriter::new(File::create(path)?))
         } else {
             None
         };
-    let mut log_jsonl_nondeterm_file: Option<std::io::BufWriter<File>> =
-        if let Some(ref path) = args.log_jsonl {
-            let nondeterm_path = if let Some(stem) = path.strip_suffix(".jsonl") {
-                format!("{}-nondeterm.jsonl", stem)
-            } else {
-                format!("{}-nondeterm", path)
-            };
-            let f = File::create(&nondeterm_path)?;
-            Some(std::io::BufWriter::new(f))
-        } else {
-            None
-        };
-    let mut total_log_count: usize = 0;
-    let mut total_nondeterm_log_count: usize = 0;
+    let mut total_event_count: usize = 0;
+
+    // Always enable the event stream: guest serial output flows through it as
+    // `Serial` records (printed to the console below). `--events-jsonl`
+    // additionally drains every record (exits included) to a file.
+    let event_config = build_event_config(&args);
+    vm.set_event_config(&event_config)
+        .map_err(|e| io::Error::other(format!("failed to enable event stream: {}", e)))?;
+    info!(
+        "Event stream enabled (categories={:#x})",
+        event_config.categories
+    );
+    if args.should_capture_exits() && args.events_jsonl.is_none() {
+        warn!("--exit-capture/--single-step capture exit records but --events-jsonl is not set; they will not be saved");
+    }
 
     // Setup for new VMs (not forked)
     if vm.is_root() {
@@ -510,36 +474,25 @@ fn run() -> io::Result<()> {
 
         match vm.run() {
             Ok(exit) => {
-                // Print serial output with timestamps
-                if exit.serial_len > 0 {
-                    let serial_str = vm.serial_output_str(exit.serial_len as usize);
-                    // Parse line TSC entries from the TSC metadata page for accurate per-line timestamps
-                    let line_entries = parse_line_tsc_entries(vm.serial_tsc_buffer());
-                    output.write_with_line_tsc(
-                        serial_str,
-                        line_entries.as_deref(),
-                        exit.emulated_tsc,
-                        exit.tsc_frequency,
-                    );
-                }
-
-                // Write log entries to JSONL (split by deterministic flag)
-                if exit.log_entry_count > 0 {
-                    if let Some(buffer) = vm.log_buffer() {
-                        let entries = LogEntry::from_buffer(buffer, exit.log_entry_count as usize);
-                        for entry in entries {
-                            if entry.is_deterministic() {
-                                if let Some(ref mut w) = log_jsonl_file {
-                                    let _ = serde_json::to_writer(&mut *w, entry);
-                                    let _ = writeln!(w);
-                                }
-                                total_log_count += 1;
-                            } else {
-                                if let Some(ref mut w) = log_jsonl_nondeterm_file {
-                                    let _ = serde_json::to_writer(&mut *w, entry);
-                                    let _ = writeln!(w);
-                                }
-                                total_nondeterm_log_count += 1;
+                // Drain the unified event stream once: print `Serial` records as
+                // timestamped console lines, and (when --events-jsonl is set)
+                // write every record — exits included, each with its
+                // `deterministic` flag — to the JSONL sink.
+                if exit.event_len > 0 {
+                    if let Some(buffer) = vm.event_buffer() {
+                        let drained = &buffer[..(exit.event_len as usize).min(buffer.len())];
+                        for rec in EventStream::new(drained) {
+                            if rec.kind() == EventKind::Serial.as_u16() {
+                                output.write_serial_record(
+                                    rec.payload,
+                                    rec.tsc(),
+                                    exit.tsc_frequency,
+                                );
+                            }
+                            if let Some(ref mut w) = events_jsonl_file {
+                                let _ = serde_json::to_writer(&mut *w, &rec.to_json());
+                                let _ = writeln!(w);
+                                total_event_count += 1;
                             }
                         }
                     }
@@ -593,20 +546,25 @@ fn run() -> io::Result<()> {
                     }
                     ExitKind::IoResponse => {
                         match vm.drain_io_response() {
-                            Ok(bytes) => match decode_io_response(&bytes) {
-                                Ok((status, exit_code, data)) => {
+                            Ok(bytes) => match io_channel::decode_response(&bytes) {
+                                Some(resp) => {
                                     info!(
-                                        "I/O response: status={} exit_code={} ({} bytes)",
-                                        status,
-                                        exit_code,
-                                        data.len()
+                                        "I/O response: status={} exit_code={} output_len={}",
+                                        resp.status, resp.exit_code, resp.output_len
                                     );
-                                    if !data.is_empty() {
-                                        print!("{}", String::from_utf8_lossy(data));
-                                        let _ = io::stdout().flush();
+                                    if resp.output_len > 0 {
+                                        match read_io_output(&mut vm, resp.output_len as usize) {
+                                            Ok(out) => {
+                                                print!("{}", String::from_utf8_lossy(&out));
+                                                let _ = io::stdout().flush();
+                                            }
+                                            Err(e) => {
+                                                warn!("Failed to read recorded output: {}", e)
+                                            }
+                                        }
                                     }
                                 }
-                                Err(e) => warn!("Failed to decode I/O response: {}", e),
+                                None => warn!("Failed to decode I/O response header"),
                             },
                             Err(e) => warn!("Failed to drain I/O response: {}", e),
                         }
@@ -616,7 +574,7 @@ fn run() -> io::Result<()> {
                         info!("VM ready (VMCALL hypercall) at tsc {}", exit.emulated_tsc);
                         continue;
                     }
-                    ExitKind::Continue | ExitKind::LogBufferFull => continue,
+                    ExitKind::Continue | ExitKind::EventBufferFull => continue,
                     ExitKind::Rdrand | ExitKind::Rdseed => {
                         warn!("VM exit: RDRAND/RDSEED in userspace mode not supported by CLI");
                         break;
@@ -656,33 +614,12 @@ fn run() -> io::Result<()> {
     // Flush any partial line from guest output
     output.flush_partial();
 
-    // Flush JSONL files
-    if let Some(ref mut jsonl_writer) = log_jsonl_file {
-        let _ = jsonl_writer.flush();
+    // Flush the event JSONL sink.
+    if let Some(ref mut w) = events_jsonl_file {
+        let _ = w.flush();
     }
-    if let Some(ref mut jsonl_writer) = log_jsonl_nondeterm_file {
-        let _ = jsonl_writer.flush();
-    }
-    if let Some(ref path) = args.log_jsonl {
-        if total_log_count > 0 {
-            info!(
-                "Wrote {} deterministic log entries to {}",
-                total_log_count, path
-            );
-        } else {
-            debug!("No deterministic log entries written to {}", path);
-        }
-        if total_nondeterm_log_count > 0 {
-            let nondeterm_path = if let Some(stem) = path.strip_suffix(".jsonl") {
-                format!("{}-nondeterm.jsonl", stem)
-            } else {
-                format!("{}-nondeterm", path)
-            };
-            info!(
-                "Wrote {} non-deterministic log entries to {}",
-                total_nondeterm_log_count, nondeterm_path
-            );
-        }
+    if let Some(ref path) = args.events_jsonl {
+        info!("Wrote {} event records to {}", total_event_count, path);
     }
 
     // Display exit statistics after VM shutdown

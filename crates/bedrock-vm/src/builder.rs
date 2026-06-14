@@ -4,7 +4,7 @@
 
 use crate::error::VmError;
 use crate::rdrand::RdrandConfig;
-use crate::vm::{LogConfig, Vm, BEDROCK_DEVICE_PATH, DEFAULT_TSC_FREQUENCY};
+use crate::vm::{Vm, BEDROCK_DEVICE_PATH, DEFAULT_TSC_FREQUENCY};
 
 /// Default guest memory size (4 GB).
 const DEFAULT_MEMORY_SIZE: usize = 4 * 1024 * 1024 * 1024;
@@ -32,7 +32,6 @@ pub struct VmBuilder {
     tsc_frequency: u64,
     device_path: String,
     rdrand_config: Option<RdrandConfig>,
-    log_config: Option<LogConfig>,
     single_step: Option<(u64, u64)>,
     stop_at_tsc: Option<u64>,
     parent_id: Option<u64>,
@@ -45,7 +44,6 @@ impl VmBuilder {
     /// - Memory size: 4 GB (ignored for forked VMs)
     /// - Device path: /dev/bedrock
     /// - RDRAND: Not configured (uses kernel default)
-    /// - Logging: Disabled
     /// - Single-step: Disabled
     /// - Stop-at-TSC: Disabled
     /// - Parent: None (creates root VM)
@@ -55,7 +53,6 @@ impl VmBuilder {
             tsc_frequency: DEFAULT_TSC_FREQUENCY,
             device_path: BEDROCK_DEVICE_PATH.to_string(),
             rdrand_config: None,
-            log_config: None,
             single_step: None,
             stop_at_tsc: None,
             parent_id: None,
@@ -102,12 +99,6 @@ impl VmBuilder {
         self
     }
 
-    /// Configure deterministic logging.
-    pub fn logging(mut self, config: LogConfig) -> Self {
-        self.log_config = Some(config);
-        self
-    }
-
     /// Set a custom device path (default: /dev/bedrock).
     pub fn device_path(mut self, path: &str) -> Self {
         self.device_path = path.to_string();
@@ -139,7 +130,7 @@ impl VmBuilder {
     /// - Memory mapping fails
     /// - Configuration fails
     pub fn build(self) -> Result<Vm, VmError> {
-        let mut vm = if let Some(parent_id) = self.parent_id {
+        let vm = if let Some(parent_id) = self.parent_id {
             // Create forked VM
             Vm::create_forked(parent_id).map_err(|e| VmError::Ioctl {
                 operation: "CREATE_FORKED_VM",
@@ -172,13 +163,6 @@ impl VmBuilder {
         if let Some(config) = self.rdrand_config {
             vm.set_rdrand_config(&config).map_err(|e| VmError::Ioctl {
                 operation: "SET_RDRAND_CONFIG",
-                source: e,
-            })?;
-        }
-
-        if let Some(config) = self.log_config {
-            vm.set_log_config(&config).map_err(|e| VmError::Ioctl {
-                operation: "SET_LOG_CONFIG",
                 source: e,
             })?;
         }
@@ -219,7 +203,6 @@ mod tests {
         assert_eq!(builder.tsc_frequency, DEFAULT_TSC_FREQUENCY);
         assert_eq!(builder.device_path, BEDROCK_DEVICE_PATH);
         assert!(builder.rdrand_config.is_none());
-        assert!(builder.log_config.is_none());
         assert!(builder.single_step.is_none());
         assert!(builder.stop_at_tsc.is_none());
         assert!(builder.parent_id.is_none());

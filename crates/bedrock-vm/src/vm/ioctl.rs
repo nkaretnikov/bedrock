@@ -4,7 +4,7 @@
 
 use std::mem::size_of;
 
-use super::config::{LogConfig, SingleStepConfig};
+use super::config::{EventConfig, SingleStepConfig};
 use super::exit::VmExit;
 use super::serial::SerialInput;
 use super::stats::ExitStats;
@@ -67,14 +67,15 @@ pub(crate) const BEDROCK_VM_SET_RDRAND_CONFIG: u64 =
     ioctl_iow(BEDROCK_IOC_MAGIC, 5, size_of::<RdrandConfig>());
 pub(crate) const BEDROCK_VM_SET_RDRAND_VALUE: u64 =
     ioctl_iow(BEDROCK_IOC_MAGIC, 6, size_of::<u64>());
-pub(crate) const BEDROCK_VM_SET_LOG_CONFIG: u64 =
-    ioctl_iow(BEDROCK_IOC_MAGIC, 7, size_of::<LogConfig>());
 pub(crate) const BEDROCK_VM_SET_SINGLE_STEP: u64 =
     ioctl_iow(BEDROCK_IOC_MAGIC, 8, size_of::<SingleStepConfig>());
 pub(crate) const BEDROCK_VM_GET_EXIT_STATS: u64 =
     ioctl_ior(BEDROCK_IOC_MAGIC, 9, size_of::<ExitStats>());
 pub(crate) const BEDROCK_VM_SET_STOP_TSC: u64 = ioctl_iow(BEDROCK_IOC_MAGIC, 10, size_of::<u64>());
 pub(crate) const BEDROCK_VM_GET_VM_ID: u64 = ioctl_ior(BEDROCK_IOC_MAGIC, 11, size_of::<u64>());
+/// Unified event-stream configuration (enable + category mask + exit trigger).
+pub(crate) const BEDROCK_VM_SET_EVENT_CONFIG: u64 =
+    ioctl_iow(BEDROCK_IOC_MAGIC, 15, size_of::<EventConfig>());
 
 // Device ioctls (on /dev/bedrock)
 // _IOW('B', 1, u64) - takes parent VM ID as argument

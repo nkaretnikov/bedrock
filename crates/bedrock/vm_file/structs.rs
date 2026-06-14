@@ -37,10 +37,6 @@ pub(crate) const BEDROCK_VM_SET_RDRAND_CONFIG: u32 =
 /// Ioctl number for SET_RDRAND_VALUE command - set pending RDRAND value.
 pub(crate) const BEDROCK_VM_SET_RDRAND_VALUE: u32 = _IOW::<u64>(BEDROCK_IOC_MAGIC, 6);
 
-/// Ioctl number for SET_LOG_CONFIG command - unified logging configuration.
-/// Replaces ENABLE_LOGGING, DISABLE_LOGGING, SET_LOG_MODE, SET_LOG_THRESHOLD, SET_LOG_START_TSC.
-pub(crate) const BEDROCK_VM_SET_LOG_CONFIG: u32 = _IOW::<BedrockLogConfig>(BEDROCK_IOC_MAGIC, 7);
-
 /// Ioctl number for SET_SINGLE_STEP command - configure MTF single-stepping.
 pub(crate) const BEDROCK_VM_SET_SINGLE_STEP: u32 =
     _IOW::<BedrockSingleStepConfig>(BEDROCK_IOC_MAGIC, 8);
@@ -66,6 +62,10 @@ pub(crate) const BEDROCK_VM_QUEUE_IO_ACTION: u32 =
 /// Ioctl number for DRAIN_IO_RESPONSE command - drain the most recent I/O channel response.
 pub(crate) const BEDROCK_VM_DRAIN_IO_RESPONSE: u32 =
     _IOR::<BedrockIoActionPayload>(BEDROCK_IOC_MAGIC, 14);
+
+/// Ioctl number for SET_EVENT_CONFIG command - unified event-stream configuration.
+pub(crate) const BEDROCK_VM_SET_EVENT_CONFIG: u32 =
+    _IOW::<BedrockEventConfig>(BEDROCK_IOC_MAGIC, 15);
 
 /// Maximum I/O channel payload size (one 4KB page).
 pub(crate) const BEDROCK_IO_CHANNEL_BUF_SIZE: usize = 4096;
@@ -180,32 +180,28 @@ pub(crate) struct BedrockSingleStepConfig {
     pub tsc_end: u64,
 }
 
-/// Unified logging configuration passed from userspace.
+/// Unified event-stream configuration passed from userspace
+/// (`BEDROCK_VM_SET_EVENT_CONFIG`). Must match `bedrock_vm::EventConfig`.
 ///
-/// This struct combines all logging-related settings into a single ioctl:
-/// - Buffer allocation (enabled)
-/// - Logging mode (mode)
-/// - Mode-specific target (target_tsc)
-/// - Universal start threshold (start_tsc)
-/// - Flags bitfield for optional behavior
+/// One struct configures the whole stream: the buffer enable + category mask,
+/// plus the `Exit`-record trigger policy in the `exit_*` fields.
 #[repr(C)]
-pub(crate) struct BedrockLogConfig {
-    /// Whether logging is enabled. When transitioning from disabled to enabled,
-    /// allocates the log buffer. When transitioning from enabled to disabled,
-    /// frees the buffer.
+pub(crate) struct BedrockEventConfig {
+    /// Whether the event stream is enabled. The disabled->enabled transition
+    /// allocates the event buffer; enabled->disabled frees it.
     pub enabled: u32,
-    /// Mode: 0 = Disabled, 1 = AllExits, 2 = AtTsc, 3 = AtShutdown, 4 = Checkpoints, 5 = TscRange.
-    pub mode: u32,
-    /// Target TSC value (threshold for AllExits, trigger for AtTsc, interval for Checkpoints).
-    pub target_tsc: u64,
-    /// Universal start threshold - no logging occurs until TSC reaches this value.
-    /// Set to 0 to log from the start.
-    pub start_tsc: u64,
-    /// Flags bitfield. Bit 0: skip memory hashing (LOG_FLAG_NO_MEMORY_HASH).
-    /// Bit 1: intercept guest #PF (LOG_FLAG_INTERCEPT_PF).
-    pub flags: u32,
-    /// Reserved for alignment.
-    pub _reserved: u32,
+    /// Category include mask (see `bedrock_vmx::events::EventCategories`).
+    pub categories: u32,
+    /// `Exit`-record trigger (`ExitTrigger` as u32): 0 = Disabled, 1 = AllExits,
+    /// 2 = AtTsc, 3 = AtShutdown, 4 = Checkpoints, 5 = TscRange.
+    pub exit_trigger: u32,
+    /// Exit flags bitfield. Bit 0: skip memory hashing. Bit 1: intercept #PF.
+    pub exit_flags: u32,
+    /// Mode-specific TSC (AtTsc threshold / Checkpoints interval; 0 otherwise).
+    pub exit_target_tsc: u64,
+    /// Universal start threshold — no `Exit` records until TSC reaches this
+    /// value. 0 = capture from the start.
+    pub exit_start_tsc: u64,
 }
 
 /// Per-exit-type statistics for userspace.
@@ -284,22 +280,25 @@ pub(crate) struct BedrockExitStats {
 
 /// VM exit information returned to userspace from RUN ioctl.
 ///
-/// Serial output is accessed via mmap at offset = guest_memory_size.
-/// Log buffer is accessed via mmap at offset = guest_memory_size + 4096.
+/// All host-visible output (serial console included) is carried by the unified
+/// event buffer, mmap'd separately and drained as `buffer[0..event_len]`.
 #[repr(C)]
 pub(crate) struct BedrockVmExit {
     /// Exit reason (ExitReason as u32).
     pub exit_reason: u32,
-    /// Number of valid bytes in the serial buffer (mmap'd separately).
-    pub serial_len: u32,
+    /// Reserved (formerly the serial buffer length; guest serial output now
+    /// flows through the event stream). Kept so the ioctl struct layout is
+    /// unchanged.
+    pub _reserved: u32,
     /// Exit qualification (interpretation depends on exit reason).
     pub exit_qualification: u64,
     /// Guest physical address (for EPT violations).
     pub guest_physical_addr: u64,
-    /// Number of log entries in the log buffer (if logging enabled).
-    pub log_entry_count: u32,
-    /// Reserved for alignment.
-    pub _reserved: u32,
+    /// Number of valid bytes in the event buffer (mmap'd separately). Zero when
+    /// the event stream is disabled.
+    pub event_len: u32,
+    /// Explicit padding so the following `u64` fields are 8-byte aligned.
+    pub _pad: u32,
     /// Current emulated TSC value.
     pub emulated_tsc: u64,
     /// TSC frequency in Hz.

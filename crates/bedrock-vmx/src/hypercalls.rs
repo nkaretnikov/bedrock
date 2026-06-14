@@ -111,11 +111,10 @@ pub const HYPERCALL_SERIAL_REGISTER_PAGE: u64 = 8;
 /// - RAX: 0 on success, !0 on failure (no page registered or guest memory
 ///   access failed).
 ///
-/// The hypervisor copies those bytes and feeds them through the existing
-/// per-byte serial sink (`VmState::serial_write`), so the buffer-full
-/// drain-to-userspace path and per-line TSC metadata are reused unchanged.
-/// This batches one whole printk record into a single VM exit instead of one
-/// exit per byte through the emulated 8250 UART.
+/// The hypervisor copies those bytes and emits them as one `Serial` event
+/// record (stamped with the line-start emulated TSC). This batches one whole
+/// printk record into a single VM exit instead of one exit per byte through the
+/// emulated 8250 UART.
 pub const HYPERCALL_SERIAL_WRITE: u64 = 9;
 
 /// Register a single 4KB page as the PEBS scratch page for precise VM exits.

@@ -117,17 +117,29 @@ pub use crate::exits::{
 // Logging
 // =============================================================================
 #[cfg(not(feature = "cargo"))]
-pub use super::logging::{
-    LogEntry, StateHash, Xxh64Hasher, LOG_ENTRY_FLAG_DETERMINISTIC, MAX_LOG_ENTRIES,
-};
+pub use super::exit_record::{ExitRecord, StateHash, Xxh64Hasher, EXIT_RECORD_FLAG_DETERMINISTIC};
 #[cfg(feature = "cargo")]
-pub use crate::logging::{
-    LogEntry, StateHash, Xxh64Hasher, LOG_ENTRY_FLAG_DETERMINISTIC, MAX_LOG_ENTRIES,
-};
+pub use crate::exit_record::{ExitRecord, StateHash, Xxh64Hasher, EXIT_RECORD_FLAG_DETERMINISTIC};
 
 // Logging macros - in kernel builds, macros are available via #[macro_use] on mod log
 #[cfg(feature = "cargo")]
 pub use bedrock_log::{log_debug, log_err, log_info, log_warn};
+
+// =============================================================================
+// Event stream (wire-format types)
+// =============================================================================
+#[cfg(not(feature = "cargo"))]
+pub use super::events::{
+    align_up, EventCategories, EventHeader, EventKind, InjectPayload, InjectSource,
+    IoChannelPayload, IoChannelPhase, RandomPayload, RandomSource, EVENT_BUFFER_SIZE,
+    EVENT_FLAG_DETERMINISTIC, EVENT_HEADER_SIZE,
+};
+#[cfg(feature = "cargo")]
+pub use crate::events::{
+    align_up, EventCategories, EventHeader, EventKind, InjectPayload, InjectSource,
+    IoChannelPayload, IoChannelPhase, RandomPayload, RandomSource, EVENT_BUFFER_SIZE,
+    EVENT_FLAG_DETERMINISTIC, EVENT_HEADER_SIZE,
+};
 
 // =============================================================================
 // Instruction decoder
@@ -166,16 +178,16 @@ pub use crate::cow::CowPageMap;
 // =============================================================================
 #[cfg(not(feature = "cargo"))]
 pub use super::vm_state::{
-    box_vm_state, AllExitStats, EnqueueResult, ExitStats, FeedbackBufferInfo, IoChannelState,
-    LogMode, PendingIoAction, SerialConsoleState, SyscallMsrs, VmState, VmStateBox, VmStateError,
-    DEFAULT_TSC_FREQUENCY, FEEDBACK_BUFFER_ID_MAX_LEN, FEEDBACK_BUFFER_MAX_PAGES,
+    box_vm_state, AllExitStats, EnqueueResult, ExitStats, ExitTrigger, FeedbackBufferInfo,
+    IoChannelState, PendingIoAction, SerialConsoleState, SyscallMsrs, VmState, VmStateBox,
+    VmStateError, DEFAULT_TSC_FREQUENCY, FEEDBACK_BUFFER_ID_MAX_LEN, FEEDBACK_BUFFER_MAX_PAGES,
     IO_CHANNEL_BUF_SIZE, MAX_FEEDBACK_BUFFERS, PENDING_IO_QUEUE_CAP, SERIAL_CONSOLE_PAGE_SIZE,
 };
 #[cfg(feature = "cargo")]
 pub use crate::vm_state::{
-    box_vm_state, AllExitStats, EnqueueResult, ExitStats, FeedbackBufferInfo, IoChannelState,
-    LogMode, PendingIoAction, SerialConsoleState, SyscallMsrs, VmState, VmStateBox, VmStateError,
-    DEFAULT_TSC_FREQUENCY, FEEDBACK_BUFFER_ID_MAX_LEN, FEEDBACK_BUFFER_MAX_PAGES,
+    box_vm_state, AllExitStats, EnqueueResult, ExitStats, ExitTrigger, FeedbackBufferInfo,
+    IoChannelState, PendingIoAction, SerialConsoleState, SyscallMsrs, VmState, VmStateBox,
+    VmStateError, DEFAULT_TSC_FREQUENCY, FEEDBACK_BUFFER_ID_MAX_LEN, FEEDBACK_BUFFER_MAX_PAGES,
     IO_CHANNEL_BUF_SIZE, MAX_FEEDBACK_BUFFERS, PENDING_IO_QUEUE_CAP, SERIAL_CONSOLE_PAGE_SIZE,
 };
 

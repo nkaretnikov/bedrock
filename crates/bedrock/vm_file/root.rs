@@ -13,10 +13,10 @@ use kernel::bindings;
 use kernel::sync::Arc;
 
 use super::super::c_helpers::{
-    bedrock_copy_from_user, bedrock_remap_page, bedrock_remap_pages, bedrock_remap_vmalloc_range,
+    bedrock_copy_from_user, bedrock_remap_pages, bedrock_remap_vmalloc_range,
     bedrock_vma_end, bedrock_vma_pgoff, bedrock_vma_start,
 };
-use super::super::page::{LogBuffer, PagePool, LOG_BUFFER_SIZE};
+use super::super::page::{EventBuffer, PagePool, EVENT_BUFFER_SIZE};
 use super::super::vmx::traits::GuestMemory;
 use super::super::vmx::{ForkableVm, ParentVm, VmState};
 use super::super::HANDLER;
@@ -48,12 +48,12 @@ impl VmFileOps for BedrockVmFile {
         &self.running
     }
 
-    fn log_buffer(&self) -> Option<&LogBuffer> {
-        self.log_buffer.as_ref()
+    fn event_buffer(&self) -> Option<&EventBuffer> {
+        self.event_buffer.as_ref()
     }
 
-    fn log_buffer_mut(&mut self) -> &mut Option<LogBuffer> {
-        &mut self.log_buffer
+    fn event_buffer_mut(&mut self) -> &mut Option<EventBuffer> {
+        &mut self.event_buffer
     }
 
     fn can_run(&self) -> bool {
@@ -216,21 +216,55 @@ unsafe extern "C" fn bedrock_vm_mmap(
 
     // Memory layout for mmap:
     // - Offset 0 to memory.size(): guest memory
-    // - Offset memory.size(): serial buffer (1 page = 4096 bytes)
-    // - Offset memory.size() + 4096: log buffer (1MB, if enabled)
-    // - Offset memory.size() + 4096 + LOG_BUFFER_SIZE: serial TSC page (4KB)
-    // - Offset memory.size() + 4096 + LOG_BUFFER_SIZE + 4096: feedback buffer 0 (up to 1MB)
-    // - Offset memory.size() + 4096 + LOG_BUFFER_SIZE + 4096 + 1MB: feedback buffer 1 (up to 1MB)
-    // - ... (each buffer slot reserves 1MB)
+    // - Offset memory.size(): feedback buffer 0 (up to 1MB)
+    // - ... (each feedback slot reserves 1MB)
+    // - past the feedback region: the unified event buffer (1MB)
+    //
+    // Guest serial output flows through the event buffer as `Serial` records,
+    // so there is no dedicated serial/TSC page in the layout.
     let guest_mem_size = memory.size();
-    let serial_buffer_offset = guest_mem_size;
-    let log_buffer_offset = guest_mem_size + 4096;
-    let serial_tsc_offset = log_buffer_offset + LOG_BUFFER_SIZE;
-    let feedback_buffer_base_offset = serial_tsc_offset + 4096;
+    let feedback_buffer_base_offset = guest_mem_size;
     const FEEDBACK_BUFFER_SLOT_SIZE: usize = 1024 * 1024; // 1MB per slot
+                                                          // The event buffer sits just past the feedback-buffer region (i.e. at the
+                                                          // slot the index `MAX_FEEDBACK_BUFFERS` would occupy). Placing it here means
+                                                          // enabling the event stream never shifts any existing buffer offset. It is
+                                                          // checked *before* the feedback catch-all below because its offset is also
+                                                          // `>= feedback_buffer_base_offset`.
+    let event_buffer_offset = feedback_buffer_base_offset
+        + super::super::vmx::MAX_FEEDBACK_BUFFERS * FEEDBACK_BUFFER_SLOT_SIZE;
 
-    // Check if this is a feedback buffer mapping
-    if offset_bytes as usize >= feedback_buffer_base_offset {
+    if offset_bytes as usize == event_buffer_offset {
+        // Event buffer mapping
+        if requested_size as usize != EVENT_BUFFER_SIZE {
+            log_err!(
+                "mmap: event buffer must be exactly {} bytes, got {}\n",
+                EVENT_BUFFER_SIZE,
+                requested_size
+            );
+            return -(bindings::EINVAL as i32);
+        }
+
+        let event_buffer = match &vm_file.event_buffer {
+            Some(buf) => buf,
+            None => {
+                log_err!("mmap: event buffer not allocated (event stream not enabled)\n");
+                return -(bindings::EINVAL as i32);
+            }
+        };
+
+        let addr = event_buffer.as_ptr().cast::<core::ffi::c_void>();
+        // SAFETY: `vma` is a valid VMA pointer from the kernel. `addr` is a valid
+        // vmalloc'd pointer to the event buffer. Offset 0 maps from the start.
+        let ret = unsafe { bedrock_remap_vmalloc_range(vma, addr, 0) };
+
+        if ret != 0 {
+            log_err!("mmap: event buffer remap failed with {}\n", ret);
+        } else {
+            log_info!("mmap: mapped event buffer for VM {}\n", vm_file.vm_id);
+        }
+
+        ret
+    } else if offset_bytes as usize >= feedback_buffer_base_offset {
         let relative_offset = offset_bytes as usize - feedback_buffer_base_offset;
         let buffer_index = relative_offset / FEEDBACK_BUFFER_SLOT_SIZE;
 
@@ -309,79 +343,6 @@ unsafe extern "C" fn bedrock_vm_mmap(
         }
 
         ret
-    } else if offset_bytes as usize == serial_tsc_offset {
-        // Serial TSC metadata page mapping
-        if requested_size as usize != 4096 {
-            log_err!(
-                "mmap: serial TSC page must be exactly 4096 bytes, got {}\n",
-                requested_size
-            );
-            return -(bindings::EINVAL as i32);
-        }
-
-        let page = vm_file.vm.state.serial_tsc_page.as_raw_page();
-        // SAFETY: `vma` is a valid VMA pointer from the kernel. `page` is a valid
-        // kernel page obtained from serial_tsc_page.
-        let ret = unsafe { bedrock_remap_page(vma, page) };
-
-        if ret != 0 {
-            log_err!("mmap: serial TSC page remap failed with {}\n", ret);
-        }
-
-        ret
-    } else if offset_bytes as usize == log_buffer_offset {
-        // Log buffer mapping
-        if requested_size as usize != LOG_BUFFER_SIZE {
-            log_err!(
-                "mmap: log buffer must be exactly {} bytes, got {}\n",
-                LOG_BUFFER_SIZE,
-                requested_size
-            );
-            return -(bindings::EINVAL as i32);
-        }
-
-        let log_buffer = match &vm_file.log_buffer {
-            Some(buf) => buf,
-            None => {
-                log_err!("mmap: log buffer not allocated (logging not enabled)\n");
-                return -(bindings::EINVAL as i32);
-            }
-        };
-
-        let addr = log_buffer.as_ptr().cast::<core::ffi::c_void>();
-        // SAFETY: `vma` is a valid VMA pointer from the kernel. `addr` is a valid
-        // vmalloc'd pointer to the log buffer. Offset 0 maps from the start.
-        let ret = unsafe { bedrock_remap_vmalloc_range(vma, addr, 0) };
-
-        if ret != 0 {
-            log_err!("mmap: log buffer remap failed with {}\n", ret);
-        } else {
-            log_info!("mmap: mapped log buffer for VM {}\n", vm_file.vm_id);
-        }
-
-        ret
-    } else if offset_bytes as usize == serial_buffer_offset {
-        // Serial buffer mapping
-        if requested_size as usize != 4096 {
-            log_err!(
-                "mmap: serial buffer must be exactly 4096 bytes, got {}\n",
-                requested_size
-            );
-            return -(bindings::EINVAL as i32);
-        }
-
-        let page = vm_file.vm.state.serial_buffer_page.as_raw_page();
-        // SAFETY: `vma` is a valid VMA pointer from the kernel. `page` is a valid
-        // kernel page obtained from serial_buffer_page.
-        let ret = unsafe { bedrock_remap_page(vma, page) };
-
-        if ret != 0 {
-            log_err!("mmap: serial buffer remap failed with {}\n", ret);
-        } else {
-            log_info!("mmap: mapped serial buffer for VM {}\n", vm_file.vm_id);
-        }
-
-        ret
     } else if (offset_bytes as usize) < guest_mem_size {
         // Guest memory mapping
         if (offset_bytes as usize) + (requested_size as usize) > guest_mem_size {
@@ -448,7 +409,7 @@ unsafe extern "C" fn bedrock_vm_ioctl(
         BEDROCK_VM_SET_INPUT => handle_set_input(vm_file, arg),
         BEDROCK_VM_SET_RDRAND_CONFIG => handlers::handle_set_rdrand_config(vm_file, arg),
         BEDROCK_VM_SET_RDRAND_VALUE => handlers::handle_set_rdrand_value(vm_file, arg),
-        BEDROCK_VM_SET_LOG_CONFIG => handlers::handle_set_log_config(vm_file, arg),
+        BEDROCK_VM_SET_EVENT_CONFIG => handlers::handle_set_event_config(vm_file, arg),
         BEDROCK_VM_SET_SINGLE_STEP => handlers::handle_set_single_step(vm_file, arg),
         BEDROCK_VM_GET_EXIT_STATS => handlers::handle_get_exit_stats(vm_file, arg),
         BEDROCK_VM_SET_STOP_TSC => handlers::handle_set_stop_tsc(vm_file, arg),
