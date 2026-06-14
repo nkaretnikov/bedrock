@@ -256,11 +256,11 @@ const fn get_pebs_margin() -> u64 {
     // See `intel-family.h` in the Linux source code for model names.
     let cpuinfo = include_str!("/proc/cpuinfo").as_bytes();
     if contains(cpuinfo, b"\nmodel\t\t: 143\n") {
-        3  // Sapphire Rapids-SP (ex: Xeon Gold 5412U)
+        3 // Sapphire Rapids-SP (ex: Xeon Gold 5412U)
     } else if contains(cpuinfo, b"\nmodel\t\t: 106\n") {
-        8  // Ice Lake-SP (ex: Xeon Silver 4310)
+        8 // Ice Lake-SP (ex: Xeon Silver 4310)
     } else {
-        8  // default for untested models
+        8 // default for untested models
     }
 }
 
