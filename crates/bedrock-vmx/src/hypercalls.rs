@@ -82,6 +82,42 @@ pub const HYPERCALL_IO_PUT_RESPONSE: u64 = 6;
 /// any internal state on this exit; it is purely a synchronization point.
 pub const HYPERCALL_READY: u64 = 7;
 
+/// Register the guest's 4KB shared paravirtual-console page.
+///
+/// Inputs:
+/// - RBX: Guest virtual address of the console page (must be 4KB-aligned).
+///
+/// Outputs:
+/// - RAX: 0 on success, !0 (-1) on failure (unaligned or GVA translation failed).
+///
+/// Mirrors `HYPERCALL_IO_REGISTER_PAGE`: the GVA is translated to a GPA once
+/// and stored in `VmState`. The page is owned by the guest console module
+/// (`bedrock-console.ko`), which registers both a `struct console` (kernel
+/// printk) and a tty driver backing `/dev/console` (userspace output) and
+/// copies each write buffer into this page before issuing
+/// `HYPERCALL_SERIAL_WRITE`. The host only ever *reads* this page, so (unlike
+/// the I/O channel) no pre-CoW is needed.
+///
+/// Re-registration is allowed and overwrites the previous registration.
+pub const HYPERCALL_SERIAL_REGISTER_PAGE: u64 = 8;
+
+/// Emit bytes from the registered console page to the serial output sink.
+///
+/// Inputs:
+/// - RBX: Number of bytes at the start of the registered console page to emit
+///   (clamped to `PAGE_SIZE`).
+///
+/// Outputs:
+/// - RAX: 0 on success, !0 on failure (no page registered or guest memory
+///   access failed).
+///
+/// The hypervisor copies those bytes and feeds them through the existing
+/// per-byte serial sink (`VmState::serial_write`), so the buffer-full
+/// drain-to-userspace path and per-line TSC metadata are reused unchanged.
+/// This batches one whole printk record into a single VM exit instead of one
+/// exit per byte through the emulated 8250 UART.
+pub const HYPERCALL_SERIAL_WRITE: u64 = 9;
+
 /// Register a single 4KB page as the PEBS scratch page for precise VM exits.
 ///
 /// The page must be:

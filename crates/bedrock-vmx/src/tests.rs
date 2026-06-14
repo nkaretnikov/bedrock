@@ -1041,3 +1041,160 @@ fn test_check_io_channel_defers_until_target_tsc() {
         "APIC IRR should be set on the boundary step"
     );
 }
+
+// =============================================================================
+// Paravirtual batch console tests
+// =============================================================================
+
+#[test]
+fn test_vmcall_serial_register_page_success() {
+    use crate::hypercalls::HYPERCALL_SERIAL_REGISTER_PAGE;
+
+    let mut ctx = MockVmContext::new();
+    install_identity_paging(&mut ctx);
+
+    ctx.set_exit_reason(ExitReason::Vmcall);
+    ctx.set_exit_qualification(0);
+    ctx.set_guest_rip(0x1000);
+    ctx.set_instruction_len(3);
+
+    ctx.gprs_mut().rax = HYPERCALL_SERIAL_REGISTER_PAGE;
+    // 4KB-aligned address inside the 1GB identity-mapped window.
+    ctx.gprs_mut().rbx = 0x5000;
+
+    let result = handle_exit(&mut ctx, &MockKernel, &mut MockFrameAllocator::new());
+    // Registration is purely host-internal, so it continues the guest rather
+    // than exiting to userspace.
+    assert_eq!(result, ExitHandlerResult::Continue);
+    assert_eq!(ctx.gprs().rax, 0, "registration should succeed");
+    assert_eq!(ctx.state().serial_console.page_gpa, 0x5000);
+    assert_eq!(ctx.get_guest_rip(), Some(0x1003));
+}
+
+#[test]
+fn test_vmcall_serial_register_page_unaligned() {
+    use crate::hypercalls::HYPERCALL_SERIAL_REGISTER_PAGE;
+
+    let mut ctx = MockVmContext::new();
+    install_identity_paging(&mut ctx);
+
+    ctx.set_exit_reason(ExitReason::Vmcall);
+    ctx.set_exit_qualification(0);
+    ctx.set_guest_rip(0x1000);
+    ctx.set_instruction_len(3);
+
+    ctx.gprs_mut().rax = HYPERCALL_SERIAL_REGISTER_PAGE;
+    ctx.gprs_mut().rbx = 0x5001; // 1 byte misaligned
+
+    let result = handle_exit(&mut ctx, &MockKernel, &mut MockFrameAllocator::new());
+    assert_eq!(result, ExitHandlerResult::Continue);
+    assert_eq!(ctx.gprs().rax, !0u64, "unaligned should return -1");
+    assert_eq!(
+        ctx.state().serial_console.page_gpa,
+        0,
+        "failed registration must not stash a GPA"
+    );
+}
+
+#[test]
+fn test_vmcall_serial_register_page_untranslatable() {
+    use crate::hypercalls::HYPERCALL_SERIAL_REGISTER_PAGE;
+
+    let mut ctx = MockVmContext::new();
+    install_identity_paging(&mut ctx);
+
+    ctx.set_exit_reason(ExitReason::Vmcall);
+    ctx.set_exit_qualification(0);
+    ctx.set_guest_rip(0x1000);
+    ctx.set_instruction_len(3);
+
+    ctx.gprs_mut().rax = HYPERCALL_SERIAL_REGISTER_PAGE;
+    // 4KB-aligned, but exactly at the 1GB boundary — the identity window only
+    // covers [0, 1GB) via a single 1GB PDPT entry, so PDPT[1] is absent and
+    // the page-table walk fails to translate.
+    ctx.gprs_mut().rbx = 0x4000_0000;
+
+    let result = handle_exit(&mut ctx, &MockKernel, &mut MockFrameAllocator::new());
+    assert_eq!(result, ExitHandlerResult::Continue);
+    assert_eq!(
+        ctx.gprs().rax,
+        !0u64,
+        "untranslatable GVA should return -1"
+    );
+    assert_eq!(
+        ctx.state().serial_console.page_gpa,
+        0,
+        "failed registration must not stash a GPA"
+    );
+}
+
+#[test]
+fn test_vmcall_serial_write_appends_bytes() {
+    use crate::hypercalls::{HYPERCALL_SERIAL_REGISTER_PAGE, HYPERCALL_SERIAL_WRITE};
+
+    let mut ctx = MockVmContext::new();
+    install_identity_paging(&mut ctx);
+
+    // Register the console page at GVA/GPA 0x5000.
+    ctx.set_exit_reason(ExitReason::Vmcall);
+    ctx.set_exit_qualification(0);
+    ctx.set_guest_rip(0x1000);
+    ctx.set_instruction_len(3);
+    ctx.gprs_mut().rax = HYPERCALL_SERIAL_REGISTER_PAGE;
+    ctx.gprs_mut().rbx = 0x5000;
+    let _ = handle_exit(&mut ctx, &MockKernel, &mut MockFrameAllocator::new());
+
+    // Place a console record in the registered page. Span more than one
+    // IO_COPY_CHUNK (256 bytes) so the chunked guest->pending copy is
+    // exercised past its first boundary, and include a newline so the
+    // per-line TSC metadata path runs.
+    let mut record: Vec<u8> = Vec::new();
+    record.extend_from_slice(b"hello bedrock console\n");
+    record.extend(core::iter::repeat_n(b'x', 400));
+    ctx.memory[0x5000..0x5000 + record.len()].copy_from_slice(&record);
+
+    // Issue SERIAL_WRITE with the record length.
+    ctx.set_exit_reason(ExitReason::Vmcall);
+    ctx.set_exit_qualification(0);
+    ctx.set_guest_rip(0x2000);
+    ctx.set_instruction_len(3);
+    ctx.gprs_mut().rax = HYPERCALL_SERIAL_WRITE;
+    ctx.gprs_mut().rbx = record.len() as u64;
+    let result = handle_exit(&mut ctx, &MockKernel, &mut MockFrameAllocator::new());
+
+    // The whole record fits in the empty serial buffer, so the guest just
+    // continues and RAX reports success.
+    assert_eq!(result, ExitHandlerResult::Continue);
+    assert_eq!(ctx.gprs().rax, 0, "SERIAL_WRITE should succeed");
+    assert_eq!(ctx.get_guest_rip(), Some(0x2003));
+
+    // The bytes were appended to the serial output sink verbatim, and the
+    // pending buffer was fully drained.
+    assert_eq!(ctx.state().serial_output(), record.as_slice());
+    assert_eq!(ctx.state().serial_console.pending_len, 0);
+    assert_eq!(ctx.state().serial_console.pending_pos, 0);
+}
+
+#[test]
+fn test_vmcall_serial_write_not_registered() {
+    use crate::hypercalls::HYPERCALL_SERIAL_WRITE;
+
+    let mut ctx = MockVmContext::new();
+    install_identity_paging(&mut ctx);
+
+    ctx.set_exit_reason(ExitReason::Vmcall);
+    ctx.set_exit_qualification(0);
+    ctx.set_guest_rip(0x1000);
+    ctx.set_instruction_len(3);
+    ctx.gprs_mut().rax = HYPERCALL_SERIAL_WRITE;
+    ctx.gprs_mut().rbx = 8;
+
+    let result = handle_exit(&mut ctx, &MockKernel, &mut MockFrameAllocator::new());
+    assert_eq!(result, ExitHandlerResult::Continue);
+    assert_eq!(
+        ctx.gprs().rax,
+        !0u64,
+        "SERIAL_WRITE before registration returns -1"
+    );
+    assert_eq!(ctx.state().serial_output().len(), 0, "nothing emitted");
+}

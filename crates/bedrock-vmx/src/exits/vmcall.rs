@@ -86,6 +86,32 @@ fn copy_response_from_guest<C: VmContext>(
     Ok(())
 }
 
+/// Copy `len` bytes out of the registered serial-console page (at `gpa`)
+/// into `VmState.serial_console.pending_buf`, then reset the pending cursor
+/// so `serial_console_flush` drains from the start. Chunked through a small
+/// stack buffer for the same borrow/stack reasons as
+/// `copy_response_from_guest`. `len` must be `<= SERIAL_CONSOLE_PAGE_SIZE`,
+/// which is the capacity of `pending_buf`.
+fn copy_serial_console_from_guest<C: VmContext>(
+    ctx: &mut C,
+    gpa: GuestPhysAddr,
+    len: usize,
+) -> Result<(), MemoryError> {
+    let mut chunk = [0u8; IO_COPY_CHUNK];
+    let mut offset = 0;
+    while offset < len {
+        let n = (len - offset).min(IO_COPY_CHUNK);
+        let src = GuestPhysAddr::new(gpa.as_u64() + offset as u64);
+        ctx.read_guest_memory(src, &mut chunk[..n])?;
+        ctx.state_mut().serial_console.pending_buf[offset..offset + n].copy_from_slice(&chunk[..n]);
+        offset += n;
+    }
+    let console = &mut ctx.state_mut().serial_console;
+    console.pending_len = len;
+    console.pending_pos = 0;
+    Ok(())
+}
+
 /// Handle VMCALL exit by dispatching based on hypercall number in RAX.
 pub fn handle_vmcall<C: VmContext, A: CowAllocator<C::CowPage>>(
     ctx: &mut C,
@@ -400,6 +426,88 @@ pub fn handle_vmcall<C: VmContext, A: CowAllocator<C::CowPage>>(
             }
             // Userspace drains the response via ioctl on this exit.
             ExitHandlerResult::ExitToUserspace(ExitReason::VmcallIoResponse)
+        }
+        HYPERCALL_SERIAL_REGISTER_PAGE => {
+            // RBX = guest virtual address of the shared 4KB console page.
+            // Mirror HYPERCALL_IO_REGISTER_PAGE: require 4KB alignment and
+            // record the GPA (stable across guest CR3 changes — the module
+            // pins the page in the kernel direct map). The host only ever
+            // *reads* this page (in HYPERCALL_SERIAL_WRITE), so unlike the
+            // I/O channel there is no host write that would need pre-CoW.
+            let page_va = ctx.state().gprs.rbx;
+            let result: u64 = if page_va & 0xFFF != 0 {
+                log_err!(
+                    "HYPERCALL_SERIAL_REGISTER_PAGE: page va {:#x} not 4KB aligned\n",
+                    page_va
+                );
+                !0
+            } else {
+                match translate_gva_to_gpa(ctx, page_va) {
+                    Ok(gpa) => {
+                        let gpa = gpa.as_u64();
+                        ctx.state_mut().serial_console.page_gpa = gpa;
+                        log_info!(
+                            "HYPERCALL_SERIAL_REGISTER_PAGE: gva={:#x} gpa={:#x}\n",
+                            page_va,
+                            gpa
+                        );
+                        0
+                    }
+                    Err(()) => {
+                        log_err!(
+                            "HYPERCALL_SERIAL_REGISTER_PAGE: GVA translation failed gva={:#x}\n",
+                            page_va
+                        );
+                        !0
+                    }
+                }
+            };
+            ctx.state_mut().gprs.rax = result;
+            if let Err(e) = advance_rip(ctx) {
+                return ExitHandlerResult::Error(e);
+            }
+            // Purely host-internal registration — nothing for userspace to do.
+            ExitHandlerResult::Continue
+        }
+        HYPERCALL_SERIAL_WRITE => {
+            // RBX = number of bytes at the start of the registered console
+            // page to emit (clamped to PAGE_SIZE). Copy them into the host
+            // pending buffer, then drain into the existing serial sink so the
+            // per-line TSC metadata and buffer-full handling are reused. If
+            // the serial buffer fills mid-drain, the unsent tail stays pending
+            // and we exit to userspace exactly like the per-byte OUT path —
+            // the next serial_clear() flushes the tail into the drained
+            // buffer. RIP is advanced exactly once so the VMCALL is counted a
+            // single time (no non-deterministic double-counting on resume).
+            let len = (ctx.state().gprs.rbx as usize).min(SERIAL_CONSOLE_PAGE_SIZE);
+            let page_gpa = ctx.state().serial_console.page_gpa;
+            let result: u64 = if page_gpa == 0 {
+                log_err!("HYPERCALL_SERIAL_WRITE: page not registered\n");
+                !0
+            } else {
+                let gpa = GuestPhysAddr::new(page_gpa);
+                match copy_serial_console_from_guest(ctx, gpa, len) {
+                    Ok(()) => 0,
+                    Err(e) => {
+                        log_err!(
+                            "HYPERCALL_SERIAL_WRITE: read_guest_memory failed: {:?}\n",
+                            e
+                        );
+                        !0
+                    }
+                }
+            };
+            ctx.state_mut().gprs.rax = result;
+            if let Err(e) = advance_rip(ctx) {
+                return ExitHandlerResult::Error(e);
+            }
+            // Drain the freshly-copied bytes into the serial sink. On overflow,
+            // exit to userspace so the host drains the full buffer; the pending
+            // tail is resumed by the next serial_clear().
+            if result == 0 && !ctx.state_mut().serial_console_flush() {
+                return ExitHandlerResult::ExitToUserspace(ExitReason::IoInstruction);
+            }
+            ExitHandlerResult::Continue
         }
         _ => {
             // Unknown hypercall - exit to userspace with generic Vmcall reason

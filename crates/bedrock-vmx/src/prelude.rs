@@ -144,13 +144,13 @@ pub use crate::decoder::decode_instruction;
 pub use super::hypercalls::{
     HYPERCALL_IO_GET_REQUEST, HYPERCALL_IO_PUT_RESPONSE, HYPERCALL_IO_REGISTER_PAGE,
     HYPERCALL_READY, HYPERCALL_REGISTER_FEEDBACK_BUFFER, HYPERCALL_REGISTER_PEBS_PAGE,
-    HYPERCALL_SHUTDOWN, HYPERCALL_SNAPSHOT,
+    HYPERCALL_SERIAL_REGISTER_PAGE, HYPERCALL_SERIAL_WRITE, HYPERCALL_SHUTDOWN, HYPERCALL_SNAPSHOT,
 };
 #[cfg(feature = "cargo")]
 pub use crate::hypercalls::{
     HYPERCALL_IO_GET_REQUEST, HYPERCALL_IO_PUT_RESPONSE, HYPERCALL_IO_REGISTER_PAGE,
     HYPERCALL_READY, HYPERCALL_REGISTER_FEEDBACK_BUFFER, HYPERCALL_REGISTER_PEBS_PAGE,
-    HYPERCALL_SHUTDOWN, HYPERCALL_SNAPSHOT,
+    HYPERCALL_SERIAL_REGISTER_PAGE, HYPERCALL_SERIAL_WRITE, HYPERCALL_SHUTDOWN, HYPERCALL_SNAPSHOT,
 };
 
 // =============================================================================
@@ -167,16 +167,16 @@ pub use crate::cow::CowPageMap;
 #[cfg(not(feature = "cargo"))]
 pub use super::vm_state::{
     box_vm_state, AllExitStats, EnqueueResult, ExitStats, FeedbackBufferInfo, IoChannelState,
-    LogMode, PendingIoAction, SyscallMsrs, VmState, VmStateBox, VmStateError,
+    LogMode, PendingIoAction, SerialConsoleState, SyscallMsrs, VmState, VmStateBox, VmStateError,
     DEFAULT_TSC_FREQUENCY, FEEDBACK_BUFFER_ID_MAX_LEN, FEEDBACK_BUFFER_MAX_PAGES,
-    IO_CHANNEL_BUF_SIZE, MAX_FEEDBACK_BUFFERS, PENDING_IO_QUEUE_CAP,
+    IO_CHANNEL_BUF_SIZE, MAX_FEEDBACK_BUFFERS, PENDING_IO_QUEUE_CAP, SERIAL_CONSOLE_PAGE_SIZE,
 };
 #[cfg(feature = "cargo")]
 pub use crate::vm_state::{
     box_vm_state, AllExitStats, EnqueueResult, ExitStats, FeedbackBufferInfo, IoChannelState,
-    LogMode, PendingIoAction, SyscallMsrs, VmState, VmStateBox, VmStateError,
+    LogMode, PendingIoAction, SerialConsoleState, SyscallMsrs, VmState, VmStateBox, VmStateError,
     DEFAULT_TSC_FREQUENCY, FEEDBACK_BUFFER_ID_MAX_LEN, FEEDBACK_BUFFER_MAX_PAGES,
-    IO_CHANNEL_BUF_SIZE, MAX_FEEDBACK_BUFFERS, PENDING_IO_QUEUE_CAP,
+    IO_CHANNEL_BUF_SIZE, MAX_FEEDBACK_BUFFERS, PENDING_IO_QUEUE_CAP, SERIAL_CONSOLE_PAGE_SIZE,
 };
 
 // =============================================================================

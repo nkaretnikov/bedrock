@@ -204,6 +204,82 @@ pub struct PendingIoAction {
     pub data: HeapVec<u8>,
 }
 
+/// Size of the paravirtual-console shared page (one 4KB page). A single
+/// `HYPERCALL_SERIAL_WRITE` emits at most this many bytes; longer printk
+/// records are split into multiple writes by the guest console driver.
+///
+/// Equal to `PAGE_SIZE` and to the capacity of `IoPageBufBox`, which the
+/// overflow buffer reuses — so a clamped write always fits in the pending
+/// buffer.
+pub const SERIAL_CONSOLE_PAGE_SIZE: usize = PAGE_SIZE;
+
+/// State for the deterministic paravirtual batch console.
+///
+/// The guest's `bedrock-console.ko` registers a 4KB shared page via
+/// `HYPERCALL_SERIAL_REGISTER_PAGE`, then — from its `struct console` `.write`
+/// callback — copies each fully-formatted printk record into that page and
+/// issues `HYPERCALL_SERIAL_WRITE` with the byte count. The host copies those
+/// bytes out and feeds them through `VmState::serial_write`, the same sink the
+/// emulated 8250 UART uses, so the buffer-full drain-to-userspace path and the
+/// per-line TSC metadata are reused unchanged. This turns one VM exit per
+/// console byte into one VM exit per console line.
+///
+/// Like `IoChannelState`, this is excluded from the determinism state hash:
+/// `page_gpa` is host bookkeeping and the pending bytes are host-side output
+/// staging — none of it is guest-visible.
+pub struct SerialConsoleState {
+    /// Guest physical address of the registered console page. Zero means
+    /// "not registered yet"; `HYPERCALL_SERIAL_WRITE` fails until set.
+    pub page_gpa: u64,
+    /// Bytes from a `HYPERCALL_SERIAL_WRITE` that did not fit in the serial
+    /// output buffer before it filled. They are flushed into the
+    /// freshly-cleared buffer by the next `serial_clear()` — which the run
+    /// loop calls at the start of every RUN ioctl, i.e. right after userspace
+    /// has drained the full buffer. Reuses `IoPageBufBox` purely as a
+    /// page-sized heap buffer (kept off the 8KB kernel stack).
+    pub pending_buf: IoPageBufBox,
+    /// Number of valid bytes in `pending_buf`.
+    pub pending_len: usize,
+    /// Read cursor into `pending_buf` (bytes already flushed to the sink).
+    pub pending_pos: usize,
+}
+
+impl Default for SerialConsoleState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SerialConsoleState {
+    /// Create fresh console state with no registration and an empty pending
+    /// buffer.
+    pub fn new() -> Self {
+        Self {
+            page_gpa: 0,
+            pending_buf: box_io_page_buf(),
+            pending_len: 0,
+            pending_pos: 0,
+        }
+    }
+
+    /// Clone state for a forked child VM.
+    ///
+    /// The page registration is inherited — the child snapshots from a parent
+    /// where `bedrock-console.ko` has already registered its page, which lives
+    /// in shared (CoW) guest memory reachable via the same GPA. Any pending
+    /// overflow bytes are dropped: a fork point is a quiescent moment with no
+    /// half-emitted console line in flight, and the parent's pending bytes (if
+    /// any) belong to the parent's output stream.
+    pub fn clone_for_fork(parent: &Self) -> Self {
+        Self {
+            page_gpa: parent.page_gpa,
+            pending_buf: box_io_page_buf(),
+            pending_len: 0,
+            pending_pos: 0,
+        }
+    }
+}
+
 /// State for the deterministic hypervisor↔guest I/O channel.
 ///
 /// Lives on `VmState` and is updated by:
@@ -989,6 +1065,13 @@ pub struct VmState<V: VirtualMachineControlStructure, I: InstructionCounter> {
     /// the heap so this field stays small (a handful of words plus two box
     /// pointers).
     pub io_channel: IoChannelState,
+    /// State for the deterministic paravirtual batch console.
+    ///
+    /// The guest's `bedrock-console.ko` registers a shared 4KB page via
+    /// `HYPERCALL_SERIAL_REGISTER_PAGE` and ships whole printk records through
+    /// `HYPERCALL_SERIAL_WRITE`, which the host drains into the same serial
+    /// sink the emulated 8250 uses. See `SerialConsoleState`.
+    pub serial_console: SerialConsoleState,
     /// Logical CPU this VM most recently ran on, or `None` before the first
     /// run-loop entry. Used to detect cross-CPU migration between ioctls.
     ///
@@ -1260,6 +1343,7 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             pebs_state: None,
             pebs_supported,
             io_channel: IoChannelState::new(),
+            serial_console: SerialConsoleState::new(),
             last_cpu: None,
         })
     }
@@ -1319,9 +1403,37 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
         unsafe { core::slice::from_raw_parts(ptr, self.serial_len) }
     }
 
+    /// Flush deferred paravirtual-console bytes into the serial output buffer.
+    ///
+    /// `HYPERCALL_SERIAL_WRITE` copies a whole console record into
+    /// `serial_console.pending_buf`, then drives this to push it byte-by-byte
+    /// through `serial_write` (reusing the per-line TSC metadata path). If the
+    /// buffer fills before the record is fully emitted, the unsent tail stays
+    /// in `pending_buf` and this returns `false`; the caller exits to userspace
+    /// so the host drains the full buffer, and the next `serial_clear()`
+    /// resumes the flush into the emptied buffer. Returns `true` once the whole
+    /// pending region has been emitted.
+    pub fn serial_console_flush(&mut self) -> bool {
+        while self.serial_console.pending_pos < self.serial_console.pending_len {
+            let byte = self.serial_console.pending_buf[self.serial_console.pending_pos];
+            if !self.serial_write(byte) {
+                // Serial buffer is full — leave the tail pending for the next
+                // serial_clear() to resume after userspace drains.
+                return false;
+            }
+            self.serial_console.pending_pos += 1;
+        }
+        self.serial_console.pending_len = 0;
+        self.serial_console.pending_pos = 0;
+        true
+    }
+
     /// Clear the serial output buffer and reset line tracking.
     /// If a pending byte was saved from a buffer-full condition, it is
-    /// written to the freshly cleared buffer.
+    /// written to the freshly cleared buffer. Any deferred paravirtual-console
+    /// bytes (from a `HYPERCALL_SERIAL_WRITE` that overran the buffer) are then
+    /// flushed too: at most `PAGE_SIZE` bytes can be pending, which always fit
+    /// in the now-empty `PAGE_SIZE` buffer, so a single drain cycle suffices.
     pub fn serial_clear(&mut self) {
         self.serial_len = 0;
         self.serial_line_count = 0;
@@ -1329,6 +1441,7 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
         if let Some(byte) = self.serial_pending_byte.take() {
             self.serial_write(byte);
         }
+        self.serial_console_flush();
     }
 
     /// Write the serial line TSC metadata header to the TSC page.
@@ -1839,6 +1952,7 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             pebs_state: None,
             pebs_supported: false,
             io_channel: IoChannelState::new(),
+            serial_console: SerialConsoleState::new(),
             last_cpu: None,
         })
     }
@@ -2124,6 +2238,7 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
                 .map(|p| heap_box(p.clone_for_fork())),
             pebs_supported: parent_state.pebs_supported,
             io_channel: IoChannelState::clone_for_fork(&parent_state.io_channel),
+            serial_console: SerialConsoleState::clone_for_fork(&parent_state.serial_console),
             last_cpu: None,
         })
     }

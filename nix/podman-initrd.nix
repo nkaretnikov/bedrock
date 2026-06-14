@@ -77,6 +77,42 @@ let
     '';
   };
 
+  # Guest module for the paravirtual batch console. Built out-of-tree the same
+  # way as bedrockIoModule (LLVM=1 against the guest kernel build tree). Its
+  # `struct console` ships whole printk records to the hypervisor in one VMCALL
+  # each instead of one VMX I/O exit per byte through the emulated 8250.
+  bedrockConsoleModule = let
+    llvmPackages = pkgs.llvmPackages;
+  in llvmPackages.stdenv.mkDerivation {
+    name = "bedrock-console-module";
+    src = ../guest/bedrock-console;
+
+    nativeBuildInputs = [
+      llvmPackages.lld
+      pkgs.gnumake
+    ];
+
+    dontStrip = true;
+    dontPatchELF = true;
+
+    NIX_CFLAGS_COMPILE = "-Wno-unused-command-line-argument";
+
+    buildPhase = ''
+      runHook preBuild
+      make \
+        KDIR=${guestKernel.dev}/lib/modules/${guestKernel.modDirVersion}/build \
+        LLVM=1
+      runHook postBuild
+    '';
+
+    installPhase = ''
+      runHook preInstall
+      mkdir -p $out
+      cp bedrock-console.ko $out/
+      runHook postInstall
+    '';
+  };
+
   # All runtime packages needed in the guest rootfs
   runtimePackages = [
     pkgs.podman
@@ -223,6 +259,17 @@ let
     # Create directories needed for containers and networking
     mkdir -p /run/netns /var/run/netns /run/containers/storage /var/lib/cni /var/tmp
 
+    # Load the paravirtual batch console as early as possible so that
+    # kernel printk output for the rest of boot is shipped one line per
+    # VMCALL instead of one byte per VMX I/O exit through the emulated
+    # 8250. The cmdline selects it with console=hvc0; earlyprintk=serial
+    # covers the pre-registration window. Failure is non-fatal — the guest
+    # keeps logging through earlyprintk/8250. Userspace stdout is sent to
+    # /dev/ttyS0 below (the 8250 tty, unchanged), since this console is a
+    # write-only printk console with no tty backing /dev/console.
+    insmod /lib/modules/bedrock-console.ko || \
+        echo "bedrock-console: insmod failed (continuing without batch console)"
+
     # Register a PEBS scratch page with the hypervisor so precise VM exits
     # (timer interrupt injection, stop-at-tsc) can trap on EPT writes. The
     # program registers, then blocks forever to keep the page pinned, so we
@@ -241,7 +288,12 @@ let
     # Reset podman state
     podman system reset -f 2>/dev/null || true
 
-    # Redirect output to console
+    # Redirect output to the console. /dev/console now routes to the
+    # paravirtual batch console (hvc0): bedrock-console.ko registers a tty
+    # whose .write batches whole buffers to the hypervisor in one VMCALL, and
+    # the console's .device points /dev/console at it. So both kernel printk
+    # and this userspace output go through hvc0, one VM exit per line instead
+    # of one per byte through the emulated 8250.
     exec >/dev/console 2>&1
 
     echo "=== Podman Initrd ==="
@@ -297,8 +349,12 @@ let
     # Block until the shutdown VMCALL terminates the VM.
     wait
 
-    # Drop to shell
-    exec setsid sh -c 'exec sh </dev/console >/dev/console 2>&1'
+    # Drop to an interactive shell on the 8250 serial tty. The hvc0 batch
+    # console is output-only (no get_chars/input path), so the interactive
+    # fallback shell uses /dev/ttyS0, which carries host-fed serial input.
+    # This only runs in manual sessions — under the fuzzer/determinism
+    # harness the VM is terminated by the shutdown VMCALL before here.
+    exec setsid sh -c 'exec sh </dev/ttyS0 >/dev/ttyS0 2>&1'
   '';
 
 in
@@ -348,6 +404,7 @@ pkgs.stdenv.mkDerivation {
     # modules.dep / depmod machinery (which we don't build in this initrd).
     mkdir -p rootfs/lib/modules
     cp ${bedrockIoModule}/bedrock-io.ko rootfs/lib/modules/bedrock-io.ko
+    cp ${bedrockConsoleModule}/bedrock-console.ko rootfs/lib/modules/bedrock-console.ko
 
     # SSL certificates
     mkdir -p rootfs/etc/ssl/certs
