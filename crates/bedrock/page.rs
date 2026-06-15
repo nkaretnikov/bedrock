@@ -12,7 +12,10 @@ use super::vmx::traits::{GuestMemory, Page as PageTrait};
 
 /// A kernel-allocated page wrapping the kernel crate's Page type.
 pub(crate) struct KernelPage {
-    pub(crate) page: Page,
+    /// Owning handle to the allocated page — kept solely to free it on drop;
+    /// callers use `phys`/`virt`. Underscore-prefixed so it isn't flagged as
+    /// unread.
+    _page: Page,
     pub(crate) phys: HostPhysAddr,
     pub(crate) virt: VirtAddr,
 }
@@ -24,13 +27,6 @@ impl PageTrait for KernelPage {
 
     fn virtual_address(&self) -> VirtAddr {
         self.virt
-    }
-}
-
-impl KernelPage {
-    /// Returns the raw kernel page pointer for use with remap_pfn_range.
-    pub(crate) fn as_raw_page(&self) -> *mut kernel::bindings::page {
-        self.page.as_ptr()
     }
 }
 
@@ -107,33 +103,36 @@ impl Drop for KernelGuestMemory {
     }
 }
 
-/// Log buffer for deterministic VM exit logging.
+/// Unified event-stream buffer.
 ///
-/// This is a 1MB vmalloc'd buffer that can be mapped to userspace.
-pub(crate) struct LogBuffer {
+/// A 1MB vmalloc'd buffer mapped to userspace: allocated when the event stream
+/// is enabled (SET_EVENT_CONFIG), freed on disable or file close. Holds the TLV
+/// event records (see `bedrock_vmx::events`), including `Exit` records.
+pub(crate) struct EventBuffer {
     ptr: *mut u8,
 }
 
-/// Log buffer size: 1MB (256 pages).
-pub(crate) const LOG_BUFFER_SIZE: usize = 1024 * 1024;
+/// Event buffer size: 1MB. Must match `bedrock_vmx::events::EVENT_BUFFER_SIZE`.
+pub(crate) const EVENT_BUFFER_SIZE: usize = 1024 * 1024;
 
-// SAFETY: LogBuffer contains a raw pointer but the memory it points to
-// is owned exclusively by this struct and can be safely sent between threads.
-unsafe impl Send for LogBuffer {}
-// SAFETY: LogBuffer only provides shared access through &self methods.
-unsafe impl Sync for LogBuffer {}
+// SAFETY: EventBuffer owns its vmalloc'd region exclusively; the memory it
+// points to can be safely sent between threads.
+unsafe impl Send for EventBuffer {}
+// SAFETY: EventBuffer only provides shared access through &self methods.
+unsafe impl Sync for EventBuffer {}
 
-impl LogBuffer {
-    /// Allocate a new log buffer.
+impl EventBuffer {
+    /// Allocate a new event buffer.
     pub(crate) fn new() -> Option<Self> {
-        log_info!("LogBuffer::new: allocating {} bytes\n", LOG_BUFFER_SIZE);
-        // SAFETY: bedrock_vmalloc_user allocates zeroed memory that can be mapped to userspace.
-        let ptr = unsafe { c_helpers::bedrock_vmalloc_user(LOG_BUFFER_SIZE as core::ffi::c_ulong) };
+        log_info!("EventBuffer::new: allocating {} bytes\n", EVENT_BUFFER_SIZE);
+        // SAFETY: bedrock_vmalloc_user allocates zeroed memory mappable to userspace.
+        let ptr =
+            unsafe { c_helpers::bedrock_vmalloc_user(EVENT_BUFFER_SIZE as core::ffi::c_ulong) };
         if ptr.is_null() {
-            log_err!("LogBuffer::new: vmalloc_user failed\n");
+            log_err!("EventBuffer::new: vmalloc_user failed\n");
             return None;
         }
-        log_info!("LogBuffer::new: allocated at {:p}\n", ptr);
+        log_info!("EventBuffer::new: allocated at {:p}\n", ptr);
         Some(Self {
             ptr: ptr.cast::<u8>(),
         })
@@ -145,11 +144,11 @@ impl LogBuffer {
     }
 }
 
-impl Drop for LogBuffer {
+impl Drop for EventBuffer {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
-            log_info!("LogBuffer::drop: freeing {:p}\n", self.ptr);
-            // SAFETY: ptr was allocated by bedrock_vmalloc_user and has not been freed yet.
+            log_info!("EventBuffer::drop: freeing {:p}\n", self.ptr);
+            // SAFETY: ptr was allocated by bedrock_vmalloc_user and not yet freed.
             unsafe {
                 c_helpers::bedrock_vfree(self.ptr.cast::<core::ffi::c_void>());
             }
@@ -171,7 +170,7 @@ pub(crate) fn alloc_zeroed_page() -> Option<KernelPage> {
     let virt_addr = unsafe { c_helpers::bedrock_page_address(page.as_ptr()) as u64 };
 
     Some(KernelPage {
-        page,
+        _page: page,
         phys: HostPhysAddr::new(phys_addr),
         virt: VirtAddr::new(virt_addr),
     })

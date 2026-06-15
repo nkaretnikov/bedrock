@@ -107,6 +107,12 @@ fn set_cf_flag<C: VmContext>(ctx: &mut C, cf: bool) -> Result<(), ExitError> {
 /// If the mode is ExitToUserspace and no pending value is available,
 /// exits to userspace to let it provide the value.
 pub fn handle_rdrand<C: VmContext>(ctx: &mut C) -> ExitHandlerResult {
+    handle_random(ctx, RandomSource::Rdrand)
+}
+
+/// Shared RDRAND/RDSEED emulation, parameterized by which instruction faulted
+/// so the emitted `Randomness` event records the correct source.
+fn handle_random<C: VmContext>(ctx: &mut C, source: RandomSource) -> ExitHandlerResult {
     let info = match read_instruction_info(ctx) {
         Ok(i) => i,
         Err(e) => return ExitHandlerResult::Error(e),
@@ -126,6 +132,25 @@ pub fn handle_rdrand<C: VmContext>(ctx: &mut C) -> ExitHandlerResult {
             return ExitHandlerResult::ExitToUserspace(ExitReason::Rdrand);
         }
     };
+
+    // Record the served value as a determinism *input* on the event stream. It
+    // is its own category so it can be captured on a normal run without the
+    // heavyweight `Exit` capture. Buffer-full is handled centrally by the exit
+    // dispatcher (`event_buffer_full`), so the return value is ignored here.
+    let width: u8 = match info.operand_size {
+        RdrandOperandSize::Size16 => 2,
+        RdrandOperandSize::Size32 => 4,
+        RdrandOperandSize::Size64 => 8,
+    };
+    let payload = RandomPayload {
+        value,
+        source: source as u8,
+        width,
+        _pad: [0; 6],
+    };
+    let _ = ctx
+        .state_mut()
+        .event_append(EventKind::Randomness, payload.as_bytes());
 
     // Write the value to the destination register
     write_gpr_by_index(
@@ -155,8 +180,8 @@ pub fn handle_rdrand<C: VmContext>(ctx: &mut C) -> ExitHandlerResult {
 /// seeds, while RDRAND returns pseudo-random values. Since we're emulating
 /// both with the same RNG, they behave the same.
 pub fn handle_rdseed<C: VmContext>(ctx: &mut C) -> ExitHandlerResult {
-    // RDSEED uses the same logic as RDRAND
-    handle_rdrand(ctx)
+    // RDSEED uses the same logic as RDRAND; only the recorded source differs.
+    handle_random(ctx, RandomSource::Rdseed)
 }
 
 #[cfg(test)]

@@ -508,26 +508,32 @@ pub fn handle_exit<C: VmContext, K: Kernel, A: CowAllocator<C::CowPage>>(
                     apic.isr[7]
                 );
                 // Log state if AtShutdown mode is enabled (treat stop-at-tsc like shutdown)
-                ctx.state_mut().log_shutdown();
+                ctx.state_mut().capture_exit_at_shutdown();
                 return ExitHandlerResult::ExitToUserspace(ExitReason::StopTscReached);
             }
         }
     }
 
-    // Log exits if logging is enabled (both deterministic and non-deterministic)
+    // Emit an `Exit` event if logging is enabled (both deterministic and
+    // non-deterministic exits). A full event buffer is handled by the
+    // `event_buffer_full` check below.
     //
-    // We need to do this after the stop_at_tsc check, so that the guest is not re-entered after
-    // returning from user space (to handle the LogBufferFull exit), which would cause the
-    // StopTscReached exit to be non-deterministic
-    //
-    // TODO: log the exit above but only return to userspace here, otherwise we're missing one exit
-    // from the log
-    if ctx.state().log_enabled() {
+    // We do this after the stop_at_tsc check so the guest is not re-entered
+    // after returning to userspace (to drain a full buffer), which would make
+    // the StopTscReached exit non-deterministic.
+    if ctx.state().exit_capture_enabled() {
         ctx.state_mut()
-            .log_exit(reason, qual, !non_deterministic_exit);
-        if ctx.state().log_buffer_full() {
-            return ExitHandlerResult::ExitToUserspace(ExitReason::LogBufferFull);
-        }
+            .capture_exit(reason, qual, !non_deterministic_exit);
+    }
+
+    // If event emission filled the event buffer during this exit and the exit
+    // would otherwise re-enter the guest, force a drain round-trip to userspace;
+    // the staged record is re-appended on the next RUN via `event_clear()`. When
+    // `result` already exits to userspace, the buffer is drained there anyway,
+    // so the original reason is left intact. Pure host-side — guest state is
+    // unchanged, so this is deterministic.
+    if ctx.state().event_buffer_full() && matches!(result, ExitHandlerResult::Continue) {
+        return ExitHandlerResult::ExitToUserspace(ExitReason::EventBufferFull);
     }
 
     result

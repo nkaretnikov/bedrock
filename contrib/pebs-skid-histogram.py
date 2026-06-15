@@ -7,14 +7,12 @@ for. With architecturally-precise PEBS the skid should be 0 or 1; anything
 else is hardware imprecision or an arming bug. This script reads the
 `pebs_skid` field on EPT_VIOLATION_PEBS entries and renders the distribution.
 
-PEBS-induced EPT violations are non-deterministic (asynchronous + write), so
-they live in `exit-log-nondeterm.jsonl`. Pass either the determ or non-
-determ path (or a run directory) — the script auto-loads the companion so
-the caller doesn't have to remember which file holds them.
+PEBS-induced EPT violations are non-deterministic `exit` events in the unified
+event stream; this reads `events.jsonl` and looks at the `exit` records.
 
 Usage:
-    python3 pebs-skid-histogram.py <exit-log.jsonl> [<exit-log.jsonl> ...]
-    python3 pebs-skid-histogram.py <run-dir>          # auto-finds exit-log.jsonl
+    python3 pebs-skid-histogram.py <events.jsonl> [<events.jsonl> ...]
+    python3 pebs-skid-histogram.py <run-dir>          # auto-finds events.jsonl
     python3 pebs-skid-histogram.py <log> --output skid.png
     python3 pebs-skid-histogram.py <log> --bins 50 --range -5 50
 
@@ -64,7 +62,10 @@ def load_skids(paths):
                 line = line.strip()
                 if not line:
                     continue
-                e = json.loads(line)
+                ev = json.loads(line)
+                if ev.get("kind") != "exit":
+                    continue
+                e = ev.get("data", {})
                 stats["total"] += 1
                 if e.get("exit_reason") != EPT_VIOLATION:
                     continue
@@ -109,33 +110,14 @@ def warn_no_skids(stats, paths):
         )
     elif stats["ept"] == 0:
         print(
-            "\nno EPT violations found at all. PEBS-induced exits are "
-            "non-deterministic, so check the non-deterministic log "
-            "(`<stem>-nondeterm.jsonl`)."
+            "\nno EPT violations found at all. Either PEBS isn't being used, "
+            "or this event stream has no `exit` records (capture them with "
+            "`--exit-capture all`)."
         )
 
 
-def companion_path(p):
-    """Given a JSONL log path, return its deterministic/non-deterministic pair.
-
-    bedrock writes deterministic exits to `<stem>.jsonl` and non-deterministic
-    ones to `<stem>-nondeterm.jsonl`. PEBS-induced EPT violations are
-    classified as non-deterministic (asynchronous + write), so they live in
-    the `-nondeterm.jsonl` file. We auto-load both halves so the caller can
-    pass either path — or just a run directory — without remembering which.
-    """
-    base, ext = os.path.splitext(p)
-    if ext != ".jsonl":
-        return None
-    if base.endswith("-nondeterm"):
-        return base[: -len("-nondeterm")] + ".jsonl"
-    return base + "-nondeterm.jsonl"
-
-
 def resolve_inputs(inputs):
-    """Expand directories to <dir>/exit-log.jsonl and pair each JSONL file
-    with its deterministic/non-deterministic companion if present.
-    """
+    """Expand directories to `<dir>/events.jsonl`; pass through file paths."""
     out = []
     seen = set()
 
@@ -147,20 +129,14 @@ def resolve_inputs(inputs):
 
     for p in inputs:
         if os.path.isdir(p):
-            candidate = os.path.join(p, "exit-log.jsonl")
+            candidate = os.path.join(p, "events.jsonl")
             if not os.path.exists(candidate):
                 sys.exit(f"error: {candidate} not found")
             add(candidate)
-            companion = companion_path(candidate)
-            if companion and os.path.exists(companion):
-                add(companion)
         else:
             if not os.path.exists(p):
                 sys.exit(f"error: {p} not found")
             add(p)
-            companion = companion_path(p)
-            if companion and os.path.exists(companion):
-                add(companion)
     return out
 
 
@@ -465,7 +441,7 @@ def main():
     p.add_argument(
         "inputs",
         nargs="+",
-        help="exit-log.jsonl path(s) or run directory containing exit-log.jsonl",
+        help="events.jsonl path(s) or run directory containing events.jsonl",
     )
     p.add_argument(
         "--bins", type=int, default=20, help="number of histogram bins (default: 20)"

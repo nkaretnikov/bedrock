@@ -75,8 +75,12 @@ pub mod mptable {
 
 /// Default values for boot configuration.
 pub mod defaults {
-    pub const MEMORY_MB: usize = 1024;
-    pub const CMDLINE: &str =
-        "console=ttyS0,keep earlyprintk=serial nopti nokaslr mitigations=off break";
+    pub const MEMORY_MB: usize = 5120;
+    // The kernel console is the paravirtual batch console (hvc0), registered
+    // by the guest `bedrock-console.ko` module — one VMCALL per printk line
+    // instead of one VMX I/O exit per byte through the emulated 8250.
+    // earlyprintk=serial still handles the early-boot window (before the
+    // module loads) through the 8250; that output is bounded and fine.
+    pub const CMDLINE: &str = "console=hvc0 earlyprintk=serial nopti nokaslr mitigations=off break";
     pub const RDRAND_SEED: u64 = 0x12345678_deadbeef;
 }

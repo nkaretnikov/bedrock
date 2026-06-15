@@ -5,18 +5,13 @@
 mod config;
 mod exit;
 mod ioctl;
-mod serial;
 mod stats;
 
-pub use config::{LogConfig, LogMode, SingleStepConfig, EXIT_REASON_CHECKPOINT};
+pub use config::{EventConfig, ExitTrigger, SingleStepConfig, EXIT_REASON_CHECKPOINT};
 pub use exit::{ExitKind, VmExit};
 pub use ioctl::{
     FeedbackBufferInfo, FeedbackBufferInfoRequest, IoActionPayload, IO_CHANNEL_BUF_SIZE,
     MAX_FEEDBACK_BUFFERS,
-};
-pub use serial::{
-    parse_line_tsc_entries, LineTscEntry, SerialInput, LOG_BUFFER_SIZE, SERIAL_BUFFER_SIZE,
-    SERIAL_INPUT_MAX_SIZE, SERIAL_TSC_PAGE_SIZE,
 };
 pub use stats::{ExitStatEntry, ExitStats, ExitStatsReport, IoctlStats};
 
@@ -41,6 +36,17 @@ pub const DEFAULT_MEMORY_SIZE: usize = 4 * 1024 * 1024 * 1024;
 /// Default TSC frequency (2995.2 MHz) for deterministic time emulation.
 pub use bedrock_vmx::DEFAULT_TSC_FREQUENCY;
 
+/// Size of the unified event buffer (1 MB), mmap'd to userspace.
+pub use crate::events::EVENT_BUFFER_SIZE;
+
+/// 1 MB per feedback-buffer mmap slot (must match the kernel layout).
+const FEEDBACK_BUFFER_SLOT_SIZE: usize = 1024 * 1024;
+
+/// Bytes of mmap address space reserved for the feedback-buffer region,
+/// after which the event buffer is placed. Keeping the event buffer past the
+/// feedback slots means enabling the stream never shifts any existing offset.
+const FEEDBACK_REGION_SIZE: usize = MAX_FEEDBACK_BUFFERS * FEEDBACK_BUFFER_SLOT_SIZE;
+
 /// A userspace handle to a bedrock VM.
 ///
 /// This struct owns the VM file descriptor and provides access to VM operations.
@@ -61,14 +67,11 @@ pub struct Vm {
     memory_ptr: Option<NonNull<u8>>,
     /// Size of guest memory (0 for forked VMs).
     memory_size: usize,
-    /// Mapped serial buffer pointer.
-    serial_ptr: NonNull<u8>,
-    /// Mapped serial TSC metadata page.
-    serial_tsc_ptr: NonNull<u8>,
-    /// Mapped log buffer pointer (None if logging not enabled).
-    log_ptr: Option<NonNull<u8>>,
-    /// Offset for log buffer mmap (differs between root and forked VMs).
-    log_mmap_offset: libc::off_t,
+    /// Mapped unified event buffer pointer (None if the event stream is not
+    /// enabled). Carries all event records, including `Exit` records.
+    event_ptr: Option<NonNull<u8>>,
+    /// Offset for event buffer mmap (placed after the feedback-buffer region).
+    event_mmap_offset: libc::off_t,
     /// Mapped feedback buffer pointers (None if not mapped).
     feedback_buffer_ptrs: [Option<NonNull<u8>>; MAX_FEEDBACK_BUFFERS],
     /// Sizes of mapped feedback buffers (0 if not mapped).
@@ -91,18 +94,9 @@ impl Drop for Vm {
             if let Some(ptr) = self.memory_ptr {
                 libc::munmap(ptr.as_ptr() as *mut libc::c_void, self.memory_size);
             }
-            // Unmap serial buffers
-            libc::munmap(
-                self.serial_ptr.as_ptr() as *mut libc::c_void,
-                SERIAL_BUFFER_SIZE,
-            );
-            libc::munmap(
-                self.serial_tsc_ptr.as_ptr() as *mut libc::c_void,
-                SERIAL_TSC_PAGE_SIZE,
-            );
-            // Unmap log buffer if mapped
-            if let Some(log_ptr) = self.log_ptr {
-                libc::munmap(log_ptr.as_ptr() as *mut libc::c_void, LOG_BUFFER_SIZE);
+            // Unmap event buffer if mapped
+            if let Some(event_ptr) = self.event_ptr {
+                libc::munmap(event_ptr.as_ptr() as *mut libc::c_void, EVENT_BUFFER_SIZE);
             }
             // Unmap feedback buffers if mapped
             for i in 0..MAX_FEEDBACK_BUFFERS {
@@ -211,57 +205,17 @@ impl Vm {
 
         let memory_ptr = Some(unsafe { NonNull::new_unchecked(ptr as *mut u8) });
 
-        // Map the serial buffer
-        let serial_ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                SERIAL_BUFFER_SIZE,
-                libc::PROT_READ,
-                libc::MAP_SHARED,
-                fd.as_raw_fd(),
-                memory_size as libc::off_t,
-            )
-        };
-
-        if serial_ptr == libc::MAP_FAILED {
-            unsafe { libc::munmap(ptr, memory_size) };
-            return Err(io::Error::last_os_error());
-        }
-
-        let serial_ptr = unsafe { NonNull::new_unchecked(serial_ptr as *mut u8) };
-
-        // Map the serial TSC metadata page
-        let serial_tsc_offset = memory_size + SERIAL_BUFFER_SIZE + LOG_BUFFER_SIZE;
-        let tsc_ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                SERIAL_TSC_PAGE_SIZE,
-                libc::PROT_READ,
-                libc::MAP_SHARED,
-                fd.as_raw_fd(),
-                serial_tsc_offset as libc::off_t,
-            )
-        };
-
-        if tsc_ptr == libc::MAP_FAILED {
-            unsafe {
-                libc::munmap(ptr, memory_size);
-                libc::munmap(serial_ptr.as_ptr() as *mut libc::c_void, SERIAL_BUFFER_SIZE);
-            }
-            return Err(io::Error::last_os_error());
-        }
-
-        let serial_tsc_ptr = unsafe { NonNull::new_unchecked(tsc_ptr as *mut u8) };
-        let log_mmap_offset = (memory_size + SERIAL_BUFFER_SIZE) as libc::off_t;
+        // Root mmap layout: mem | feedback[0..16] | event. Guest serial output
+        // flows through the event buffer as `Serial` records, so there is no
+        // dedicated serial/TSC page to map.
+        let event_mmap_offset = (memory_size + FEEDBACK_REGION_SIZE) as libc::off_t;
 
         Ok(Self {
             fd,
             memory_ptr,
             memory_size,
-            serial_ptr,
-            serial_tsc_ptr,
-            log_ptr: None,
-            log_mmap_offset,
+            event_ptr: None,
+            event_mmap_offset,
             feedback_buffer_ptrs: [None; MAX_FEEDBACK_BUFFERS],
             feedback_buffer_sizes: [0; MAX_FEEDBACK_BUFFERS],
             ioctl_stats: Cell::new(IoctlStats::default()),
@@ -295,53 +249,17 @@ impl Vm {
 
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
 
-        // Map the serial buffer (forked VMs use offset 0)
-        let serial_ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                SERIAL_BUFFER_SIZE,
-                libc::PROT_READ,
-                libc::MAP_SHARED,
-                fd.as_raw_fd(),
-                0,
-            )
-        };
-
-        if serial_ptr == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
-        }
-
-        let serial_ptr = unsafe { NonNull::new_unchecked(serial_ptr as *mut u8) };
-
-        // Map the serial TSC metadata page
-        let tsc_offset = (SERIAL_BUFFER_SIZE + LOG_BUFFER_SIZE) as libc::off_t;
-        let tsc_ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                SERIAL_TSC_PAGE_SIZE,
-                libc::PROT_READ,
-                libc::MAP_SHARED,
-                fd.as_raw_fd(),
-                tsc_offset,
-            )
-        };
-
-        if tsc_ptr == libc::MAP_FAILED {
-            unsafe { libc::munmap(serial_ptr.as_ptr() as *mut libc::c_void, SERIAL_BUFFER_SIZE) };
-            return Err(io::Error::last_os_error());
-        }
-
-        let serial_tsc_ptr = unsafe { NonNull::new_unchecked(tsc_ptr as *mut u8) };
-        let log_mmap_offset = SERIAL_BUFFER_SIZE as libc::off_t;
+        // Forked mmap layout (no guest-memory prefix): feedback[0..16] | event.
+        // Guest serial output flows through the event buffer as `Serial`
+        // records, so there is no dedicated serial/TSC page to map.
+        let event_mmap_offset = FEEDBACK_REGION_SIZE as libc::off_t;
 
         Ok(Self {
             fd,
             memory_ptr: None,
             memory_size: 0,
-            serial_ptr,
-            serial_tsc_ptr,
-            log_ptr: None,
-            log_mmap_offset,
+            event_ptr: None,
+            event_mmap_offset,
             feedback_buffer_ptrs: [None; MAX_FEEDBACK_BUFFERS],
             feedback_buffer_sizes: [0; MAX_FEEDBACK_BUFFERS],
             ioctl_stats: Cell::new(IoctlStats::default()),
@@ -413,25 +331,6 @@ impl Vm {
     /// Returns 0 for forked VMs.
     pub fn memory_size(&self) -> usize {
         self.memory_size
-    }
-
-    // --- Serial I/O ---
-
-    /// Returns the serial output as a string, given the length from VmExit.
-    pub fn serial_output_str(&self, len: usize) -> &str {
-        let len = len.min(SERIAL_BUFFER_SIZE);
-        let bytes = unsafe { slice::from_raw_parts(self.serial_ptr.as_ptr(), len) };
-        std::str::from_utf8(bytes).unwrap_or("<invalid utf8>")
-    }
-
-    /// Returns the raw serial buffer.
-    pub fn serial_buffer(&self) -> &[u8] {
-        unsafe { slice::from_raw_parts(self.serial_ptr.as_ptr(), SERIAL_BUFFER_SIZE) }
-    }
-
-    /// Returns the serial TSC metadata page.
-    pub fn serial_tsc_buffer(&self) -> &[u8] {
-        unsafe { slice::from_raw_parts(self.serial_tsc_ptr.as_ptr(), SERIAL_TSC_PAGE_SIZE) }
     }
 
     // --- Deterministic I/O channel ---
@@ -511,47 +410,6 @@ impl Vm {
         Ok(payload.data[..n].to_vec())
     }
 
-    pub fn set_input(&self, input: &[u8]) -> io::Result<()> {
-        if self.forked {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "forked VMs do not support serial input",
-            ));
-        }
-
-        if input.len() > SERIAL_INPUT_MAX_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "input too large: {} > {}",
-                    input.len(),
-                    SERIAL_INPUT_MAX_SIZE
-                ),
-            ));
-        }
-
-        let mut serial_input = SerialInput {
-            len: input.len() as u32,
-            _reserved: 0,
-            buf: [0u8; SERIAL_INPUT_MAX_SIZE],
-        };
-        serial_input.buf[..input.len()].copy_from_slice(input);
-
-        let ret = unsafe {
-            libc::ioctl(
-                self.fd.as_raw_fd(),
-                BEDROCK_VM_SET_INPUT as libc::c_ulong,
-                &serial_input as *const SerialInput,
-            )
-        };
-
-        if ret < 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        Ok(())
-    }
-
     // --- Registers ---
 
     /// Read all VM registers.
@@ -611,11 +469,11 @@ impl Vm {
 
         let mut exit = VmExit {
             exit_reason: 0,
-            serial_len: 0,
+            _reserved: 0,
             exit_qualification: 0,
             guest_physical_addr: 0,
-            log_entry_count: 0,
-            _reserved: 0,
+            event_len: 0,
+            _pad: 0,
             emulated_tsc: 0,
             tsc_frequency: 0,
         };
@@ -678,18 +536,27 @@ impl Vm {
         Ok(())
     }
 
-    // --- Logging ---
+    // --- Event stream ---
 
-    /// Configure logging with a unified configuration.
-    pub fn set_log_config(&mut self, config: &LogConfig) -> io::Result<()> {
-        let was_enabled = self.log_ptr.is_some();
+    /// Configure the unified event stream: enable/disable, the category mask,
+    /// and the `Exit`-record trigger policy (see [`EventConfig`]).
+    ///
+    /// The ioctl allocates or frees the kernel event buffer, and this method
+    /// maps/unmaps it into userspace. After this returns with the stream
+    /// enabled, drain it after each [`run`](Self::run) via
+    /// [`event_buffer`](Self::event_buffer) sliced to `VmExit::event_len`,
+    /// parsed with [`crate::events::EventStream`]. To capture `Exit` records,
+    /// include [`EventCategories::EXIT`](crate::EventCategories) and an
+    /// [`ExitTrigger`] other than [`ExitTrigger::Disabled`].
+    pub fn set_event_config(&mut self, config: &EventConfig) -> io::Result<()> {
+        let was_enabled = self.event_ptr.is_some();
         let want_enabled = config.enabled != 0;
 
         let ret = unsafe {
             libc::ioctl(
                 self.fd.as_raw_fd(),
-                BEDROCK_VM_SET_LOG_CONFIG as libc::c_ulong,
-                config as *const LogConfig,
+                BEDROCK_VM_SET_EVENT_CONFIG as libc::c_ulong,
+                config as *const EventConfig,
             )
         };
 
@@ -697,36 +564,37 @@ impl Vm {
             return Err(io::Error::last_os_error());
         }
 
-        // Handle userspace mmap state changes
+        // Handle userspace mmap state changes.
         if want_enabled && !was_enabled {
-            let log_ptr = unsafe {
+            let event_ptr = unsafe {
                 libc::mmap(
                     std::ptr::null_mut(),
-                    LOG_BUFFER_SIZE,
+                    EVENT_BUFFER_SIZE,
                     libc::PROT_READ,
                     libc::MAP_SHARED,
                     self.fd.as_raw_fd(),
-                    self.log_mmap_offset,
+                    self.event_mmap_offset,
                 )
             };
 
-            if log_ptr == libc::MAP_FAILED {
-                let disabled = LogConfig::disabled();
+            if event_ptr == libc::MAP_FAILED {
+                // Roll back the kernel-side enable so state stays consistent.
+                let disabled = EventConfig::disabled();
                 unsafe {
                     libc::ioctl(
                         self.fd.as_raw_fd(),
-                        BEDROCK_VM_SET_LOG_CONFIG as libc::c_ulong,
-                        &disabled as *const LogConfig,
+                        BEDROCK_VM_SET_EVENT_CONFIG as libc::c_ulong,
+                        &disabled as *const EventConfig,
                     );
                 }
                 return Err(io::Error::last_os_error());
             }
 
-            self.log_ptr = Some(unsafe { NonNull::new_unchecked(log_ptr as *mut u8) });
+            self.event_ptr = Some(unsafe { NonNull::new_unchecked(event_ptr as *mut u8) });
         } else if !want_enabled && was_enabled {
-            if let Some(log_ptr) = self.log_ptr.take() {
+            if let Some(event_ptr) = self.event_ptr.take() {
                 unsafe {
-                    libc::munmap(log_ptr.as_ptr() as *mut libc::c_void, LOG_BUFFER_SIZE);
+                    libc::munmap(event_ptr.as_ptr() as *mut libc::c_void, EVENT_BUFFER_SIZE);
                 }
             }
         }
@@ -734,15 +602,18 @@ impl Vm {
         Ok(())
     }
 
-    /// Check if logging is enabled.
-    pub fn logging_enabled(&self) -> bool {
-        self.log_ptr.is_some()
+    /// Whether the event stream is enabled (buffer mapped).
+    pub fn event_stream_enabled(&self) -> bool {
+        self.event_ptr.is_some()
     }
 
-    /// Returns the raw log buffer as a byte slice.
-    pub fn log_buffer(&self) -> Option<&[u8]> {
-        self.log_ptr
-            .map(|ptr| unsafe { slice::from_raw_parts(ptr.as_ptr(), LOG_BUFFER_SIZE) })
+    /// Returns the raw event buffer as a byte slice (the full 1 MB region).
+    ///
+    /// Callers should slice this to `VmExit::event_len` (the valid prefix) and
+    /// iterate it with [`crate::events::EventStream`].
+    pub fn event_buffer(&self) -> Option<&[u8]> {
+        self.event_ptr
+            .map(|ptr| unsafe { slice::from_raw_parts(ptr.as_ptr(), EVENT_BUFFER_SIZE) })
     }
 
     // --- Feedback buffer ---
@@ -960,11 +831,11 @@ impl Vm {
         const FEEDBACK_BUFFER_SLOT_SIZE: usize = 1024 * 1024; // 1MB per slot
 
         let base_offset = if self.forked {
-            // Forked VM layout: serial(0) + log(4096) + tsc(4096+1MB) + feedback_base(4096+1MB+4096)
-            SERIAL_BUFFER_SIZE + LOG_BUFFER_SIZE + SERIAL_TSC_PAGE_SIZE
+            // Forked layout: feedback_base(0) | event
+            0
         } else {
-            // Root VM layout: mem(0) + serial(mem_size) + log(mem_size+4096) + tsc(mem_size+4096+1MB) + feedback_base(...)
-            self.memory_size + SERIAL_BUFFER_SIZE + LOG_BUFFER_SIZE + SERIAL_TSC_PAGE_SIZE
+            // Root layout: mem | feedback_base(mem_size) | event
+            self.memory_size
         };
 
         (base_offset + index * FEEDBACK_BUFFER_SLOT_SIZE) as libc::off_t
@@ -1090,16 +961,6 @@ impl Vm {
     }
 
     // --- Convenience methods ---
-
-    /// Get log entries from the log buffer.
-    ///
-    /// Returns a slice of the first `count` log entries, or all entries if
-    /// `count` exceeds the available entries.
-    pub fn log_entries(&self, count: usize) -> &[crate::LogEntry] {
-        self.log_buffer()
-            .map(|buf| crate::LogEntry::from_buffer(buf, count))
-            .unwrap_or(&[])
-    }
 
     /// Modify registers using a closure.
     ///

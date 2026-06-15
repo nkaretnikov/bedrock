@@ -143,7 +143,7 @@ impl VmContext for MockVmContext {
         Ok(())
     }
 
-    fn finalize_log_entry<K: Kernel>(&mut self, _kernel: &K) {
+    fn finalize_exit_record<K: Kernel>(&mut self, _kernel: &K) {
         // Mock does nothing for log finalization
     }
 }
@@ -474,23 +474,45 @@ fn test_vmcall_snapshot_hypercall() {
     assert_eq!(ctx.get_guest_rip(), Some(0x1003));
 }
 
+/// Attach a fresh event buffer to the VM and enable the `EXIT` category, so
+/// `Exit` records are captured. Returns the backing buffer (keep it alive for
+/// the test's duration).
+fn attach_exit_event_buffer(ctx: &mut MockVmContext) -> std::vec::Vec<u8> {
+    use crate::events::{EventCategories, EVENT_BUFFER_SIZE};
+    let buffer = std::vec![0u8; EVENT_BUFFER_SIZE];
+    let ptr = buffer.as_ptr() as *mut u8;
+    ctx.state_mut().set_event_buffer(ptr);
+    ctx.state_mut().set_event_categories(EventCategories::EXIT);
+    buffer
+}
+
+/// Read the first event record's kind and its `ExitRecord` payload from a drained
+/// event buffer. Panics if there is no record.
+fn first_exit_entry(buffer: &[u8]) -> &crate::exit_record::ExitRecord {
+    use crate::events::{EventKind, EVENT_HEADER_SIZE};
+    let kind = u16::from_le_bytes([buffer[24], buffer[25]]);
+    assert_eq!(
+        kind,
+        EventKind::Exit.as_u16(),
+        "first record is not an Exit"
+    );
+    // SAFETY: an Exit payload is a 512-byte ExitRecord beginning right after the
+    // 32-byte header; the buffer is at least that large.
+    unsafe { &*(buffer.as_ptr().add(EVENT_HEADER_SIZE) as *const crate::exit_record::ExitRecord) }
+}
+
 #[test]
 fn test_vmcall_snapshot_with_logging_enabled() {
-    use crate::logging::LogEntry;
-    use crate::vm_state::LogMode;
+    use crate::vm_state::ExitTrigger;
 
     let mut ctx = MockVmContext::new();
 
-    // Allocate a log buffer
-    let log_buffer = std::vec![0u8; 1024 * 1024]; // 1MB
-    let log_buffer_ptr = log_buffer.as_ptr() as *mut u8;
+    // Capture Exit records via the unified event stream.
+    let event_buffer = attach_exit_event_buffer(&mut ctx);
 
-    // Use AtShutdown mode - this skips automatic exit logging but still
-    // allows explicit snapshot logging via log_snapshot()
-    ctx.state_mut().log_mode = LogMode::AtShutdown;
-    unsafe {
-        ctx.state_mut().set_log_buffer(log_buffer_ptr);
-    }
+    // Use AtShutdown mode - this skips automatic per-exit capture but still
+    // allows explicit snapshot logging via capture_exit_at_snapshot()
+    ctx.state_mut().exit_trigger = ExitTrigger::AtShutdown;
     // Set last_instruction_count and tsc_offset so that emulated_tsc is computed correctly
     // (emulated_tsc = last_instruction_count + tsc_offset)
     ctx.state_mut().last_instruction_count = 1000;
@@ -509,74 +531,63 @@ fn test_vmcall_snapshot_with_logging_enabled() {
         ExitHandlerResult::ExitToUserspace(ExitReason::VmcallSnapshot)
     );
 
-    // Log entry should have been written (only the snapshot entry)
-    assert_eq!(ctx.state().log_entry_count, 1);
-
-    // Verify the log entry contents by reading directly from buffer
-    let entry = unsafe { &*(log_buffer.as_ptr() as *const LogEntry) };
+    // One Exit event should have been emitted (the snapshot).
+    assert!(ctx.state().event_buffer_len() > 0);
+    let entry = first_exit_entry(&event_buffer);
     assert_eq!(entry.exit_reason, ExitReason::VmcallSnapshot as u32);
     assert_eq!(entry.tsc, 1000);
 }
 
 #[test]
-fn test_vmcall_snapshot_buffer_full() {
-    // Test log_snapshot directly on VmState to verify buffer full behavior.
-    // When buffer is full, log_snapshot silently does nothing.
-    use crate::logging::MAX_LOG_ENTRIES;
-    use crate::vm_state::LogMode;
+fn test_vmcall_snapshot_requires_exit_category() {
+    // With the EXIT category disabled, capture_exit_at_snapshot captures nothing — the
+    // event-stream analog of "log buffer not allocated".
+    use crate::events::EventCategories;
+    use crate::vm_state::ExitTrigger;
 
     let mut ctx = MockVmContext::new();
+    let _event_buffer = attach_exit_event_buffer(&mut ctx);
+    // Disable EXIT capture again.
+    ctx.state_mut()
+        .set_event_categories(EventCategories::empty());
 
-    // Allocate a log buffer
-    let log_buffer = std::vec![0u8; 1024 * 1024]; // 1MB
-    let log_buffer_ptr = log_buffer.as_ptr() as *mut u8;
-
-    // Enable logging (use AtShutdown to avoid other logging side effects)
-    ctx.state_mut().log_mode = LogMode::AtShutdown;
-    unsafe {
-        ctx.state_mut().set_log_buffer(log_buffer_ptr);
-    }
-    ctx.state_mut().log_entry_count = MAX_LOG_ENTRIES; // Buffer is full
+    ctx.state_mut().exit_trigger = ExitTrigger::AtShutdown;
     ctx.state_mut().emulated_tsc = 2000;
 
-    // Call log_snapshot directly - should silently do nothing when buffer full
-    ctx.state_mut().log_snapshot();
+    ctx.state_mut().capture_exit_at_snapshot();
 
-    // Log entry count should not have changed
-    assert_eq!(ctx.state().log_entry_count, MAX_LOG_ENTRIES);
+    // Nothing written because EXIT is not in the category mask.
+    assert_eq!(ctx.state().event_buffer_len(), 0);
 }
 
 #[test]
 fn test_vmcall_snapshot_respects_log_start_tsc() {
-    // Test log_snapshot directly to verify TSC threshold is respected.
-    use crate::vm_state::LogMode;
+    // Test capture_exit_at_snapshot directly to verify TSC threshold is respected.
+    use crate::vm_state::ExitTrigger;
 
     let mut ctx = MockVmContext::new();
-
-    // Allocate a log buffer
-    let log_buffer = std::vec![0u8; 1024 * 1024]; // 1MB
-    let log_buffer_ptr = log_buffer.as_ptr() as *mut u8;
+    let event_buffer = attach_exit_event_buffer(&mut ctx);
 
     // Enable logging with a start threshold
-    ctx.state_mut().log_mode = LogMode::AtShutdown;
-    unsafe {
-        ctx.state_mut().set_log_buffer(log_buffer_ptr);
-    }
-    ctx.state_mut().log_start_tsc = 5000; // Don't log until TSC >= 5000
+    ctx.state_mut().exit_trigger = ExitTrigger::AtShutdown;
+    ctx.state_mut().exit_start_tsc = 5000; // Don't log until TSC >= 5000
     ctx.state_mut().emulated_tsc = 1000; // Current TSC is below threshold
 
-    // Call log_snapshot directly - should skip logging due to threshold
-    ctx.state_mut().log_snapshot();
+    // Call capture_exit_at_snapshot directly - should skip logging due to threshold
+    ctx.state_mut().capture_exit_at_snapshot();
 
-    // No log entry should have been written
-    assert_eq!(ctx.state().log_entry_count, 0);
+    // No Exit event should have been written.
+    assert_eq!(ctx.state().event_buffer_len(), 0);
 
     // Now set TSC above threshold and try again
     ctx.state_mut().emulated_tsc = 6000;
-    ctx.state_mut().log_snapshot();
+    ctx.state_mut().capture_exit_at_snapshot();
 
-    // Now a log entry should have been written
-    assert_eq!(ctx.state().log_entry_count, 1);
+    // Now an Exit event should have been written.
+    assert!(ctx.state().event_buffer_len() > 0);
+    let entry = first_exit_entry(&event_buffer);
+    assert_eq!(entry.exit_reason, ExitReason::VmcallSnapshot as u32);
+    assert_eq!(entry.tsc, 6000);
 }
 
 // =============================================================================
@@ -1039,5 +1050,182 @@ fn test_check_io_channel_defers_until_target_tsc() {
     assert!(
         ctx.state().devices.apic.irr[irr_index] & irr_bit != 0,
         "APIC IRR should be set on the boundary step"
+    );
+}
+
+// =============================================================================
+// Paravirtual batch console tests
+// =============================================================================
+
+#[test]
+fn test_vmcall_serial_register_page_success() {
+    use crate::hypercalls::HYPERCALL_SERIAL_REGISTER_PAGE;
+
+    let mut ctx = MockVmContext::new();
+    install_identity_paging(&mut ctx);
+
+    ctx.set_exit_reason(ExitReason::Vmcall);
+    ctx.set_exit_qualification(0);
+    ctx.set_guest_rip(0x1000);
+    ctx.set_instruction_len(3);
+
+    ctx.gprs_mut().rax = HYPERCALL_SERIAL_REGISTER_PAGE;
+    // 4KB-aligned address inside the 1GB identity-mapped window.
+    ctx.gprs_mut().rbx = 0x5000;
+
+    let result = handle_exit(&mut ctx, &MockKernel, &mut MockFrameAllocator::new());
+    // Registration is purely host-internal, so it continues the guest rather
+    // than exiting to userspace.
+    assert_eq!(result, ExitHandlerResult::Continue);
+    assert_eq!(ctx.gprs().rax, 0, "registration should succeed");
+    assert_eq!(ctx.state().serial_console.page_gpa, 0x5000);
+    assert_eq!(ctx.get_guest_rip(), Some(0x1003));
+}
+
+#[test]
+fn test_vmcall_serial_register_page_unaligned() {
+    use crate::hypercalls::HYPERCALL_SERIAL_REGISTER_PAGE;
+
+    let mut ctx = MockVmContext::new();
+    install_identity_paging(&mut ctx);
+
+    ctx.set_exit_reason(ExitReason::Vmcall);
+    ctx.set_exit_qualification(0);
+    ctx.set_guest_rip(0x1000);
+    ctx.set_instruction_len(3);
+
+    ctx.gprs_mut().rax = HYPERCALL_SERIAL_REGISTER_PAGE;
+    ctx.gprs_mut().rbx = 0x5001; // 1 byte misaligned
+
+    let result = handle_exit(&mut ctx, &MockKernel, &mut MockFrameAllocator::new());
+    assert_eq!(result, ExitHandlerResult::Continue);
+    assert_eq!(ctx.gprs().rax, !0u64, "unaligned should return -1");
+    assert_eq!(
+        ctx.state().serial_console.page_gpa,
+        0,
+        "failed registration must not stash a GPA"
+    );
+}
+
+#[test]
+fn test_vmcall_serial_register_page_untranslatable() {
+    use crate::hypercalls::HYPERCALL_SERIAL_REGISTER_PAGE;
+
+    let mut ctx = MockVmContext::new();
+    install_identity_paging(&mut ctx);
+
+    ctx.set_exit_reason(ExitReason::Vmcall);
+    ctx.set_exit_qualification(0);
+    ctx.set_guest_rip(0x1000);
+    ctx.set_instruction_len(3);
+
+    ctx.gprs_mut().rax = HYPERCALL_SERIAL_REGISTER_PAGE;
+    // 4KB-aligned, but exactly at the 1GB boundary — the identity window only
+    // covers [0, 1GB) via a single 1GB PDPT entry, so PDPT[1] is absent and
+    // the page-table walk fails to translate.
+    ctx.gprs_mut().rbx = 0x4000_0000;
+
+    let result = handle_exit(&mut ctx, &MockKernel, &mut MockFrameAllocator::new());
+    assert_eq!(result, ExitHandlerResult::Continue);
+    assert_eq!(ctx.gprs().rax, !0u64, "untranslatable GVA should return -1");
+    assert_eq!(
+        ctx.state().serial_console.page_gpa,
+        0,
+        "failed registration must not stash a GPA"
+    );
+}
+
+#[test]
+fn test_vmcall_serial_write_emits_serial_event() {
+    use crate::events::{EventCategories, EventKind, EVENT_BUFFER_SIZE, EVENT_HEADER_SIZE};
+    use crate::hypercalls::{HYPERCALL_SERIAL_REGISTER_PAGE, HYPERCALL_SERIAL_WRITE};
+
+    let mut ctx = MockVmContext::new();
+    install_identity_paging(&mut ctx);
+
+    // Capture the console output on the unified event stream.
+    let buffer = std::vec![0u8; EVENT_BUFFER_SIZE];
+    let ptr = buffer.as_ptr() as *mut u8;
+    ctx.state_mut().set_event_buffer(ptr);
+    ctx.state_mut()
+        .set_event_categories(EventCategories::SERIAL);
+
+    // Register the console page at GVA/GPA 0x5000.
+    ctx.set_exit_reason(ExitReason::Vmcall);
+    ctx.set_exit_qualification(0);
+    ctx.set_guest_rip(0x1000);
+    ctx.set_instruction_len(3);
+    ctx.gprs_mut().rax = HYPERCALL_SERIAL_REGISTER_PAGE;
+    ctx.gprs_mut().rbx = 0x5000;
+    let _ = handle_exit(&mut ctx, &MockKernel, &mut MockFrameAllocator::new());
+
+    // Place a console record in the registered page. Span more than one
+    // IO_COPY_CHUNK (256 bytes) so the chunked guest->pending copy is
+    // exercised past its first boundary.
+    let mut record: Vec<u8> = Vec::new();
+    record.extend_from_slice(b"hello bedrock console\n");
+    record.extend(core::iter::repeat_n(b'x', 400));
+    ctx.memory[0x5000..0x5000 + record.len()].copy_from_slice(&record);
+
+    // Issue SERIAL_WRITE with the record length.
+    ctx.set_exit_reason(ExitReason::Vmcall);
+    ctx.set_exit_qualification(0);
+    ctx.set_guest_rip(0x2000);
+    ctx.set_instruction_len(3);
+    ctx.gprs_mut().rax = HYPERCALL_SERIAL_WRITE;
+    ctx.gprs_mut().rbx = record.len() as u64;
+    let result = handle_exit(&mut ctx, &MockKernel, &mut MockFrameAllocator::new());
+
+    assert_eq!(result, ExitHandlerResult::Continue);
+    assert_eq!(ctx.gprs().rax, 0, "SERIAL_WRITE should succeed");
+    assert_eq!(ctx.get_guest_rip(), Some(0x2003));
+
+    // The record was emitted as a single Serial event carrying its bytes verbatim.
+    let len = ctx.state().event_buffer_len();
+    assert_eq!(
+        len,
+        EVENT_HEADER_SIZE + crate::events::align_up(record.len(), 8)
+    );
+    let kind = u16::from_le_bytes([buffer[24], buffer[25]]);
+    let payload_len = u32::from_le_bytes([buffer[28], buffer[29], buffer[30], buffer[31]]) as usize;
+    assert_eq!(kind, EventKind::Serial.as_u16());
+    assert_eq!(payload_len, record.len());
+    assert_eq!(
+        &buffer[EVENT_HEADER_SIZE..EVENT_HEADER_SIZE + record.len()],
+        record.as_slice()
+    );
+}
+
+#[test]
+fn test_vmcall_serial_write_not_registered() {
+    use crate::events::{EventCategories, EVENT_BUFFER_SIZE};
+    use crate::hypercalls::HYPERCALL_SERIAL_WRITE;
+
+    let mut ctx = MockVmContext::new();
+    install_identity_paging(&mut ctx);
+
+    let buffer = std::vec![0u8; EVENT_BUFFER_SIZE];
+    ctx.state_mut().set_event_buffer(buffer.as_ptr() as *mut u8);
+    ctx.state_mut()
+        .set_event_categories(EventCategories::SERIAL);
+
+    ctx.set_exit_reason(ExitReason::Vmcall);
+    ctx.set_exit_qualification(0);
+    ctx.set_guest_rip(0x1000);
+    ctx.set_instruction_len(3);
+    ctx.gprs_mut().rax = HYPERCALL_SERIAL_WRITE;
+    ctx.gprs_mut().rbx = 8;
+
+    let result = handle_exit(&mut ctx, &MockKernel, &mut MockFrameAllocator::new());
+    assert_eq!(result, ExitHandlerResult::Continue);
+    assert_eq!(
+        ctx.gprs().rax,
+        !0u64,
+        "SERIAL_WRITE before registration returns -1"
+    );
+    assert_eq!(
+        ctx.state().event_buffer_len(),
+        0,
+        "no Serial event emitted on failure"
     );
 }

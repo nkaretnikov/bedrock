@@ -2,8 +2,6 @@
 
 //! VM exit information returned from the RUN ioctl.
 
-use super::Vm;
-
 /// Categorized VM exit types for cleaner pattern matching.
 ///
 /// This enum provides a higher-level categorization of VM exits,
@@ -15,12 +13,9 @@ use super::Vm;
 /// use bedrock_vm::{Vm, ExitKind};
 ///
 /// let exit = vm.run()?;
-/// if exit.serial_len > 0 {
-///     print!("{}", exit.serial_output(&vm));
-/// }
 /// match exit.kind() {
 ///     ExitKind::VmcallShutdown => println!("Clean shutdown"),
-///     ExitKind::Continue | ExitKind::LogBufferFull => continue,
+///     ExitKind::Continue | ExitKind::EventBufferFull => continue,
 ///     kind => println!("Unexpected exit: {:?}", kind),
 /// }
 /// ```
@@ -52,8 +47,8 @@ pub enum ExitKind {
     Rdrand,
     /// RDSEED instruction (ExitToUserspace mode).
     Rdseed,
-    /// Log buffer is full - userspace must drain the log buffer.
-    LogBufferFull,
+    /// Event buffer is full - userspace must drain it, then call run() again.
+    EventBufferFull,
     /// Continuable exit - userspace should call run() again.
     ///
     /// Includes: preemption timer, need_resched, MWAIT, MONITOR,
@@ -71,23 +66,27 @@ pub enum ExitKind {
 
 /// VM exit information returned from the RUN ioctl.
 ///
-/// Serial output is accessed via mmap at offset = guest_memory_size.
-/// Log buffer is accessed via mmap at offset = guest_memory_size + 4096.
+/// All host-visible output (serial console included) is carried by the unified
+/// event buffer, mmap'd separately and drained as `buffer[0..event_len]`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct VmExit {
     /// Exit reason (corresponds to ExitReason enum in kernel).
     pub exit_reason: u32,
-    /// Number of valid bytes in the serial buffer (mmap'd separately).
-    pub serial_len: u32,
+    /// Reserved (formerly the serial buffer length; guest serial output now
+    /// flows through the event stream as `Serial` records). Kept so the ioctl
+    /// struct layout is unchanged.
+    pub _reserved: u32,
     /// Exit qualification (interpretation depends on exit reason).
     pub exit_qualification: u64,
     /// Guest physical address (for EPT violations).
     pub guest_physical_addr: u64,
-    /// Number of log entries in the log buffer (if logging enabled).
-    pub log_entry_count: u32,
-    /// Reserved for alignment.
-    pub _reserved: u32,
+    /// Number of valid bytes in the event buffer (mmap'd separately), i.e. the
+    /// cursor userspace drains as `event_buffer()[0..event_len]`. Zero when the
+    /// event stream is disabled.
+    pub event_len: u32,
+    /// Explicit padding so the following `u64` fields are 8-byte aligned.
+    pub _pad: u32,
     /// Current emulated TSC value.
     pub emulated_tsc: u64,
     /// TSC frequency in Hz.
@@ -115,7 +114,6 @@ impl VmExit {
             57 => "RDRAND",
             61 => "RDSEED",
             256 => "NEED_RESCHED",
-            257 => "LOG_BUFFER_FULL",
             258 => "VMCALL_SHUTDOWN",
             259 => "STOP_TSC_REACHED",
             260 => "VMCALL_SNAPSHOT",
@@ -125,6 +123,7 @@ impl VmExit {
             264 => "VMCALL_IO_REGISTER_PAGE",
             265 => "VMCALL_IO_RESPONSE",
             266 => "VMCALL_READY",
+            267 => "EVENT_BUFFER_FULL",
             _ => "UNKNOWN",
         }
     }
@@ -142,7 +141,7 @@ impl VmExit {
             266 => ExitKind::VmcallReady,
             57 => ExitKind::Rdrand,
             61 => ExitKind::Rdseed,
-            257 => ExitKind::LogBufferFull,
+            267 => ExitKind::EventBufferFull,
             // Continuable: preemption timer, need_resched, mwait, monitor,
             // I/O instruction, pool exhausted, PEBS scratch-page registration,
             // I/O channel page registration (no userspace action needed —
@@ -158,23 +157,6 @@ impl VmExit {
     /// Returns true for exits that are handled internally and don't require
     /// userspace intervention beyond draining the serial buffer.
     pub fn is_continue(&self) -> bool {
-        matches!(self.kind(), ExitKind::Continue | ExitKind::LogBufferFull)
-    }
-
-    /// Get the serial output for this exit from the given VM.
-    ///
-    /// This is a convenience method that extracts the serial output string
-    /// from the VM using the serial_len from this exit.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let exit = vm.run()?;
-    /// if exit.serial_len > 0 {
-    ///     println!("Output: {}", exit.serial_output(&vm));
-    /// }
-    /// ```
-    pub fn serial_output<'a>(&self, vm: &'a Vm) -> &'a str {
-        vm.serial_output_str(self.serial_len as usize)
+        matches!(self.kind(), ExitKind::Continue | ExitKind::EventBufferFull)
     }
 }

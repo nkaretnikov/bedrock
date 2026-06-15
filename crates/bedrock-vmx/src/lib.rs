@@ -12,12 +12,13 @@ pub mod compat;
 pub mod cow;
 pub mod decoder;
 pub mod devices;
+pub mod events;
+pub mod exit_record;
 pub mod exits;
 pub mod fields;
 pub mod handler;
 pub mod host;
 pub mod hypercalls;
-pub mod logging;
 mod prelude;
 pub mod registers;
 pub mod timing;
@@ -39,8 +40,8 @@ pub use traits::{
 pub use traits::VmRunError;
 pub use vm::{ForkableVm, ForkedVm, ForkedVmError, ParentVm, RootVm, RootVmError};
 pub use vm_state::{
-    AllExitStats, ExitStats, LogMode, SyscallMsrs, VmState, VmStateError, DEFAULT_TSC_FREQUENCY,
-    PAT_DEFAULT, SERIAL_BUFFER_SIZE,
+    AllExitStats, ExitStats, ExitTrigger, SyscallMsrs, VmState, VmStateError,
+    DEFAULT_TSC_FREQUENCY, PAT_DEFAULT,
 };
 
 // Handler

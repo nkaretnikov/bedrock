@@ -6,9 +6,9 @@
 //! local APIC. It's accessed via MMIO at 0xFEC00000.
 
 #[cfg(not(feature = "cargo"))]
-use super::super::logging::{StateHash, Xxh64Hasher};
+use super::super::exit_record::{StateHash, Xxh64Hasher};
 #[cfg(feature = "cargo")]
-use crate::logging::{StateHash, Xxh64Hasher};
+use crate::exit_record::{StateHash, Xxh64Hasher};
 
 /// Number of I/O APIC redirection table entries.
 pub const IOAPIC_NUM_PINS: usize = 24;

@@ -1,29 +1,27 @@
 // SPDX-License-Identifier: GPL-2.0
 
-//! Log entry structures for deterministic VM exit logging.
+//! Exit-record structure: the payload of an `EventKind::Exit` event.
 
-/// Log buffer size: 1MB (256 pages).
-pub const LOG_BUFFER_SIZE: usize = 1024 * 1024;
-
-/// Number of pages in the log buffer.
-pub const LOG_BUFFER_PAGES: usize = LOG_BUFFER_SIZE / 4096;
-
-/// Size of a single log entry in bytes.
-pub const LOG_ENTRY_SIZE: usize = 512;
-
-/// Maximum number of log entries that fit in the buffer.
-pub const MAX_LOG_ENTRIES: usize = LOG_BUFFER_SIZE / LOG_ENTRY_SIZE;
+/// Size of an exit record (`ExitRecord`) in bytes.
+pub const EXIT_RECORD_SIZE: usize = 512;
 
 /// Flag bit: entry represents a deterministic exit.
-pub const LOG_ENTRY_FLAG_DETERMINISTIC: u32 = 1;
+pub const EXIT_RECORD_FLAG_DETERMINISTIC: u32 = 1;
 
-/// A single log entry for VM exit logging.
+/// The payload of an `EventKind::Exit` event: a 512-byte snapshot of one VM
+/// exit. Fixed-size with all fields aligned for efficient access.
 ///
-/// Fixed at 512 bytes to allow ~2048 entries in a 1MB buffer.
-/// All fields are aligned for efficient access.
+/// The `cargo`-gated `zerocopy`/`serde` derives let the userspace reader cast
+/// and serialize it; the kernel-module build (Kbuild, not Cargo) never sees
+/// those derives.
+#[cfg_attr(
+    feature = "cargo",
+    derive(zerocopy::FromBytes, zerocopy::Immutable, zerocopy::KnownLayout)
+)]
+#[cfg_attr(feature = "cargo", derive(serde::Serialize, serde::Deserialize))]
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct LogEntry {
+#[derive(Clone, Copy, Default, Debug)]
+pub struct ExitRecord {
     // Exit info (24 bytes)
     /// TSC value at time of exit (from emulated_tsc).
     pub tsc: u64,
@@ -146,13 +144,14 @@ pub struct LogEntry {
     pub vmx_state_flags: u64,
 
     /// Padding to reach 512 bytes.
+    #[cfg_attr(feature = "cargo", serde(skip))]
     pub _padding: [u64; 16],
 }
 
-// Compile-time assertion that LogEntry is exactly LOG_ENTRY_SIZE bytes.
-const _: () = assert!(core::mem::size_of::<LogEntry>() == LOG_ENTRY_SIZE);
+// Compile-time assertion that ExitRecord is exactly EXIT_RECORD_SIZE bytes.
+const _: () = assert!(core::mem::size_of::<ExitRecord>() == EXIT_RECORD_SIZE);
 
-impl LogEntry {
+impl ExitRecord {
     /// Create a new empty log entry.
     pub const fn new() -> Self {
         Self {
@@ -209,8 +208,13 @@ impl LogEntry {
             _padding: [0; 16],
         }
     }
+
+    /// Returns true if this entry represents a deterministic exit.
+    pub fn is_deterministic(&self) -> bool {
+        self.flags & EXIT_RECORD_FLAG_DETERMINISTIC != 0
+    }
 }
 
 #[cfg(test)]
-#[path = "entry_tests.rs"]
+#[path = "record_tests.rs"]
 mod tests;

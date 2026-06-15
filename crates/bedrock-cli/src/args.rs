@@ -5,12 +5,12 @@
 use clap::{Parser, ValueEnum};
 
 use bedrock_vm::boot::defaults;
-use bedrock_vm::DEFAULT_TSC_FREQUENCY;
+use bedrock_vm::{ExitTrigger, DEFAULT_TSC_FREQUENCY};
 
-/// Bedrock CLI - Linux Kernel Loader for the bedrock hypervisor.
+/// Boot and run deterministic Linux guests on the bedrock hypervisor.
 #[derive(Parser, Debug)]
 #[command(name = "bedrock-cli")]
-#[command(about = "Linux Kernel Loader for the bedrock hypervisor")]
+#[command(about = "Boot and run deterministic Linux guests on the bedrock hypervisor")]
 #[command(version)]
 pub struct Args {
     /// Path to vmlinux ELF image (required for root VMs, unused for forked VMs)
@@ -29,12 +29,8 @@ pub struct Args {
     pub initramfs: Option<String>,
 
     /// Write serial output to file (in addition to stdout)
-    #[arg(short = 'l', long)]
-    pub log: Option<String>,
-
-    /// Serial input to send to guest (use \n for newlines)
-    #[arg(short = 'x', long, value_parser = parse_serial_input)]
-    pub input: Option<String>,
+    #[arg(short = 'l', long = "serial-log-file")]
+    pub serial_log_file: Option<String>,
 
     /// RDRAND emulation mode
     #[arg(short = 'r', long = "rdrand-mode", value_enum, default_value_t = RdrandMode::Seeded)]
@@ -44,29 +40,34 @@ pub struct Args {
     #[arg(short = 's', long = "rdrand-seed", default_value_t = defaults::RDRAND_SEED, value_parser = parse_u64)]
     pub rdrand_seed: u64,
 
-    /// Enable deterministic exit logging
-    #[arg(short = 'L', long = "enable-log")]
-    pub enable_log: bool,
+    /// Write the unified event stream to a JSONL file (enables the event stream)
+    #[arg(long = "events-jsonl")]
+    pub events_jsonl: Option<String>,
 
-    /// Write log entries to JSONL file (implies -L)
-    #[arg(long = "log-jsonl")]
-    pub log_jsonl: Option<String>,
+    /// Event categories to capture, comma-separated. One or more of:
+    /// exit, serial, inject, randomness, io_channel, diagnostic, all.
+    #[arg(
+        long = "event-categories",
+        default_value = "serial,inject,randomness,io_channel"
+    )]
+    pub event_categories: String,
 
     /// Single-step (MTF) for TSC range (e.g., 79800000-79810000)
     #[arg(long = "single-step", value_parser = parse_tsc_range)]
     pub single_step: Option<(u64, u64)>,
 
-    /// Start logging only after emulated TSC reaches threshold
-    #[arg(long = "log-after-tsc", value_parser = parse_u64)]
-    pub log_after_tsc: Option<u64>,
+    /// Capture `Exit` records into the event stream. One of:
+    ///   all              — every exit
+    ///   at-shutdown      — one record at guest shutdown (hashes full memory)
+    ///   at-tsc:<N>       — one record when emulated TSC reaches <N>
+    ///   checkpoints:<N>  — one record every <N> emulated-TSC ticks
+    /// Implies the `exit` event category; requires `--events-jsonl` to drain.
+    #[arg(long = "exit-capture", value_parser = parse_exit_capture, verbatim_doc_comment)]
+    pub exit_capture: Option<ExitCaptureArg>,
 
-    /// Log once at VM shutdown and hash full memory
-    #[arg(long = "log-at-shutdown")]
-    pub log_at_shutdown: bool,
-
-    /// Log once when TSC reaches value and hash full memory
-    #[arg(long = "log-at-tsc", value_parser = parse_u64)]
-    pub log_at_tsc: Option<u64>,
+    /// Capture `Exit` records only after emulated TSC reaches this threshold
+    #[arg(long = "capture-exits-after-tsc", value_parser = parse_u64)]
+    pub capture_exits_after_tsc: Option<u64>,
 
     /// Stop VM when emulated TSC reaches this value
     #[arg(long = "stop-at-tsc", value_parser = parse_u64, conflicts_with = "stop_at_vt")]
@@ -76,11 +77,7 @@ pub struct Args {
     #[arg(long = "stop-at-vt", conflicts_with = "stop_at_tsc")]
     pub stop_at_vt: Option<f64>,
 
-    /// Log checkpoints at TSC intervals (e.g., 1000000000 for every 1B ticks)
-    #[arg(long = "log-checkpoints", value_parser = parse_u64)]
-    pub log_checkpoints: Option<u64>,
-
-    /// Skip memory hashing in log entries (memory_hash will be 0)
+    /// Skip memory hashing in exit records (memory_hash will be 0)
     #[arg(long = "no-memory-hash")]
     pub no_memory_hash: bool,
 
@@ -96,21 +93,17 @@ pub struct Args {
     #[arg(long = "wait")]
     pub wait: bool,
 
-    /// Dump feedback buffer to file on stop-at-tsc
-    #[arg(long = "dump-feedback")]
-    pub dump_feedback: Option<String>,
-
     /// Wall-clock timeout in seconds (VM run ends after this duration)
-    #[arg(long = "timeout", value_parser = parse_f64)]
-    pub timeout: Option<f64>,
+    #[arg(long = "wall-clock-timeout", value_parser = parse_f64)]
+    pub wall_clock_timeout: Option<f64>,
 
     /// Write exit statistics to a JSON file
     #[arg(long = "exit-stats-json")]
     pub exit_stats_json: Option<String>,
 
     /// Emulated TSC frequency in Hz (defaults to the kernel's built-in default)
-    #[arg(long = "tsc-frequency", value_parser = parse_u64)]
-    pub tsc_frequency: Option<u64>,
+    #[arg(long = "virt-tsc-frequency", value_parser = parse_u64)]
+    pub virt_tsc_frequency: Option<u64>,
 
     /// Queue a deterministic I/O channel action for the guest's bedrock-io
     /// module. Repeatable; actions fire in `target_tsc` order at the first
@@ -124,17 +117,17 @@ pub struct Args {
     ///                             (converted via DEFAULT_TSC_FREQUENCY).
     /// Without a prefix, `target_tsc` defaults to 0 (queue immediately).
     ///
-    /// Action body formats:
-    ///   `list`                      — run `podman ps --format '{{.Names}}'`
+    /// Action body formats (optional `rec:` prefix records the command's
+    /// output into the output feedback buffer, which the CLI then prints):
     ///   `exec:<container>:<cmd>`    — run `podman exec <container> /bin/sh -c <cmd>`
     ///   `exec:host:<cmd>`           — run `/bin/sh -c <cmd>` on the guest itself
     ///                                 (outside any container)
     ///
     /// Examples:
-    ///   --io-action 'list'
-    ///   --io-action 'tsc=300000000:list'
-    ///   --io-action 'vt=120.0:exec:bitcoind1:bitcoin-cli getblockchaininfo'
     ///   --io-action 'exec:host:uname -a'
+    ///   --io-action 'rec:exec:host:uname -a'
+    ///   --io-action 'tsc=300000000:rec:exec:host:date'
+    ///   --io-action 'vt=120.0:exec:bitcoind1:bitcoin-cli getblockchaininfo'
     #[arg(long = "io-action", value_parser = parse_scheduled_io_action, verbatim_doc_comment)]
     pub io_actions: Vec<ScheduledIoAction>,
 }
@@ -152,40 +145,78 @@ pub struct ScheduledIoAction {
     pub action: IoAction,
 }
 
-/// Action body: which thing the guest module should do.
+/// A bash command to run on the I/O channel — the channel's one action.
 #[derive(Clone, Debug)]
-pub enum IoAction {
-    /// Enumerate running containers and the executables each one ships
-    /// under `/opt/bedrock/drivers/`. Response is line-based with one
-    /// record per line, each record having two tab-separated fields:
-    ///
-    /// - `<container>\t`           — header line, emitted once per
-    ///   container (driver field empty).
-    /// - `<container>\t<driver>`   — one such line per executable
-    ///   found in that container.
-    ///
-    /// Consumers can parse the response with a single `split('\t', 1)`
-    /// per line — no state machine. The fuzzer reads this list to
-    /// choose (container, driver) targets.
-    GetWorkloadDetails,
-    /// `podman exec <container> /bin/sh -c <cmd>` — returns stdout+stderr.
-    ExecBash { container: String, cmd: String },
-    /// `/bin/sh -c <cmd>` run directly on the guest, outside any container.
-    /// Returns stdout+stderr.
-    ExecHostBash { cmd: String },
+pub struct IoAction {
+    /// Container to run inside (`podman exec`), or `None` to run on the host.
+    pub container: Option<String>,
+    /// The bash command line.
+    pub command: String,
+    /// Whether to additionally capture the command's combined stdout+stderr
+    /// into the output feedback buffer (printed by the CLI when the response
+    /// arrives). The output streams to the guest journal either way.
+    pub record_output: bool,
 }
 
 impl Args {
-    /// Returns true if logging should be enabled (explicit flag or implied by other options).
-    pub fn should_enable_log(&self) -> bool {
-        self.enable_log
-            || self.log_jsonl.is_some()
-            || self.single_step.is_some()
-            || self.log_after_tsc.is_some()
-            || self.log_at_shutdown
-            || self.log_at_tsc.is_some()
-            || self.log_checkpoints.is_some()
+    /// Returns true if `Exit` records should be captured (single-stepping or an
+    /// explicit `--exit-capture` mode).
+    pub fn should_capture_exits(&self) -> bool {
+        self.single_step.is_some() || self.exit_capture.is_some()
     }
+
+    /// The `Exit`-record trigger policy and its mode-specific TSC, derived from
+    /// `--single-step` / `--exit-capture`. Single-stepping takes precedence and
+    /// uses the `TscRange` trigger.
+    pub fn exit_trigger(&self) -> (ExitTrigger, u64) {
+        if self.single_step.is_some() {
+            (ExitTrigger::TscRange, 0)
+        } else if let Some(ec) = &self.exit_capture {
+            (ec.trigger, ec.target_tsc)
+        } else {
+            (ExitTrigger::Disabled, 0)
+        }
+    }
+}
+
+/// Parsed `--exit-capture` argument: an [`ExitTrigger`] plus its mode-specific
+/// TSC value (`AtTsc` threshold / `Checkpoints` interval; 0 otherwise).
+#[derive(Clone, Debug)]
+pub struct ExitCaptureArg {
+    /// The trigger policy.
+    pub trigger: ExitTrigger,
+    /// Mode-specific TSC value.
+    pub target_tsc: u64,
+}
+
+/// Parse `--exit-capture`: `all`, `at-shutdown`, `at-tsc:<N>`, `checkpoints:<N>`.
+fn parse_exit_capture(s: &str) -> Result<ExitCaptureArg, String> {
+    let s = s.trim();
+    let arg = match s {
+        "all" => ExitCaptureArg {
+            trigger: ExitTrigger::AllExits,
+            target_tsc: 0,
+        },
+        "at-shutdown" => ExitCaptureArg {
+            trigger: ExitTrigger::AtShutdown,
+            target_tsc: 0,
+        },
+        _ if s.starts_with("at-tsc:") => ExitCaptureArg {
+            trigger: ExitTrigger::AtTsc,
+            target_tsc: parse_u64(&s["at-tsc:".len()..])?,
+        },
+        _ if s.starts_with("checkpoints:") => ExitCaptureArg {
+            trigger: ExitTrigger::Checkpoints,
+            target_tsc: parse_u64(&s["checkpoints:".len()..])?,
+        },
+        _ => {
+            return Err(format!(
+                "invalid --exit-capture '{}'. Expected: all | at-shutdown | at-tsc:<N> | checkpoints:<N>",
+                s
+            ))
+        }
+    };
+    Ok(arg)
 }
 
 /// RDRAND emulation mode.
@@ -235,14 +266,6 @@ fn parse_f64(s: &str) -> Result<f64, String> {
         .map_err(|_| format!("Invalid number: {}", s))
 }
 
-/// Parse serial input, processing escape sequences.
-fn parse_serial_input(s: &str) -> Result<String, String> {
-    Ok(s.replace("\\n", "\n")
-        .replace("\\r", "\r")
-        .replace("\\t", "\t")
-        .replace("\\\\", "\\"))
-}
-
 /// Parse a `--io-action` spec into a `ScheduledIoAction`.
 ///
 /// Accepts an optional `tsc=<N>:` or `vt=<seconds>:` scheduling prefix
@@ -272,8 +295,8 @@ fn parse_scheduled_io_action(s: &str) -> Result<ScheduledIoAction, String> {
             return Err(format!("Negative virtual time in '{}'", s));
         }
         // Conversion uses DEFAULT_TSC_FREQUENCY because the parser runs
-        // before `--tsc-frequency` is applied to the VM. Users who pass
-        // `--tsc-frequency` and want precise alignment should specify
+        // before `--virt-tsc-frequency` is applied to the VM. Users who pass
+        // `--virt-tsc-frequency` and want precise alignment should specify
         // `tsc=...` directly.
         let tsc = (secs * DEFAULT_TSC_FREQUENCY as f64) as u64;
         (tsc, body)
@@ -287,44 +310,46 @@ fn parse_scheduled_io_action(s: &str) -> Result<ScheduledIoAction, String> {
 /// Parse the body portion of an `--io-action` spec, after any scheduling
 /// prefix has been stripped.
 ///
-/// Accepts:
-///   `list`                       → IoAction::GetWorkloadDetails
-///   `exec:host:<cmd>`            → IoAction::ExecHostBash { cmd }
-///   `exec:<container>:<cmd>`     → IoAction::ExecBash { container, cmd }
+/// Accepts an optional `rec:` prefix (record the command's output into the
+/// output feedback buffer) then one exec form:
+///   `exec:host:<cmd>`            → run on the host
+///   `exec:<container>:<cmd>`     → run inside the container
 ///
 /// The split on the first `:` after `exec:` leaves the `<cmd>` part free
 /// to contain colons of its own (`exec:bitcoind1:bitcoin-cli getinfo`).
 /// `host` in the container slot is reserved for the guest-direct form, so
 /// a container literally named `host` cannot be targeted via `exec:`.
 fn parse_io_action_body(s: &str) -> Result<IoAction, String> {
-    if s == "list" {
-        return Ok(IoAction::GetWorkloadDetails);
+    let (record_output, body) = match s.strip_prefix("rec:") {
+        Some(rest) => (true, rest),
+        None => (false, s),
+    };
+    let rest = body.strip_prefix("exec:").ok_or_else(|| {
+        format!(
+            "Invalid I/O action '{}'. Expected [rec:]exec:host:<cmd> or [rec:]exec:<container>:<cmd>",
+            s
+        )
+    })?;
+    let (target, cmd) = rest.split_once(':').ok_or_else(|| {
+        format!(
+            "Invalid exec action '{}'. Expected exec:<host|container>:<cmd>",
+            s
+        )
+    })?;
+    if cmd.is_empty() {
+        return Err(format!("Empty command in '{}'", s));
     }
-    if let Some(rest) = s.strip_prefix("exec:") {
-        let (container, cmd) = rest.split_once(':').ok_or_else(|| {
-            format!(
-                "Invalid exec action '{}'. Expected exec:<container>:<cmd>",
-                s
-            )
-        })?;
-        if container.is_empty() {
+    let container = if target == "host" {
+        None
+    } else {
+        if target.is_empty() {
             return Err(format!("Empty container name in '{}'", s));
         }
-        if cmd.is_empty() {
-            return Err(format!("Empty command in '{}'", s));
-        }
-        if container == "host" {
-            return Ok(IoAction::ExecHostBash {
-                cmd: cmd.to_string(),
-            });
-        }
-        return Ok(IoAction::ExecBash {
-            container: container.to_string(),
-            cmd: cmd.to_string(),
-        });
-    }
-    Err(format!(
-        "Invalid I/O action '{}'. Expected `list`, `exec:host:<cmd>`, or `exec:<container>:<cmd>`",
-        s
-    ))
+        Some(target.to_string())
+    };
+    Ok(IoAction {
+        container,
+        command: cmd.to_string(),
+        record_output,
+    })
 }

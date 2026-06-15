@@ -181,6 +181,40 @@ fn box_io_page_buf() -> IoPageBufBox {
     }
 }
 
+/// Heap-allocated early-boot serial line accumulator. Boxed for the same
+/// reason as [`IoPageBufBox`]: `VmState` is built by value on the stack before
+/// being moved into its `VmStateBox`, so keeping this buffer inline would add
+/// its size (times the construction's temporary copies) to the kernel's 8KB
+/// stack budget during `VmState::new`/`new_for_fork`. See `SERIAL_LINE_ACC_SIZE`.
+pub type SerialLineBufBox = VmallocBox<[u8; SERIAL_LINE_ACC_SIZE]>;
+
+/// Allocate a zeroed serial line accumulator directly on the heap.
+#[cfg(feature = "cargo")]
+fn box_serial_line_buf() -> SerialLineBufBox {
+    extern crate alloc;
+    let v = alloc::vec![0u8; SERIAL_LINE_ACC_SIZE];
+    let boxed_slice = v.into_boxed_slice();
+    let ptr = alloc::boxed::Box::into_raw(boxed_slice) as *mut [u8; SERIAL_LINE_ACC_SIZE];
+    // SAFETY: `boxed_slice` has exactly `SERIAL_LINE_ACC_SIZE` elements, so its
+    // pointer can be reinterpreted as a pointer to a fixed-size array of the
+    // same length.
+    unsafe { alloc::boxed::Box::from_raw(ptr) }
+}
+
+#[cfg(not(feature = "cargo"))]
+fn box_serial_line_buf() -> SerialLineBufBox {
+    let mut boxed: kernel::alloc::KVBox<core::mem::MaybeUninit<[u8; SERIAL_LINE_ACC_SIZE]>> =
+        kernel::alloc::KVBox::new_uninit(kernel::alloc::flags::GFP_KERNEL)
+            .expect("Failed to allocate serial line accumulator");
+    // SAFETY: freshly allocated; we zero-fill the entire region before calling
+    // `assume_init`, so every byte is initialized to a valid `u8` (0).
+    unsafe {
+        let ptr = boxed.as_mut_ptr().cast::<u8>();
+        core::ptr::write_bytes(ptr, 0, SERIAL_LINE_ACC_SIZE);
+        boxed.assume_init()
+    }
+}
+
 /// Maximum number of I/O channel requests that can sit in the
 /// hypervisor-side pending queue waiting for the in-flight slot to free
 /// up. Higher than the depth users typically want today (a few bash
@@ -202,6 +236,70 @@ pub struct PendingIoAction {
     /// Serialised request bytes, exactly as the guest module will see
     /// them on its shared page.
     pub data: HeapVec<u8>,
+}
+
+/// Size of the paravirtual-console shared page (one 4KB page). A single
+/// `HYPERCALL_SERIAL_WRITE` emits at most this many bytes; longer printk
+/// records are split into multiple writes by the guest console driver.
+///
+/// Equal to `PAGE_SIZE` and to the capacity of `IoPageBufBox`, which the
+/// overflow buffer reuses — so a clamped write always fits in the pending
+/// buffer.
+pub const SERIAL_CONSOLE_PAGE_SIZE: usize = PAGE_SIZE;
+
+/// State for the deterministic paravirtual batch console.
+///
+/// The guest's `bedrock-console.ko` registers a 4KB shared page via
+/// `HYPERCALL_SERIAL_REGISTER_PAGE`, then — from its `struct console` `.write`
+/// callback — copies each fully-formatted printk record into that page and
+/// issues `HYPERCALL_SERIAL_WRITE` with the byte count. The host copies those
+/// bytes into `pending_buf` and emits them as one `Serial` event
+/// (`event_emit_console`), turning one VM exit per console byte into one VM
+/// exit per console line.
+///
+/// Like `IoChannelState`, this is excluded from the determinism state hash:
+/// `page_gpa` is host bookkeeping and the pending bytes are host-side output
+/// staging — none of it is guest-visible.
+pub struct SerialConsoleState {
+    /// Guest physical address of the registered console page. Zero means
+    /// "not registered yet"; `HYPERCALL_SERIAL_WRITE` fails until set.
+    pub page_gpa: u64,
+    /// Staging buffer the host copies a `HYPERCALL_SERIAL_WRITE` record into
+    /// before emitting it as a `Serial` event. Reuses `IoPageBufBox` purely as
+    /// a page-sized heap buffer (kept off the 8KB kernel stack).
+    pub pending_buf: IoPageBufBox,
+}
+
+impl Default for SerialConsoleState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SerialConsoleState {
+    /// Create fresh console state with no registration and an empty pending
+    /// buffer.
+    pub fn new() -> Self {
+        Self {
+            page_gpa: 0,
+            pending_buf: box_io_page_buf(),
+        }
+    }
+
+    /// Clone state for a forked child VM.
+    ///
+    /// The page registration is inherited — the child snapshots from a parent
+    /// where `bedrock-console.ko` has already registered its page, which lives
+    /// in shared (CoW) guest memory reachable via the same GPA. Any pending
+    /// overflow bytes are dropped: a fork point is a quiescent moment with no
+    /// half-emitted console line in flight, and the parent's pending bytes (if
+    /// any) belong to the parent's output stream.
+    pub fn clone_for_fork(parent: &Self) -> Self {
+        Self {
+            page_gpa: parent.page_gpa,
+            pending_buf: box_io_page_buf(),
+        }
+    }
 }
 
 /// State for the deterministic hypervisor↔guest I/O channel.
@@ -478,7 +576,7 @@ pub const DEFAULT_TSC_FREQUENCY: u64 = 2_995_200_000;
 
 /// Logging mode for deterministic exit capture.
 ///
-/// Controls when and how exit logging occurs:
+/// Controls when and how exits are captured:
 /// - `Disabled`: No logging (default)
 /// - `AllExits`: Log every deterministic exit (for debugging, higher overhead)
 /// - `AtTsc`: Log once when TSC >= target, hash full memory (for binary search)
@@ -487,7 +585,7 @@ pub const DEFAULT_TSC_FREQUENCY: u64 = 2_995_200_000;
 /// - `TscRange`: Log only exits within a TSC range (used with single-stepping)
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum LogMode {
+pub enum ExitTrigger {
     /// No logging.
     #[default]
     Disabled = 0,
@@ -500,7 +598,7 @@ pub enum LogMode {
     /// Used for comparing final state across runs.
     AtShutdown = 3,
     /// Log checkpoints at configurable TSC intervals.
-    /// Uses log_target_tsc as the checkpoint interval.
+    /// Uses exit_target_tsc as the checkpoint interval.
     /// Each checkpoint includes registers and device state hashes.
     /// Memory hash is set to 0 to skip expensive full-memory hashing.
     Checkpoints = 4,
@@ -514,6 +612,17 @@ pub enum LogMode {
 /// This is not a hardware VMX exit reason - it identifies log entries
 /// that are periodic state snapshots rather than actual VM exits.
 pub const EXIT_REASON_CHECKPOINT: u32 = 0xFFFFFFFF;
+
+/// Where a just-emitted `Exit` record's payload lives, so its deferred
+/// `memory_hash` field can be patched after the guest's memory stabilizes.
+#[derive(Clone, Copy)]
+pub enum ExitLoc {
+    /// Byte offset of the payload within the event buffer.
+    Buffer(usize),
+    /// The record was staged pending (buffer was full at emit); its payload is
+    /// at offset 0 of `event_pending_buf`.
+    Pending,
+}
 
 /// Per-exit-type performance statistics.
 ///
@@ -793,24 +902,14 @@ impl SyscallMsrs {
     }
 }
 
-/// Maximum size of the serial output buffer.
+/// Size of the early-boot serial line accumulator (the `OUT 0x3F8` byte path).
 ///
-/// This must equal PAGE_SIZE (4096) since the buffer is backed by a single
-/// kernel-allocated page. Do not change this value.
-pub const SERIAL_BUFFER_SIZE: usize = PAGE_SIZE;
-
-/// Magic value to identify line TSC metadata format.
-pub const SERIAL_METADATA_MAGIC: u16 = 0xCAFE;
-
-/// Maximum number of line TSC entries.
-/// The TSC page layout is:
-/// - Bytes 0-3: header (u16 line_count, u16 magic)
-/// - Bytes 4-4095: line entries (10 bytes each)
-///   Available: (4096 - 4) / 10 = 409 entries
-pub const SERIAL_MAX_LINE_ENTRIES: usize = 409;
-
-/// Offset where line TSC entries start in the TSC page (after header).
-pub const SERIAL_LINE_TSC_OFFSET: usize = 4;
+/// Before the paravirtual console module loads, `earlyprintk=serial` writes one
+/// byte per `OUT 0x3F8`. To avoid a 32-byte event header per character, those
+/// bytes are accumulated into this fixed buffer and emitted as one `Serial`
+/// event per line (on `\n` or when the buffer fills). Boxed with the rest of
+/// `VmState` — never on the 8 KB kernel stack.
+pub const SERIAL_LINE_ACC_SIZE: usize = 256;
 
 /// VM state that can be shared between RootVm and ForkedVm.
 ///
@@ -846,19 +945,20 @@ pub struct VmState<V: VirtualMachineControlStructure, I: InstructionCounter> {
     /// SMAP-faults on the user VA. Loaded only when the entry-load count is
     /// nonzero (set by `pebs_pre_vm_entry`, cleared by `pebs_post_vm_exit`).
     pub pebs_entry_msr_load_page: V::P,
-    /// Serial output buffer page (4KB) for guest console output.
-    pub serial_buffer_page: V::P,
-    /// Serial line TSC metadata page (4KB) for per-line timestamps.
-    pub serial_tsc_page: V::P,
-    /// Current write position in serial buffer.
-    pub serial_len: usize,
-    /// Number of line TSC entries recorded.
-    pub serial_line_count: usize,
-    /// Whether the next character written starts a new line.
-    pub serial_at_line_start: bool,
-    /// Byte that could not be written because the serial buffer was full.
-    /// Written to the buffer after the next `serial_clear()`.
-    pub serial_pending_byte: Option<u8>,
+    /// Early-boot serial line accumulator (the `OUT 0x3F8` byte path). Bytes are
+    /// appended here and emitted as one `Serial` event per line, so early boot
+    /// produces line-granular records like the paravirtual console — only the
+    /// underlying exit cost differs (one VMX exit per byte vs. one VMCALL per
+    /// line). See `SERIAL_LINE_ACC_SIZE`.
+    pub serial_line_buf: SerialLineBufBox,
+    /// Number of valid bytes in `serial_line_buf`.
+    pub serial_line_len: usize,
+    /// Emulated TSC captured at the first byte of the in-progress line. The
+    /// emitted `Serial` event is stamped with this (not the flushing newline),
+    /// matching the legacy per-line-start TSC semantics and the paravirt path.
+    pub serial_line_tsc: u64,
+    /// Host (raw RDTSC) captured at the first byte of the in-progress line.
+    pub serial_line_real_tsc: u64,
     /// Guest XSAVE area page (4KB) for extended state (FPU/SSE/AVX) save/restore.
     pub guest_xsave_page: V::P,
     /// Host XSAVE area page (4KB) for extended state save/restore during VM transitions.
@@ -892,27 +992,58 @@ pub struct VmState<V: VirtualMachineControlStructure, I: InstructionCounter> {
     /// Configured TSC frequency in Hz.
     pub tsc_frequency: u64,
     /// Logging mode for deterministic exit capture.
-    pub log_mode: LogMode,
+    pub exit_trigger: ExitTrigger,
     /// Target TSC value for AtTsc mode, or interval for Checkpoints mode.
     /// In AtTsc mode: log when emulated_tsc >= this value, then stop.
     /// In Checkpoints mode: interval between checkpoints.
-    pub log_target_tsc: u64,
+    pub exit_target_tsc: u64,
     /// Universal logging start threshold (applies to all modes).
     /// No logging occurs until emulated_tsc >= this value.
     /// 0 means logging starts immediately (no threshold).
-    pub log_start_tsc: u64,
+    pub exit_start_tsc: u64,
     /// Whether logging has been captured (for AtTsc/AtShutdown modes).
     /// Prevents logging more than once in single-point modes.
-    pub log_captured: bool,
-    /// Number of log entries written to the buffer.
-    pub log_entry_count: usize,
-    /// Pointer to the log buffer (set by kernel module after allocation).
-    /// Buffer is 1MB = 256 pages, allocated by kernel, mmap'd to userspace.
-    pub log_buffer_ptr: Option<*mut u8>,
-    /// Index of log entry that needs memory hash finalization (None if no pending).
-    /// Set by log_exit(), consumed by finalize_log_entry().
-    pub pending_log_idx: Option<usize>,
-    /// When true, skip memory hashing in log entries (memory_hash stays 0).
+    pub exit_captured: bool,
+
+    // --- Unified event stream (see `crate::events`). ---
+    // `Exit` records (the `ExitRecord` body) are emitted into the event buffer
+    // below, gated by `ExitTrigger` (above) as the trigger policy.
+    /// Pointer to the event buffer (set by the kernel module after allocation).
+    /// 1 MB, vmalloc'd by the kernel and mmap'd to userspace, drained linearly
+    /// like the log/serial buffers. `None` until attached (and in cargo tests
+    /// until `set_event_buffer` is called).
+    pub event_buffer_ptr: Option<*mut u8>,
+    /// Write cursor into the event buffer (the next free byte). Always a
+    /// multiple of 8, so every `EventHeader` is naturally aligned.
+    pub event_len: usize,
+    /// Monotonic record sequence number. Never reset on drain, so userspace can
+    /// detect gaps and order records globally across drains.
+    pub event_seq: u64,
+    /// Userspace include/exclude mask (set via ioctl). Filtering happens at emit
+    /// time, so a disabled category costs a single bit test. Empty by default —
+    /// the event stream is fully opt-in and adds zero overhead until enabled.
+    pub event_categories: EventCategories,
+    /// A single event staged because it did not fit in the remaining buffer.
+    /// The caller exits to userspace to drain, and `event_clear()` re-appends
+    /// this into the emptied buffer. `None` when no event is pending.
+    pub event_pending: Option<EventKind>,
+    /// Payload bytes of the pending event (page-sized heap buffer; reused as
+    /// staging, kept off the 8 KB kernel stack).
+    pub event_pending_buf: IoPageBufBox,
+    /// Number of valid bytes in `event_pending_buf`.
+    pub event_pending_len: usize,
+    /// Header flags the pending event was emitted with (so the deterministic bit
+    /// of a staged `Exit` survives the re-append in `event_clear`).
+    pub event_pending_flags: u16,
+    /// Emulated TSC the pending event was originally stamped with.
+    pub event_pending_tsc: u64,
+    /// Host (raw RDTSC) the pending event was originally stamped with.
+    pub event_pending_real_tsc: u64,
+    /// Where the most-recently-emitted `Exit` record's deferred `memory_hash`
+    /// field lives, so `finalize_exit_memory_hash` can patch it after the guest
+    /// memory stabilizes. `None` when no Exit record awaits finalization.
+    pub pending_exit_loc: Option<ExitLoc>,
+    /// When true, skip memory hashing in exit records (memory_hash stays 0).
     pub skip_memory_hash: bool,
     /// TSC range for single-stepping (start, end). None means disabled.
     pub single_step_tsc_range: Option<(u64, u64)>,
@@ -933,7 +1064,7 @@ pub struct VmState<V: VirtualMachineControlStructure, I: InstructionCounter> {
     /// Skid of the most recent PEBS-induced EPT-violation exit, in TSC ticks
     /// (= retired guest instructions). Computed as
     /// `current_tsc - armed_target_tsc` at handle_pebs_precise_exit time
-    /// and consumed by `write_log_entry`. A non-zero value indicates the
+    /// and consumed by `write_exit_record`. A non-zero value indicates the
     /// PEBS exit landed past the programmed PEBS firing point. With PDist this
     /// should usually be 0. Stale value outside the EPT_VIOLATION_PEBS log
     /// entry that captured it — the log writer resets it to 0 after recording.
@@ -989,6 +1120,13 @@ pub struct VmState<V: VirtualMachineControlStructure, I: InstructionCounter> {
     /// the heap so this field stays small (a handful of words plus two box
     /// pointers).
     pub io_channel: IoChannelState,
+    /// State for the deterministic paravirtual batch console.
+    ///
+    /// The guest's `bedrock-console.ko` registers a shared 4KB page via
+    /// `HYPERCALL_SERIAL_REGISTER_PAGE` and ships whole printk records through
+    /// `HYPERCALL_SERIAL_WRITE`, which the host drains into the same serial
+    /// sink the emulated 8250 uses. See `SerialConsoleState`.
+    pub serial_console: SerialConsoleState,
     /// Logical CPU this VM most recently ran on, or `None` before the first
     /// run-loop entry. Used to detect cross-CPU migration between ioctls.
     ///
@@ -1014,10 +1152,6 @@ pub enum VmStateError<E> {
     PebsExitMsrLoadAlloc,
     /// XSAVE area page allocation failed.
     XsavePageAlloc,
-    /// Serial buffer page allocation failed.
-    SerialBufferAlloc,
-    /// Serial TSC page allocation failed.
-    SerialTscPageAlloc,
     /// VMCS setup failed.
     VmcsSetup(VmcsSetupError),
     /// Guest state copy failed.
@@ -1126,18 +1260,6 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
         msr_bitmap_clear_intercept(ptr, msr::IA32_SYSENTER_ESP);
         msr_bitmap_clear_intercept(ptr, msr::IA32_SYSENTER_EIP);
 
-        // Allocate serial buffer page (4KB, zeroed)
-        let serial_buffer_page = machine
-            .kernel()
-            .alloc_zeroed_page()
-            .ok_or(VmStateError::SerialBufferAlloc)?;
-
-        // Allocate serial TSC metadata page (4KB, zeroed)
-        let serial_tsc_page = machine
-            .kernel()
-            .alloc_zeroed_page()
-            .ok_or(VmStateError::SerialTscPageAlloc)?;
-
         // Allocate XSAVE area pages (4KB each, zeroed)
         let guest_xsave_page = machine
             .kernel()
@@ -1214,12 +1336,10 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             msr_bitmap,
             pebs_exit_msr_load_page,
             pebs_entry_msr_load_page,
-            serial_buffer_page,
-            serial_tsc_page,
-            serial_len: 0,
-            serial_line_count: 0,
-            serial_at_line_start: true, // First char starts a line
-            serial_pending_byte: None,
+            serial_line_buf: box_serial_line_buf(),
+            serial_line_len: 0,
+            serial_line_tsc: 0,
+            serial_line_real_tsc: 0,
             guest_xsave_page,
             host_xsave_page,
             // Enable XSAVE for SSE+AVX by default
@@ -1235,13 +1355,21 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             emulated_tsc: 0,
             tsc_offset: 0,
             tsc_frequency,
-            log_mode: LogMode::Disabled,
-            log_target_tsc: 0,
-            log_start_tsc: 0,
-            log_captured: false,
-            log_entry_count: 0,
-            log_buffer_ptr: None,
-            pending_log_idx: None,
+            exit_trigger: ExitTrigger::Disabled,
+            exit_target_tsc: 0,
+            exit_start_tsc: 0,
+            exit_captured: false,
+            event_buffer_ptr: None,
+            event_len: 0,
+            event_seq: 0,
+            event_categories: EventCategories::empty(),
+            event_pending: None,
+            event_pending_buf: box_io_page_buf(),
+            event_pending_len: 0,
+            event_pending_flags: 0,
+            event_pending_tsc: 0,
+            event_pending_real_tsc: 0,
+            pending_exit_loc: None,
             skip_memory_hash: false,
             single_step_tsc_range: None,
             mtf_enabled: false,
@@ -1260,126 +1388,478 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             pebs_state: None,
             pebs_supported,
             io_channel: IoChannelState::new(),
+            serial_console: SerialConsoleState::new(),
             last_cpu: None,
         })
     }
 
-    /// Write a byte to the serial output buffer.
+    // ========================================================================
+    // Unified event stream (see `crate::events`).
+    // ========================================================================
+
+    /// Attach the kernel-allocated event buffer (1 MB, mmap'd to userspace).
+    pub fn set_event_buffer(&mut self, ptr: *mut u8) {
+        self.event_buffer_ptr = Some(ptr);
+    }
+
+    /// Detach the event buffer and reset the cursor (e.g. on disable).
+    pub fn clear_event_buffer_ptr(&mut self) {
+        self.event_buffer_ptr = None;
+        self.event_len = 0;
+        self.event_pending = None;
+        self.event_pending_len = 0;
+    }
+
+    /// Number of valid bytes in the event buffer (`[0..event_len]`), which
+    /// userspace drains after a RUN exit.
+    pub fn event_buffer_len(&self) -> usize {
+        self.event_len
+    }
+
+    /// True if an event was staged because the buffer filled. The exit
+    /// dispatcher checks this after handling an exit and forces a drain
+    /// round-trip to userspace.
+    pub fn event_buffer_full(&self) -> bool {
+        self.event_pending.is_some()
+    }
+
+    /// Returns the event buffer virtual address for mmap.
+    pub fn event_buffer_ptr(&self) -> Option<*mut u8> {
+        self.event_buffer_ptr
+    }
+
+    /// Set the userspace category include/exclude mask (from ioctl).
+    pub fn set_event_categories(&mut self, categories: EventCategories) {
+        self.event_categories = categories;
+    }
+
+    /// Current category mask.
+    pub fn event_categories(&self) -> EventCategories {
+        self.event_categories
+    }
+
+    /// True if `kind`'s category is enabled.
+    pub fn event_category_enabled(&self, kind: EventKind) -> bool {
+        self.event_categories.contains(kind.category())
+    }
+
+    /// Reset the event cursor after userspace drains the buffer, re-appending a
+    /// single event that was staged because it did not fit before the drain.
+    /// Called at the start of every RUN ioctl.
+    pub fn event_clear(&mut self) {
+        self.event_len = 0;
+        if let Some(kind) = self.event_pending.take() {
+            let len = self.event_pending_len;
+            let flags = self.event_pending_flags;
+            let tsc = self.event_pending_tsc;
+            let real_tsc = self.event_pending_real_tsc;
+            // `event_pending_buf` is a separate heap allocation, distinct from
+            // the event buffer, so reading it via a raw pointer across the
+            // `&mut self` call below does not alias the destination.
+            let src = self.event_pending_buf.as_ptr();
+            // SAFETY: `src` is valid for `len` bytes (set when the event was
+            // staged); the now-empty buffer has room for it.
+            unsafe {
+                self.event_write(kind, flags, tsc, real_tsc, src, len, core::ptr::null(), 0);
+            }
+            // If this was the deferred `Exit` record, point finalize at its new
+            // home so a still-pending memory_hash patch lands in the buffer.
+            if kind == EventKind::Exit && matches!(self.pending_exit_loc, Some(ExitLoc::Pending)) {
+                self.pending_exit_loc = Some(ExitLoc::Buffer(self.event_len_at_last_record()));
+            }
+            self.event_pending_len = 0;
+        }
+    }
+
+    /// Byte offset of the payload of the most-recently-written record (used by
+    /// `event_clear` to relocate a finalize target after re-appending it).
+    fn event_len_at_last_record(&self) -> usize {
+        // The last record's header sits at `event_len - (its total size)`; its
+        // payload begins `EVENT_HEADER_SIZE` after that. Recompute from the
+        // pending length (padded) since `event_write` just advanced the cursor.
+        let total = EVENT_HEADER_SIZE + align_up(self.event_pending_len, 8);
+        self.event_len - total + EVENT_HEADER_SIZE
+    }
+
+    /// Append one event stamped with the current emulated/host TSC.
     ///
-    /// Returns `true` if the byte was written, `false` if the buffer is full.
-    /// Also tracks TSC at line starts for accurate per-line timestamping.
-    pub fn serial_write(&mut self, byte: u8) -> bool {
-        if self.serial_len >= SERIAL_BUFFER_SIZE {
+    /// Returns `true` on success (or when filtered out — a disabled category is
+    /// a single bit test), `false` if the buffer was full (the payload was
+    /// staged as pending and the caller must advance RIP and exit to userspace
+    /// to drain; `event_clear()` re-appends it).
+    pub fn event_append(&mut self, kind: EventKind, payload: &[u8]) -> bool {
+        // Early-out before reading the host TSC when the category is disabled
+        // (the common case — the stream is opt-in). `event_write` re-checks.
+        if !self.event_categories.contains(kind.category()) {
+            return true;
+        }
+        let tsc = self.emulated_tsc;
+        let real_tsc = rdtsc();
+        // SAFETY: `payload` is a valid slice that never aliases the event buffer
+        // (callers pass stack temporaries, stack-built POD, or separate heap
+        // buffers).
+        unsafe {
+            self.event_write(
+                kind,
+                kind.default_flags(),
+                tsc,
+                real_tsc,
+                payload.as_ptr(),
+                payload.len(),
+                core::ptr::null(),
+                0,
+            )
+        }
+    }
+
+    /// Append one event stamped with an explicit TSC (e.g. a serial line's
+    /// start time rather than the flushing newline's time).
+    pub fn event_append_at(
+        &mut self,
+        kind: EventKind,
+        payload: &[u8],
+        tsc: u64,
+        real_tsc: u64,
+    ) -> bool {
+        // SAFETY: as in `event_append`. `event_write` applies the category filter.
+        unsafe {
+            self.event_write(
+                kind,
+                kind.default_flags(),
+                tsc,
+                real_tsc,
+                payload.as_ptr(),
+                payload.len(),
+                core::ptr::null(),
+                0,
+            )
+        }
+    }
+
+    /// Low-level record writer. Writes an [`EventHeader`] followed by the payload
+    /// — `head_len` bytes from `head_ptr` then `tail_len` bytes from `tail_ptr`,
+    /// written contiguously — padded up to an 8-byte boundary.
+    ///
+    /// # Safety
+    ///
+    /// `head_ptr`/`tail_ptr` must be valid for `head_len`/`tail_len` reads and
+    /// must point into memory distinct from the event buffer (they always do —
+    /// payloads are stack temporaries, stack-built POD, or separate heap
+    /// allocations, never the event buffer itself). `tail_ptr` may be null when
+    /// `tail_len == 0` (the single-part case).
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn event_write(
+        &mut self,
+        kind: EventKind,
+        flags: u16,
+        tsc: u64,
+        real_tsc: u64,
+        head_ptr: *const u8,
+        head_len: usize,
+        tail_ptr: *const u8,
+        tail_len: usize,
+    ) -> bool {
+        // Filtered: one bit test, no work.
+        if !self.event_categories.contains(kind.category()) {
+            return true;
+        }
+        let base = match self.event_buffer_ptr {
+            Some(p) => p,
+            None => return true, // no buffer attached: drop silently
+        };
+        // The payload is `head` (a fixed struct or line) optionally followed by a
+        // variable `tail` (e.g. an I/O-channel transaction's bytes). They are
+        // written contiguously; `tail_len == 0` is the common single-part case.
+        let len = head_len + tail_len;
+        let need = EVENT_HEADER_SIZE + align_up(len, 8);
+        if self.event_len + need > EVENT_BUFFER_SIZE {
+            // Stage the payload as the single pending event and signal the
+            // caller to drain. If one is already staged (the buffer filled
+            // earlier this exit), drop this record rather than clobber it — the
+            // staged one is re-appended after the drain; the dropped ones are
+            // the bounded loss at the exact fill boundary.
+            if self.event_pending.is_none() {
+                let cap = IO_CHANNEL_BUF_SIZE;
+                let head_copy = head_len.min(cap);
+                let tail_copy = tail_len.min(cap - head_copy);
+                let dst = self.event_pending_buf.as_mut_ptr().cast::<u8>();
+                // SAFETY: `head_ptr`/`tail_ptr` are valid for `head_copy`/
+                // `tail_copy` bytes; `dst` is a distinct page-sized heap buffer
+                // with room for `head_copy + tail_copy <= cap` bytes written
+                // contiguously. The tail copy is guarded because `tail_ptr` is
+                // null for single-part callers (`tail_len == 0`).
+                unsafe {
+                    core::ptr::copy_nonoverlapping(head_ptr, dst, head_copy);
+                    if tail_copy > 0 {
+                        core::ptr::copy_nonoverlapping(tail_ptr, dst.add(head_copy), tail_copy);
+                    }
+                }
+                self.event_pending = Some(kind);
+                self.event_pending_len = head_copy + tail_copy;
+                self.event_pending_flags = flags;
+                self.event_pending_tsc = tsc;
+                self.event_pending_real_tsc = real_tsc;
+            }
             return false;
         }
-
-        // If this is the start of a new line, record the TSC in the TSC page
-        if self.serial_at_line_start && self.serial_line_count < SERIAL_MAX_LINE_ENTRIES {
-            let tsc_ptr = self.serial_tsc_page.virtual_address().as_u64() as *mut u8;
-            // Write line entry: (offset: u16, tsc: u64) starting at SERIAL_LINE_TSC_OFFSET
-            let entry_offset = SERIAL_LINE_TSC_OFFSET + self.serial_line_count * 10;
-            // SAFETY: tsc_ptr points to valid 4KB page
-            unsafe {
-                // Write offset (2 bytes)
-                let offset_bytes = (self.serial_len as u16).to_le_bytes();
-                tsc_ptr.add(entry_offset).write(offset_bytes[0]);
-                tsc_ptr.add(entry_offset + 1).write(offset_bytes[1]);
-                // Write TSC (8 bytes)
-                let tsc_bytes = self.emulated_tsc.to_le_bytes();
+        let header = EventHeader {
+            seq: self.event_seq,
+            tsc,
+            real_tsc,
+            kind: kind.as_u16(),
+            flags,
+            len: len as u32,
+        };
+        let padded = align_up(len, 8);
+        // SAFETY: `event_len + need <= EVENT_BUFFER_SIZE` (checked above), so the
+        // header, the `len` payload bytes, and the `padded - len` pad bytes all
+        // fit in the buffer. `base` is page-aligned and `event_len` is a multiple
+        // of 8, so the record start is 8-aligned (as `EventHeader` needs). Both
+        // `head_ptr` (`head_len` bytes) and `tail_ptr` (`tail_len` bytes) are
+        // valid and distinct from the event buffer.
+        unsafe {
+            let rec = base.add(self.event_len);
+            core::ptr::write(rec.cast::<EventHeader>(), header);
+            core::ptr::copy_nonoverlapping(head_ptr, rec.add(EVENT_HEADER_SIZE), head_len);
+            // Guarded: `tail_ptr` is null for single-part callers (`tail_len == 0`).
+            if tail_len > 0 {
                 core::ptr::copy_nonoverlapping(
-                    tsc_bytes.as_ptr(),
-                    tsc_ptr.add(entry_offset + 2),
-                    8,
+                    tail_ptr,
+                    rec.add(EVENT_HEADER_SIZE + head_len),
+                    tail_len,
                 );
             }
-            self.serial_line_count += 1;
-            self.serial_at_line_start = false;
+            // Zero the 0..7 padding bytes so they never leak host memory / vary
+            // run-to-run (the determinism comparison depends on this).
+            core::ptr::write_bytes(rec.add(EVENT_HEADER_SIZE + len), 0, padded - len);
         }
-
-        // Write the actual byte to the serial buffer
-        let ptr = self.serial_buffer_page.virtual_address().as_u64() as *mut u8;
-        // SAFETY: ptr points to valid 4KB page, serial_len < SERIAL_BUFFER_SIZE
-        unsafe {
-            ptr.add(self.serial_len).write(byte);
-        }
-        self.serial_len += 1;
-
-        // Check if this byte ends a line
-        if byte == b'\n' {
-            self.serial_at_line_start = true;
-        }
-
+        self.event_seq = self.event_seq.wrapping_add(1);
+        self.event_len += need;
         true
     }
 
-    /// Get the serial output buffer contents.
-    pub fn serial_output(&self) -> &[u8] {
-        let ptr = self.serial_buffer_page.virtual_address().as_u64() as *const u8;
-        // SAFETY: ptr points to a valid 4KB page, and serial_len <= SERIAL_BUFFER_SIZE (4096)
-        unsafe { core::slice::from_raw_parts(ptr, self.serial_len) }
-    }
-
-    /// Clear the serial output buffer and reset line tracking.
-    /// If a pending byte was saved from a buffer-full condition, it is
-    /// written to the freshly cleared buffer.
-    pub fn serial_clear(&mut self) {
-        self.serial_len = 0;
-        self.serial_line_count = 0;
-        self.serial_at_line_start = true;
-        if let Some(byte) = self.serial_pending_byte.take() {
-            self.serial_write(byte);
+    /// Append one early-boot serial byte to the line accumulator and, on newline
+    /// or when the fixed buffer fills, emit one `Serial` event stamped with the
+    /// line-start TSC. No-op (and no accumulation) when the `Serial` category is
+    /// disabled, so the byte path costs a single bit test then.
+    ///
+    /// Returns `false` if emitting the line filled the event buffer (the line
+    /// was staged pending; the caller should advance RIP and exit to userspace).
+    pub fn event_serial_byte(&mut self, byte: u8) -> bool {
+        if !self.event_categories.contains(EventCategories::SERIAL) {
+            return true;
         }
+        if self.serial_line_len == 0 {
+            // Stamp at the first byte of a fresh line.
+            self.serial_line_tsc = self.emulated_tsc;
+            self.serial_line_real_tsc = rdtsc();
+        }
+        if self.serial_line_len < SERIAL_LINE_ACC_SIZE {
+            self.serial_line_buf[self.serial_line_len] = byte;
+            self.serial_line_len += 1;
+        }
+        if byte == b'\n' || self.serial_line_len == SERIAL_LINE_ACC_SIZE {
+            return self.event_flush_serial_line();
+        }
+        true
     }
 
-    /// Write the serial line TSC metadata header to the TSC page.
+    /// Emit the accumulated early-boot serial line (if any) as a `Serial` event,
+    /// resetting the accumulator. Used as the newline/full flush, as cheap
+    /// insurance before a `HYPERCALL_SERIAL_WRITE` line, and at shutdown so a
+    /// final non-newline-terminated partial line is not lost.
     ///
-    /// This should be called before returning serial data to userspace so that
-    /// the line count and magic value are available for parsing.
-    ///
-    /// TSC page layout:
-    /// - Bytes 0-1: line_count (u16)
-    /// - Bytes 2-3: magic (u16, 0xCAFE to identify format)
-    /// - Bytes 4+: line entries (10 bytes each: u16 offset + u64 tsc)
-    pub fn serial_finalize_metadata(&mut self) {
-        let ptr = self.serial_tsc_page.virtual_address().as_u64() as *mut u8;
-        // SAFETY: ptr points to valid 4KB page
+    /// Returns `false` if the event buffer filled (line staged pending).
+    pub fn event_flush_serial_line(&mut self) -> bool {
+        if self.serial_line_len == 0 {
+            return true;
+        }
+        let len = self.serial_line_len;
+        let tsc = self.serial_line_tsc;
+        let real_tsc = self.serial_line_real_tsc;
+        // Copy into a small stack temporary so the payload does not alias `self`
+        // (the accumulator is an inline field of `VmState`).
+        let mut tmp = [0u8; SERIAL_LINE_ACC_SIZE];
+        tmp[..len].copy_from_slice(&self.serial_line_buf[..len]);
+        self.serial_line_len = 0;
+        self.event_append_at(EventKind::Serial, &tmp[..len], tsc, real_tsc)
+    }
+
+    /// Emit the freshly-copied paravirtual-console record
+    /// (`serial_console.pending_buf[0..len]`) as one `Serial` event. Returns
+    /// `false` if the event buffer filled (the record was staged pending).
+    pub fn event_emit_console(&mut self, len: usize) -> bool {
+        if !self.event_categories.contains(EventCategories::SERIAL) {
+            return true;
+        }
+        let tsc = self.emulated_tsc;
+        let real_tsc = rdtsc();
+        // `pending_buf` is a separate heap allocation, distinct from the event
+        // buffer — holding its pointer across the `&mut self` call is sound.
+        let src = self.serial_console.pending_buf.as_ptr();
+        let len = len.min(SERIAL_CONSOLE_PAGE_SIZE);
+        // SAFETY: `src` is valid for `len` <= SERIAL_CONSOLE_PAGE_SIZE bytes and
+        // does not alias the event buffer.
         unsafe {
-            // Write line_count at offset 0
-            let count_bytes = (self.serial_line_count as u16).to_le_bytes();
-            ptr.write(count_bytes[0]);
-            ptr.add(1).write(count_bytes[1]);
-            // Write magic at offset 2
-            let magic_bytes = SERIAL_METADATA_MAGIC.to_le_bytes();
-            ptr.add(2).write(magic_bytes[0]);
-            ptr.add(3).write(magic_bytes[1]);
+            self.event_write(
+                EventKind::Serial,
+                EventKind::Serial.default_flags(),
+                tsc,
+                real_tsc,
+                src,
+                len,
+                core::ptr::null(),
+                0,
+            )
         }
     }
 
-    /// Returns the serial buffer virtual address for mmap.
-    pub fn serial_buffer_ptr(&self) -> *mut u8 {
-        self.serial_buffer_page.virtual_address().as_u64() as *mut u8
+    /// Emit one `IoChannel` event: the fixed [`IoChannelPayload`] metadata
+    /// followed by the transaction's actual bytes — the injected request command
+    /// (e.g. an encoded bash command) for a `Request`, or the guest's reply for a
+    /// `Response`. The bytes come straight from the channel buffers
+    /// (`io_channel.{request,response}_buf`).
+    ///
+    /// Request bytes are a deterministic input, so a `Request` record keeps the
+    /// deterministic flag; response bytes are host-derived (command output, a
+    /// `call_usermodehelper` errno, …), so a `Response` record clears it.
+    ///
+    /// Returns `false` if the event buffer filled (record staged pending).
+    pub fn event_emit_io_channel(&mut self, payload: &IoChannelPayload) -> bool {
+        if !self.event_categories.contains(EventCategories::IO_CHANNEL) {
+            return true;
+        }
+        let is_response = payload.phase == IoChannelPhase::Response as u8;
+        let (data_ptr, data_len) = if is_response {
+            (
+                self.io_channel.response_buf.as_ptr(),
+                self.io_channel.response_len,
+            )
+        } else {
+            (
+                self.io_channel.request_buf.as_ptr(),
+                self.io_channel.request_len,
+            )
+        };
+        let flags = if is_response {
+            0
+        } else {
+            EVENT_FLAG_DETERMINISTIC
+        };
+        let tsc = self.emulated_tsc;
+        let real_tsc = rdtsc();
+        let data_len = data_len.min(IO_CHANNEL_BUF_SIZE);
+        // SAFETY: `payload` is a caller-owned 24-byte struct; `data_ptr` points
+        // into a distinct page-sized heap buffer (`io_channel.{request,response}_buf`),
+        // valid for `data_len` bytes; neither aliases the event buffer.
+        unsafe {
+            self.event_write(
+                EventKind::IoChannel,
+                flags,
+                tsc,
+                real_tsc,
+                payload.as_bytes().as_ptr(),
+                core::mem::size_of::<IoChannelPayload>(),
+                data_ptr,
+                data_len,
+            )
+        }
     }
 
-    /// Returns the serial TSC page virtual address for mmap.
-    pub fn serial_tsc_ptr(&self) -> *mut u8 {
-        self.serial_tsc_page.virtual_address().as_u64() as *mut u8
+    /// Emit one `Exit` event carrying the full `ExitRecord` body, remembering
+    /// where its `memory_hash` field landed so `finalize_exit_memory_hash` can
+    /// patch it once guest memory has stabilized. The `deterministic` flag is
+    /// reflected in the record header (so the stream's own determinism filter
+    /// matches the per-exit determinism recorded in `ExitRecord.flags`).
+    ///
+    /// # Safety
+    ///
+    /// `payload_ptr` must point to a valid `ExitRecord` (`len` == `size_of::<ExitRecord>()`)
+    /// that does not alias the event buffer (callers pass a stack-built entry).
+    unsafe fn emit_exit_event(&mut self, payload_ptr: *const u8, len: usize, deterministic: bool) {
+        self.pending_exit_loc = None;
+        // Capture Exit records only when the event buffer is attached and the
+        // EXIT category is enabled.
+        if self.event_buffer_ptr.is_none() || !self.event_categories.contains(EventCategories::EXIT)
+        {
+            return;
+        }
+        let flags = if deterministic {
+            EVENT_FLAG_DETERMINISTIC
+        } else {
+            0
+        };
+        let tsc = self.emulated_tsc;
+        let real_tsc = rdtsc();
+        let payload_off = self.event_len + EVENT_HEADER_SIZE;
+        // SAFETY: forwards this function's contract — `payload_ptr` is valid for
+        // `len` bytes and does not alias the event buffer.
+        let fit = unsafe {
+            self.event_write(
+                EventKind::Exit,
+                flags,
+                tsc,
+                real_tsc,
+                payload_ptr,
+                len,
+                core::ptr::null(),
+                0,
+            )
+        };
+        self.pending_exit_loc = Some(if fit {
+            ExitLoc::Buffer(payload_off)
+        } else {
+            ExitLoc::Pending
+        });
+    }
+
+    /// Patch the `memory_hash` (and, for forked VMs, `cow_page_count`) field of
+    /// the most-recently-emitted `Exit` event, which `emit_exit_event` left
+    /// zeroed for deferred finalization. Called from the VM run loop after the
+    /// guest's memory has stabilized. No-op if no Exit record is pending.
+    pub fn finalize_exit_memory_hash(&mut self, memory_hash: u64, cow_page_count: u32) {
+        let loc = match self.pending_exit_loc.take() {
+            Some(l) => l,
+            None => return,
+        };
+        let mh_off = core::mem::offset_of!(ExitRecord, memory_hash);
+        let cc_off = core::mem::offset_of!(ExitRecord, cow_page_count);
+        let payload_base: *mut u8 = match loc {
+            ExitLoc::Buffer(payload_off) => match self.event_buffer_ptr {
+                // SAFETY: `payload_off` is within the 1 MB buffer (the record
+                // was written there).
+                Some(base) => unsafe { base.add(payload_off) },
+                None => return,
+            },
+            // The Exit record was staged pending (buffer was full at emit); its
+            // payload lives at offset 0 of the staging buffer. Patch there so the
+            // re-appended copy carries the hash.
+            ExitLoc::Pending => self.event_pending_buf.as_mut_ptr().cast::<u8>(),
+        };
+        // SAFETY: `memory_hash`/`cow_page_count` lie fully within the 512-byte
+        // payload; `payload_base` is 8-aligned (record start is 8-aligned and the
+        // header is 32 bytes), so both field writes are aligned.
+        unsafe {
+            core::ptr::write(payload_base.add(mh_off).cast::<u64>(), memory_hash);
+            core::ptr::write(payload_base.add(cc_off).cast::<u32>(), cow_page_count);
+        }
     }
 
     /// Check if logging is enabled (any mode except Disabled).
-    pub fn log_enabled(&self) -> bool {
-        self.log_mode != LogMode::Disabled
+    pub fn exit_capture_enabled(&self) -> bool {
+        self.exit_trigger != ExitTrigger::Disabled
     }
 
     /// Enable deterministic logging (AllExits mode for backward compatibility).
-    pub fn enable_logging(&mut self) {
-        self.log_mode = LogMode::AllExits;
-        self.log_captured = false;
+    pub fn enable_exit_capture(&mut self) {
+        self.exit_trigger = ExitTrigger::AllExits;
+        self.exit_captured = false;
     }
 
     /// Disable deterministic logging.
-    pub fn disable_logging(&mut self) {
-        self.log_mode = LogMode::Disabled;
-        self.log_captured = false;
+    pub fn disable_exit_capture(&mut self) {
+        self.exit_trigger = ExitTrigger::Disabled;
+        self.exit_captured = false;
     }
 
     /// Set the logging mode and target TSC.
@@ -1391,15 +1871,15 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
     ///   - AllExits: only log when emulated_tsc >= target_tsc
     ///   - AtTsc: log once when emulated_tsc >= target_tsc
     ///   - AtShutdown/Disabled: ignored
-    pub fn set_log_mode(&mut self, mode: LogMode, target_tsc: u64) {
-        self.log_mode = mode;
-        self.log_target_tsc = target_tsc;
-        self.log_captured = false;
+    pub fn set_exit_trigger(&mut self, mode: ExitTrigger, target_tsc: u64) {
+        self.exit_trigger = mode;
+        self.exit_target_tsc = target_tsc;
+        self.exit_captured = false;
     }
 
     /// Get the current logging mode.
-    pub fn log_mode(&self) -> LogMode {
-        self.log_mode
+    pub fn exit_trigger(&self) -> ExitTrigger {
+        self.exit_trigger
     }
 
     /// Set the universal logging start threshold.
@@ -1410,8 +1890,8 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
     /// # Arguments
     ///
     /// * `start_tsc` - TSC threshold (0 = log from start)
-    pub fn set_log_start_tsc(&mut self, start_tsc: u64) {
-        self.log_start_tsc = start_tsc;
+    pub fn set_exit_start_tsc(&mut self, start_tsc: u64) {
+        self.exit_start_tsc = start_tsc;
     }
 
     /// Enable or disable #PF interception.
@@ -1439,68 +1919,39 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
         let _ = self.vmcs.write32(VmcsField32::ExceptionBitmap, new_bitmap);
     }
 
-    /// Set the log buffer pointer.
-    ///
-    /// # Safety
-    /// The caller must ensure the pointer points to a valid 1MB buffer.
-    pub unsafe fn set_log_buffer(&mut self, ptr: *mut u8) {
-        self.log_buffer_ptr = Some(ptr);
-    }
-
-    /// Clear the log buffer pointer.
-    pub fn clear_log_buffer_ptr(&mut self) {
-        self.log_buffer_ptr = None;
-        self.log_entry_count = 0;
-    }
-
-    /// Get the number of log entries written.
-    pub fn log_entry_count(&self) -> usize {
-        self.log_entry_count
-    }
-
-    /// Check if the log buffer is full.
-    pub fn log_buffer_full(&self) -> bool {
-        self.log_entry_count >= MAX_LOG_ENTRIES
-    }
-
-    /// Clear the log buffer (reset entry count).
-    pub fn log_clear(&mut self) {
-        self.log_entry_count = 0;
-    }
-
     /// Write a log entry for a VM exit.
     ///
     /// This captures guest registers, hashes all device states, and writes an
-    /// entry to the log buffer. Behavior depends on log_mode:
+    /// entry to the log buffer. Behavior depends on exit_trigger:
     ///
     /// - `Disabled`: Returns immediately (no logging)
     /// - `AllExits`: Logs all exits (deterministic and non-deterministic)
-    /// - `AtTsc`: Logs once when TSC >= log_target_tsc, then stops (deterministic only)
-    /// - `AtShutdown`: Returns immediately (handled by log_shutdown)
+    /// - `AtTsc`: Logs once when TSC >= exit_target_tsc, then stops (deterministic only)
+    /// - `AtShutdown`: Returns immediately (handled by capture_exit_at_shutdown)
     /// - `Checkpoints`: Deterministic only, at checkpoint intervals
     /// - `TscRange`: Deterministic only, within single_step_tsc_range
     ///
-    /// All modes respect log_start_tsc - no logging occurs until TSC >= log_start_tsc.
-    pub fn log_exit(
+    /// All modes respect exit_start_tsc - no logging occurs until TSC >= exit_start_tsc.
+    pub fn capture_exit(
         &mut self,
         exit_reason: ExitReason,
         exit_qualification: u64,
         deterministic: bool,
     ) {
         // Universal start threshold - applies to all modes
-        if self.log_start_tsc > 0 && self.emulated_tsc < self.log_start_tsc {
+        if self.exit_start_tsc > 0 && self.emulated_tsc < self.exit_start_tsc {
             return;
         }
 
-        match self.log_mode {
-            LogMode::Disabled => return,
-            LogMode::AtShutdown => return, // Handled by log_shutdown()
-            LogMode::Checkpoints => {
+        match self.exit_trigger {
+            ExitTrigger::Disabled => return,
+            ExitTrigger::AtShutdown => return, // Handled by capture_exit_at_shutdown()
+            ExitTrigger::Checkpoints => {
                 // Non-deterministic exits are only useful in AllExits mode
                 if !deterministic {
                     return;
                 }
-                let interval = self.log_target_tsc;
+                let interval = self.exit_target_tsc;
                 if interval == 0 {
                     return;
                 }
@@ -1512,20 +1963,20 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
                     return; // Not yet reached next checkpoint
                 }
             }
-            LogMode::AtTsc => {
+            ExitTrigger::AtTsc => {
                 // Non-deterministic exits are only useful in AllExits mode
                 if !deterministic {
                     return;
                 }
                 // Log once when TSC reaches target
-                if self.log_captured || self.emulated_tsc < self.log_target_tsc {
+                if self.exit_captured || self.emulated_tsc < self.exit_target_tsc {
                     return;
                 }
             }
-            LogMode::AllExits => {
+            ExitTrigger::AllExits => {
                 // Log all exits (both deterministic and non-deterministic)
             }
-            LogMode::TscRange => {
+            ExitTrigger::TscRange => {
                 // Log both deterministic and non-deterministic exits during
                 // single-stepping — non-determ exits (EPT violations, external
                 // interrupts) are essential for diagnosing divergences.
@@ -1541,15 +1992,15 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
         }
 
         let flags = if deterministic {
-            LOG_ENTRY_FLAG_DETERMINISTIC
+            EXIT_RECORD_FLAG_DETERMINISTIC
         } else {
             0
         };
-        self.write_log_entry(exit_reason, exit_qualification, flags);
+        self.write_exit_record(exit_reason, exit_qualification, flags);
 
         // For AtTsc mode, mark as captured so we don't log again
-        if self.log_mode == LogMode::AtTsc {
-            self.log_captured = true;
+        if self.exit_trigger == ExitTrigger::AtTsc {
+            self.exit_captured = true;
         }
     }
 
@@ -1557,55 +2008,59 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
     ///
     /// This is called from the vmcall shutdown handler to capture final state.
     /// Only logs if mode is AtShutdown and not already captured.
-    /// Respects log_start_tsc - no logging if TSC < log_start_tsc.
-    pub fn log_shutdown(&mut self) {
-        if self.log_mode != LogMode::AtShutdown || self.log_captured {
+    /// Respects exit_start_tsc - no logging if TSC < exit_start_tsc.
+    pub fn capture_exit_at_shutdown(&mut self) {
+        if self.exit_trigger != ExitTrigger::AtShutdown || self.exit_captured {
             return;
         }
 
         // Universal start threshold
-        if self.log_start_tsc > 0 && self.emulated_tsc < self.log_start_tsc {
+        if self.exit_start_tsc > 0 && self.emulated_tsc < self.exit_start_tsc {
             return;
         }
 
         // Use a synthetic exit reason for shutdown logging
-        self.write_log_entry(ExitReason::VmcallShutdown, 0, LOG_ENTRY_FLAG_DETERMINISTIC);
-        self.log_captured = true;
+        self.write_exit_record(
+            ExitReason::VmcallShutdown,
+            0,
+            EXIT_RECORD_FLAG_DETERMINISTIC,
+        );
+        self.exit_captured = true;
     }
 
     /// Write a log entry for a snapshot hypercall.
     ///
     /// This is called from the vmcall snapshot handler to capture state on demand.
-    /// If logging is disabled or the buffer is full, this is a no-op.
-    pub fn log_snapshot(&mut self) {
-        // Respect log_start_tsc threshold
-        if self.log_start_tsc > 0 && self.emulated_tsc < self.log_start_tsc {
+    /// If logging is disabled this is a no-op.
+    pub fn capture_exit_at_snapshot(&mut self) {
+        // Respect exit_start_tsc threshold
+        if self.exit_start_tsc > 0 && self.emulated_tsc < self.exit_start_tsc {
             return;
         }
 
         // If logging disabled, do nothing
-        if self.log_mode == LogMode::Disabled {
+        if self.exit_trigger == ExitTrigger::Disabled {
             return;
         }
 
-        // If buffer full, do nothing
-        if self.log_entry_count >= MAX_LOG_ENTRIES {
-            return;
-        }
-
-        self.write_log_entry(ExitReason::VmcallSnapshot, 0, LOG_ENTRY_FLAG_DETERMINISTIC);
+        self.write_exit_record(
+            ExitReason::VmcallSnapshot,
+            0,
+            EXIT_RECORD_FLAG_DETERMINISTIC,
+        );
     }
 
-    /// Internal helper to write a log entry.
+    /// Emit an `Exit` event capturing this VM exit.
     ///
-    /// Does nothing if buffer is full or not allocated.
-    fn write_log_entry(&mut self, exit_reason: ExitReason, exit_qualification: u64, flags: u32) {
-        let ptr = match self.log_buffer_ptr {
-            Some(p) => p,
-            None => return,
-        };
-
-        if self.log_entry_count >= MAX_LOG_ENTRIES {
+    /// Builds the 512-byte `ExitRecord` body (guest registers, device-state
+    /// hashes, diagnostics) and appends it as an `EventKind::Exit` record. The
+    /// `memory_hash` is left zero for deferred finalization (see
+    /// `finalize_exit_memory_hash`). No-op unless the event buffer is attached
+    /// with the `EXIT` category enabled.
+    fn write_exit_record(&mut self, exit_reason: ExitReason, exit_qualification: u64, flags: u32) {
+        // Capture Exit records only when the buffer is attached and EXIT is enabled.
+        if self.event_buffer_ptr.is_none() || !self.event_categories.contains(EventCategories::EXIT)
+        {
             return;
         }
 
@@ -1663,10 +2118,10 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
         let mtrr_hash = self.devices.mtrr.state_hash();
         let rdrand_hash = self.devices.rdrand.state_hash();
 
-        // Memory hash is computed later by finalize_log_entry() after this method returns.
+        // Memory hash is computed later by finalize_exit_record() after this method returns.
         let memory_hash = 0;
 
-        let entry = LogEntry {
+        let entry = ExitRecord {
             tsc: self.emulated_tsc,
             exit_reason: exit_reason as u32,
             flags,
@@ -1734,18 +2189,20 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
         self.last_pebs_iters_since_arm = 0;
         self.last_pebs_arm_delta = 0;
 
-        // Write entry to buffer
-        // SAFETY: ptr is valid for 1MB, entry_count < MAX_LOG_ENTRIES.
+        // Emit the entry as an `Exit` event. The record's header determinism bit
+        // mirrors `ExitRecord.flags` (the payload keeps its own copy too).
+        // `emit_exit_event` records where the `memory_hash` field landed so
+        // `finalize_exit_memory_hash` can patch it after guest memory stabilizes.
+        let deterministic = flags & EXIT_RECORD_FLAG_DETERMINISTIC != 0;
+        // SAFETY: `entry` is a stack-local `ExitRecord` (512 bytes) that does not
+        // alias the event buffer.
         unsafe {
-            let entry_ptr = ptr
-                .add(self.log_entry_count * core::mem::size_of::<LogEntry>())
-                .cast::<LogEntry>();
-            core::ptr::write(entry_ptr, entry);
+            self.emit_exit_event(
+                core::ptr::from_ref(&entry).cast::<u8>(),
+                core::mem::size_of::<ExitRecord>(),
+                deterministic,
+            );
         }
-
-        // Mark this entry as needing memory hash finalization
-        self.pending_log_idx = Some(self.log_entry_count);
-        self.log_entry_count += 1;
     }
 
     /// Create a VmState for testing with minimal initialization.
@@ -1767,12 +2224,6 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
         let msr_bitmap = kernel
             .alloc_zeroed_page()
             .ok_or("MSR bitmap alloc failed")?;
-        let serial_buffer_page = kernel
-            .alloc_zeroed_page()
-            .ok_or("Serial buffer alloc failed")?;
-        let serial_tsc_page = kernel
-            .alloc_zeroed_page()
-            .ok_or("Serial TSC page alloc failed")?;
         let guest_xsave_page = kernel
             .alloc_zeroed_page()
             .ok_or("Guest XSAVE alloc failed")?;
@@ -1794,12 +2245,10 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             msr_bitmap,
             pebs_exit_msr_load_page,
             pebs_entry_msr_load_page,
-            serial_buffer_page,
-            serial_tsc_page,
-            serial_len: 0,
-            serial_line_count: 0,
-            serial_at_line_start: true,
-            serial_pending_byte: None,
+            serial_line_buf: box_serial_line_buf(),
+            serial_line_len: 0,
+            serial_line_tsc: 0,
+            serial_line_real_tsc: 0,
             guest_xsave_page,
             host_xsave_page,
             xcr0_mask: 0x7, // x87 + SSE + AVX
@@ -1814,13 +2263,21 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             emulated_tsc: 0,
             tsc_offset: 0,
             tsc_frequency: DEFAULT_TSC_FREQUENCY,
-            log_mode: LogMode::Disabled,
-            log_target_tsc: 0,
-            log_start_tsc: 0,
-            log_captured: false,
-            log_entry_count: 0,
-            log_buffer_ptr: None,
-            pending_log_idx: None,
+            exit_trigger: ExitTrigger::Disabled,
+            exit_target_tsc: 0,
+            exit_start_tsc: 0,
+            exit_captured: false,
+            event_buffer_ptr: None,
+            event_len: 0,
+            event_seq: 0,
+            event_categories: EventCategories::empty(),
+            event_pending: None,
+            event_pending_buf: box_io_page_buf(),
+            event_pending_len: 0,
+            event_pending_flags: 0,
+            event_pending_tsc: 0,
+            event_pending_real_tsc: 0,
+            pending_exit_loc: None,
             skip_memory_hash: false,
             single_step_tsc_range: None,
             mtf_enabled: false,
@@ -1839,6 +2296,7 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             pebs_state: None,
             pebs_supported: false,
             io_channel: IoChannelState::new(),
+            serial_console: SerialConsoleState::new(),
             last_cpu: None,
         })
     }
@@ -1907,18 +2365,6 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             .alloc_zeroed_page()
             .ok_or(VmStateError::PebsExitMsrLoadAlloc)?;
         init_pebs_entry_msr_indexes(pebs_entry_msr_load_page.virtual_address().as_u64());
-
-        // Allocate serial buffer page (4KB, zeroed)
-        let serial_buffer_page = machine
-            .kernel()
-            .alloc_zeroed_page()
-            .ok_or(VmStateError::SerialBufferAlloc)?;
-
-        // Allocate serial TSC metadata page (4KB, zeroed)
-        let serial_tsc_page = machine
-            .kernel()
-            .alloc_zeroed_page()
-            .ok_or(VmStateError::SerialTscPageAlloc)?;
 
         // Allocate XSAVE area pages (4KB each)
         let guest_xsave_page = machine
@@ -2067,12 +2513,10 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             msr_bitmap,
             pebs_exit_msr_load_page,
             pebs_entry_msr_load_page,
-            serial_buffer_page,
-            serial_tsc_page,
-            serial_len: 0,
-            serial_line_count: 0,
-            serial_at_line_start: true,
-            serial_pending_byte: None,
+            serial_line_buf: box_serial_line_buf(),
+            serial_line_len: 0,
+            serial_line_tsc: 0,
+            serial_line_real_tsc: 0,
             guest_xsave_page,
             host_xsave_page,
             xcr0_mask: parent_state.xcr0_mask,
@@ -2087,13 +2531,21 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             emulated_tsc: parent_state.emulated_tsc,
             tsc_offset: parent_state.emulated_tsc,
             tsc_frequency: parent_state.tsc_frequency,
-            log_mode: LogMode::Disabled, // Forked VMs start with logging disabled
-            log_target_tsc: 0,
-            log_start_tsc: 0,
-            log_captured: false,
-            log_entry_count: 0,
-            log_buffer_ptr: None,
-            pending_log_idx: None,
+            exit_trigger: ExitTrigger::Disabled, // Forked VMs start with logging disabled
+            exit_target_tsc: 0,
+            exit_start_tsc: 0,
+            exit_captured: false,
+            event_buffer_ptr: None,
+            event_len: 0,
+            event_seq: 0,
+            event_categories: EventCategories::empty(),
+            event_pending: None,
+            event_pending_buf: box_io_page_buf(),
+            event_pending_len: 0,
+            event_pending_flags: 0,
+            event_pending_tsc: 0,
+            event_pending_real_tsc: 0,
+            pending_exit_loc: None,
             skip_memory_hash: false,
             single_step_tsc_range: None,
             mtf_enabled: false,
@@ -2124,7 +2576,12 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
                 .map(|p| heap_box(p.clone_for_fork())),
             pebs_supported: parent_state.pebs_supported,
             io_channel: IoChannelState::clone_for_fork(&parent_state.io_channel),
+            serial_console: SerialConsoleState::clone_for_fork(&parent_state.serial_console),
             last_cpu: None,
         })
     }
 }
+
+#[cfg(test)]
+#[path = "vm_state_event_tests.rs"]
+mod event_producer_tests;

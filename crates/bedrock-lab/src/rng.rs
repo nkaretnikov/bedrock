@@ -14,6 +14,10 @@
 use std::fs::File;
 use std::io::Read;
 
+use bedrock_vm::events::IoChannelPhase;
+use bedrock_vm::io_channel::{decode_request, IoTarget};
+use bedrock_vm::{Event, EventRecord};
+
 use crate::bash::BashTarget;
 use crate::time::VirtTime;
 
@@ -26,6 +30,10 @@ pub struct IoInput {
     pub target: BashTarget,
     /// Command to run.
     pub command: String,
+    /// Whether to capture the command's output into the output feedback
+    /// buffer (surfaced on the [`BashOutput`](crate::BashOutput) of the
+    /// resulting [`ActionResponse`](crate::RunOutcome::ActionResponse)).
+    pub record_output: bool,
 }
 
 /// One RDRAND/RDSEED value fed to a branch.
@@ -38,6 +46,13 @@ pub struct RngInput {
 }
 
 /// Inputs consumed by a branch, suitable for replay.
+///
+/// The recording is reconstructed from the branch's unified event stream rather
+/// than tracked separately: a branch with an [`InputSource`] forces on the
+/// [`Randomness`](bedrock_vm::Event::Randomness) and
+/// [`IoChannel`](bedrock_vm::Event::IoChannel) event categories, and every
+/// drained record is fed through [`record_event`](Self::record_event). The
+/// stream is therefore the single source of truth for what reached the guest.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InputRecording {
     rng_inputs: Vec<RngInput>,
@@ -60,12 +75,39 @@ impl InputRecording {
         &self.io_inputs
     }
 
-    pub(crate) fn push_rng(&mut self, input: RngInput) {
-        self.rng_inputs.push(input);
-    }
-
-    pub(crate) fn push_io(&mut self, input: IoInput) {
-        self.io_inputs.push(input);
+    /// Extract the determinism *input* carried by one event-stream record and
+    /// append it to the recording. A [`Randomness`](bedrock_vm::Event::Randomness)
+    /// record yields one [`RngInput`]; an [`IoChannel`](bedrock_vm::Event::IoChannel)
+    /// *request* yields one [`IoInput`]. Every other kind — including I/O channel
+    /// *responses*, which carry host-derived output — is ignored.
+    ///
+    /// `freq` converts the record's emulated-TSC timestamp into [`VirtTime`].
+    /// For I/O the record's own emit TSC (the moment the request was signaled to
+    /// the guest) is used, not the request's scheduled `target_tsc`: source-driven
+    /// requests are queued "fire as soon as interruptible" (target 0), so the
+    /// emit TSC is the point a replay must stop at to re-inject the command.
+    pub(crate) fn record_event(&mut self, record: &EventRecord<'_>, freq: u64) {
+        match record.event() {
+            Event::Randomness(p) => self.rng_inputs.push(RngInput {
+                at: VirtTime::from_instructions(record.tsc(), freq),
+                value: p.value,
+            }),
+            Event::IoChannel(meta, data) if meta.phase == IoChannelPhase::Request as u8 => {
+                let Some(req) = decode_request(data) else {
+                    return;
+                };
+                self.io_inputs.push(IoInput {
+                    at: VirtTime::from_instructions(record.tsc(), freq),
+                    target: match req.target {
+                        IoTarget::Host => BashTarget::Host,
+                        IoTarget::Container(name) => BashTarget::Container(name.into_owned()),
+                    },
+                    command: req.command.into_owned(),
+                    record_output: req.record_output,
+                });
+            }
+            _ => {}
+        }
     }
 }
 
@@ -230,3 +272,7 @@ impl InputSource for SystemRng {
         Box::new(Self::new().expect("/dev/urandom"))
     }
 }
+
+#[cfg(test)]
+#[path = "rng_tests.rs"]
+mod tests;

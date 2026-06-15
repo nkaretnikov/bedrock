@@ -14,10 +14,11 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 
-use bedrock_vm::{ExitStats, LogEntry, Vm, DEFAULT_TSC_FREQUENCY};
+use bedrock_vm::{ExitRecord, ExitStats, Vm, DEFAULT_TSC_FREQUENCY};
 
 const DEFAULT_RUNS: usize = 10;
-const DEFAULT_MEMORY_MB: usize = 3072;
+// Sourced from bedrock-cli's default so the two tools stay in lockstep.
+const DEFAULT_MEMORY_MB: usize = bedrock_vm::boot::defaults::MEMORY_MB;
 
 #[derive(Parser, Debug)]
 #[command(name = "bedrock-determinism")]
@@ -50,9 +51,9 @@ struct Args {
     #[arg(short = 'n', long, default_value_t = DEFAULT_RUNS)]
     runs: usize,
 
-    /// RDRAND seed
-    #[arg(short = 's', long)]
-    seed: Option<u64>,
+    /// Seed/value for RDRAND
+    #[arg(short = 's', long = "rdrand-seed")]
+    rdrand_seed: Option<u64>,
 
     /// Stop VM when emulated TSC reaches this value
     #[arg(long = "stop-at-tsc", conflicts_with = "stop_at_vt")]
@@ -70,8 +71,8 @@ struct Args {
     #[arg(short = 'q', long)]
     quiet: bool,
 
-    /// Log checkpoints at TSC intervals instead of at shutdown
-    /// When set, logs periodic state snapshots to find divergence window
+    /// Capture exit records at TSC intervals instead of at shutdown.
+    /// Periodic state snapshots help locate the divergence window.
     #[arg(long = "checkpoint-interval")]
     checkpoint_interval: Option<u64>,
 
@@ -79,24 +80,24 @@ struct Args {
     #[arg(long = "single-step", value_parser = parse_tsc_range)]
     single_step: Option<(u64, u64)>,
 
-    /// Start logging only after emulated TSC reaches this threshold
-    /// Applies to all logging modes (checkpoints, single-step, etc.)
-    #[arg(long = "log-after-tsc")]
-    log_after_tsc: Option<u64>,
+    /// Capture exit records only after emulated TSC reaches this threshold.
+    /// Applies to all capture modes (checkpoints, single-step, etc.)
+    #[arg(long = "capture-exits-after-tsc")]
+    capture_exits_after_tsc: Option<u64>,
 
     /// Parent VM ID for forked VM testing (passes --parent-id to CLI)
     #[arg(long = "parent-id", value_parser = parse_u64)]
     parent_id: Option<u64>,
 
     /// Wall-clock timeout in seconds for each VM run (default: 10)
-    #[arg(long = "timeout", default_value_t = 10.0)]
-    timeout: f64,
+    #[arg(long = "wall-clock-timeout", default_value_t = 10.0)]
+    wall_clock_timeout: f64,
 
-    /// Log every deterministic exit (high overhead, produces large logs)
-    #[arg(long = "log-all-exits")]
-    log_all_exits: bool,
+    /// Capture every deterministic exit (high overhead, large event streams)
+    #[arg(long = "all-exits")]
+    all_exits: bool,
 
-    /// Skip memory hashing in log entries (memory_hash will be 0)
+    /// Skip memory hashing in exit records (memory_hash will be 0)
     #[arg(long = "no-memory-hash")]
     no_memory_hash: bool,
 
@@ -162,9 +163,9 @@ struct RunResult {
     run_num: usize,
     /// For single-entry modes (AtShutdown), this contains the single entry.
     /// For checkpoint mode, this is empty and checkpoint_entries is used instead.
-    log_entry: Option<LogEntry>,
+    exit_record: Option<ExitRecord>,
     /// Checkpoint entries (only used when --checkpoint-interval is set).
-    checkpoint_entries: Vec<LogEntry>,
+    checkpoint_entries: Vec<ExitRecord>,
     /// Path to the run directory containing all artifacts.
     run_dir: PathBuf,
     /// Exit statistics from the VM run.
@@ -231,7 +232,7 @@ fn generate_test_dir_name(args: &Args, vmlinux: &str) -> String {
     }
 
     // Seed
-    if let Some(seed) = args.seed {
+    if let Some(seed) = args.rdrand_seed {
         parts.push(format!("seed{:#x}", seed));
     }
 
@@ -622,7 +623,7 @@ fn write_config_file(args: &Args, vmlinux: &str, cli_path: &Path) -> io::Result<
         writeln!(f, "cmdline: {}", cmdline)?;
     }
     writeln!(f, "runs: {}", args.runs)?;
-    if let Some(seed) = args.seed {
+    if let Some(seed) = args.rdrand_seed {
         writeln!(f, "seed: {:#x}", seed)?;
     }
     if let Some(stop_tsc) = args.stop_at_tsc {
@@ -637,14 +638,14 @@ fn write_config_file(args: &Args, vmlinux: &str, cli_path: &Path) -> io::Result<
     if let Some((start, end)) = args.single_step {
         writeln!(f, "single_step: {}-{}", start, end)?;
     }
-    if let Some(tsc) = args.log_after_tsc {
-        writeln!(f, "log_after_tsc: {}", tsc)?;
+    if let Some(tsc) = args.capture_exits_after_tsc {
+        writeln!(f, "capture_exits_after_tsc: {}", tsc)?;
     }
     if let Some(parent_id) = args.parent_id {
         writeln!(f, "parent_id: {}", parent_id)?;
     }
-    if args.log_all_exits {
-        writeln!(f, "log_all_exits: true")?;
+    if args.all_exits {
+        writeln!(f, "all_exits: true")?;
     }
     if args.no_memory_hash {
         writeln!(f, "no_memory_hash: true")?;
@@ -653,7 +654,7 @@ fn write_config_file(args: &Args, vmlinux: &str, cli_path: &Path) -> io::Result<
         writeln!(f, "intercept_pf: true")?;
     }
     writeln!(f, "parallel: {}", args.parallel)?;
-    writeln!(f, "timeout: {}s", args.timeout)?;
+    writeln!(f, "wall_clock_timeout: {}s", args.wall_clock_timeout)?;
 
     Ok(())
 }
@@ -683,11 +684,11 @@ fn run_sequential(args: &Args, vmlinux: &str, cli_path: &Path) -> std::process::
             format_run_time(result.wall_time)
         );
 
-        // Print log entry or checkpoint summary
-        if let Some(ref entry) = result.log_entry {
-            print_log_entry(entry);
+        // Print the exit record or checkpoint summary
+        if let Some(ref entry) = result.exit_record {
+            print_exit_record(entry);
         } else {
-            eprintln!("  {} checkpoints logged", result.checkpoint_entries.len());
+            eprintln!("  {} checkpoints captured", result.checkpoint_entries.len());
         }
         eprintln!("  Run data saved to: {:?}", result.run_dir);
 
@@ -699,7 +700,7 @@ fn run_sequential(args: &Args, vmlinux: &str, cli_path: &Path) -> std::process::
                 reference_result = Some(result);
             }
             Some(ref_result) => {
-                let multi_entry = args.checkpoint_interval.is_some() || args.log_all_exits;
+                let multi_entry = args.checkpoint_interval.is_some() || args.all_exits;
                 let diff = compare_run_results(ref_result, &result, multi_entry);
                 if let Some(diff) = diff {
                     divergent_count += 1;
@@ -771,12 +772,12 @@ fn compare_run_results(
     test: &RunResult,
     multi_entry: bool,
 ) -> Option<String> {
-    let log_diff = if multi_entry {
+    let record_diff = if multi_entry {
         compare_checkpoint_results(reference, test)
     } else {
-        compare_logs(
-            reference.log_entry.as_ref().unwrap(),
-            test.log_entry.as_ref().unwrap(),
+        compare_exit_records(
+            reference.exit_record.as_ref().unwrap(),
+            test.exit_record.as_ref().unwrap(),
         )
     };
 
@@ -785,7 +786,7 @@ fn compare_run_results(
         _ => None,
     };
 
-    match (log_diff, stats_diff) {
+    match (record_diff, stats_diff) {
         (None, None) => None,
         (Some(ld), None) => Some(ld),
         (None, Some(sd)) => Some(sd),
@@ -842,11 +843,11 @@ fn run_parallel(args: &Args, vmlinux: &str, cli_path: &Path) -> std::process::Ex
     let mut next_run = 1;
     let mut active_threads = 0;
 
-    let multi_entry = args.checkpoint_interval.is_some() || args.log_all_exits;
+    let multi_entry = args.checkpoint_interval.is_some() || args.all_exits;
 
     // Compare results incrementally as they arrive to avoid accumulating all
     // results in memory (which would be catastrophic for large run counts with
-    // multi-entry logging modes).
+    // multi-entry capture modes).
     let mut reference: Option<RunResult> = None;
     let mut pending: Vec<RunResult> = Vec::new();
     let mut completed = 0;
@@ -874,17 +875,17 @@ fn run_parallel(args: &Args, vmlinux: &str, cli_path: &Path) -> std::process::Ex
             let initramfs = args.initramfs.clone();
             let cmdline = args.cmdline.clone();
             let memory = args.memory;
-            let seed = args.seed;
+            let seed = args.rdrand_seed;
             let stop_at_tsc = args.stop_at_tsc.or_else(|| {
                 args.stop_at_vt
                     .map(|vt| (vt * DEFAULT_TSC_FREQUENCY as f64) as u64)
             });
             let checkpoint_interval = args.checkpoint_interval;
             let single_step = args.single_step;
-            let log_after_tsc = args.log_after_tsc;
+            let exit_after_tsc = args.capture_exits_after_tsc;
             let parent_id = args.parent_id;
-            let timeout = args.timeout;
-            let log_all_exits = args.log_all_exits;
+            let timeout = args.wall_clock_timeout;
+            let all_exits = args.all_exits;
             let no_memory_hash = args.no_memory_hash;
             let intercept_pf = args.intercept_pf;
 
@@ -898,10 +899,10 @@ fn run_parallel(args: &Args, vmlinux: &str, cli_path: &Path) -> std::process::Ex
                     stop_at_tsc,
                     checkpoint_interval,
                     single_step,
-                    log_after_tsc,
+                    exit_after_tsc,
                     parent_id,
                     timeout,
-                    log_all_exits,
+                    all_exits,
                     no_memory_hash,
                     intercept_pf,
                     &cli_path,
@@ -1076,17 +1077,17 @@ fn run_vm(
         args.initramfs.as_deref(),
         args.cmdline.as_deref(),
         args.memory,
-        args.seed,
+        args.rdrand_seed,
         args.stop_at_tsc.or_else(|| {
             args.stop_at_vt
                 .map(|vt| (vt * DEFAULT_TSC_FREQUENCY as f64) as u64)
         }),
         args.checkpoint_interval,
         args.single_step,
-        args.log_after_tsc,
+        args.capture_exits_after_tsc,
         args.parent_id,
-        args.timeout,
-        args.log_all_exits,
+        args.wall_clock_timeout,
+        args.all_exits,
         args.no_memory_hash,
         args.intercept_pf,
         cli_path,
@@ -1105,10 +1106,10 @@ fn run_vm_inner(
     stop_at_tsc: Option<u64>,
     checkpoint_interval: Option<u64>,
     single_step: Option<(u64, u64)>,
-    log_after_tsc: Option<u64>,
+    exit_after_tsc: Option<u64>,
     parent_id: Option<u64>,
     timeout: f64,
-    log_all_exits: bool,
+    all_exits: bool,
     no_memory_hash: bool,
     intercept_pf: bool,
     cli_path: &Path,
@@ -1129,7 +1130,7 @@ fn run_vm_inner(
         )
     })?;
 
-    let log_file = run_dir.join("exit-log.jsonl");
+    let events_file = run_dir.join("events.jsonl");
     let stdout_file = run_dir.join("stdout.txt");
     let stderr_file = run_dir.join("stderr.txt");
     let command_file = run_dir.join("command.txt");
@@ -1138,15 +1139,20 @@ fn run_vm_inner(
     let mut cmd = Command::new(cli_path);
     cmd.arg(make_absolute(vmlinux));
 
-    // Select logging mode
-    if log_all_exits {
-        cmd.arg("--enable-log");
-    } else if let Some(interval) = checkpoint_interval {
-        cmd.arg("--log-checkpoints").arg(interval.to_string());
-    } else {
-        cmd.arg("--log-at-shutdown");
+    // Capture Exit records into the event stream (`--exit-capture` implies the
+    // `exit` category). Single-stepping drives its own `TscRange` capture, so
+    // only set an explicit mode when not single-stepping.
+    cmd.arg("--events-jsonl").arg(&events_file);
+    if single_step.is_none() {
+        if all_exits {
+            cmd.arg("--exit-capture").arg("all");
+        } else if let Some(interval) = checkpoint_interval {
+            cmd.arg("--exit-capture")
+                .arg(format!("checkpoints:{}", interval));
+        } else {
+            cmd.arg("--exit-capture").arg("at-shutdown");
+        }
     }
-    cmd.arg("--log-jsonl").arg(&log_file);
     if no_memory_hash {
         cmd.arg("--no-memory-hash");
     }
@@ -1170,13 +1176,13 @@ fn run_vm_inner(
     if let Some((start, end)) = single_step {
         cmd.arg("--single-step").arg(format!("{}-{}", start, end));
     }
-    if let Some(tsc) = log_after_tsc {
-        cmd.arg("--log-after-tsc").arg(tsc.to_string());
+    if let Some(tsc) = exit_after_tsc {
+        cmd.arg("--capture-exits-after-tsc").arg(tsc.to_string());
     }
     if let Some(id) = parent_id {
         cmd.arg("--parent-id").arg(id.to_string());
     }
-    cmd.arg("--timeout").arg(timeout.to_string());
+    cmd.arg("--wall-clock-timeout").arg(timeout.to_string());
 
     let exit_stats_file = run_dir.join("exit-stats.json");
     cmd.arg("--exit-stats-json").arg(&exit_stats_file);
@@ -1229,42 +1235,42 @@ fn run_vm_inner(
     let exit_stats = parse_exit_stats_file(&exit_stats_file).ok();
 
     // Parse log file (don't delete it - keep for analysis)
-    let multi_entry = checkpoint_interval.is_some() || log_all_exits;
+    let multi_entry = checkpoint_interval.is_some() || all_exits;
     if multi_entry {
-        let entries = parse_log_file_entries(&log_file).map_err(|e| {
-            let file_size = fs::metadata(&log_file).map(|m| m.len()).unwrap_or(0);
+        let entries = parse_events_file_entries(&events_file).map_err(|e| {
+            let file_size = fs::metadata(&events_file).map(|m| m.len()).unwrap_or(0);
             format_run_error(
                 run_num,
                 &run_dir,
                 &format!(
                     "failed to parse log file {:?} ({} bytes): {}",
-                    log_file, file_size, e
+                    events_file, file_size, e
                 ),
             )
         })?;
         Ok(RunResult {
             run_num,
-            log_entry: None,
+            exit_record: None,
             checkpoint_entries: entries,
             run_dir,
             exit_stats,
             wall_time,
         })
     } else {
-        let log_entry = parse_log_file(&log_file).map_err(|e| {
-            let file_size = fs::metadata(&log_file).map(|m| m.len()).unwrap_or(0);
+        let exit_record = parse_events_file(&events_file).map_err(|e| {
+            let file_size = fs::metadata(&events_file).map(|m| m.len()).unwrap_or(0);
             format_run_error(
                 run_num,
                 &run_dir,
                 &format!(
                     "failed to parse log file {:?} ({} bytes): {}",
-                    log_file, file_size, e
+                    events_file, file_size, e
                 ),
             )
         })?;
         Ok(RunResult {
             run_num,
-            log_entry: Some(log_entry),
+            exit_record: Some(exit_record),
             checkpoint_entries: Vec::new(),
             run_dir,
             exit_stats,
@@ -1273,40 +1279,64 @@ fn run_vm_inner(
     }
 }
 
-fn parse_log_file(path: &std::path::Path) -> io::Result<LogEntry> {
-    let content = fs::read_to_string(path)?;
-    // log-at-shutdown produces exactly one entry
-    let line = content
-        .lines()
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Empty log file"))?;
-    serde_json::from_str(line).map_err(|e| {
+/// Parse one event-stream JSONL line. Returns the `ExitRecord` payload if the line
+/// is a *deterministic* `Exit` record, else `None` (serial, randomness, or a
+/// non-deterministic exit). The harness compares only deterministic exits.
+fn exit_entry_from_line(line: &str) -> io::Result<Option<ExitRecord>> {
+    let parse_err = |e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("JSON parse error: {}", e),
         )
-    })
+    };
+    let v: serde_json::Value = serde_json::from_str(line).map_err(parse_err)?;
+    let is_exit = v.get("kind").and_then(|k| k.as_str()) == Some("exit");
+    let is_det = v.get("deterministic").and_then(|d| d.as_bool()) == Some(true);
+    if !is_exit || !is_det {
+        return Ok(None);
+    }
+    let data = v
+        .get("data")
+        .cloned()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "exit event missing `data`"))?;
+    let entry: ExitRecord = serde_json::from_value(data).map_err(parse_err)?;
+    Ok(Some(entry))
 }
 
-fn parse_log_file_entries(path: &std::path::Path) -> io::Result<Vec<LogEntry>> {
+/// Read the first deterministic `Exit` record from an event-stream JSONL file
+/// (log-at-shutdown produces exactly one).
+fn parse_events_file(path: &std::path::Path) -> io::Result<ExitRecord> {
+    let content = fs::read_to_string(path)?;
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some(entry) = exit_entry_from_line(line)? {
+            return Ok(entry);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "no deterministic exit record in event stream",
+    ))
+}
+
+/// Read every deterministic `Exit` record from an event-stream JSONL file.
+fn parse_events_file_entries(path: &std::path::Path) -> io::Result<Vec<ExitRecord>> {
     let content = fs::read_to_string(path)?;
     let mut entries = Vec::new();
     for line in content.lines() {
         if line.trim().is_empty() {
             continue;
         }
-        let entry: LogEntry = serde_json::from_str(line).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("JSON parse error: {}", e),
-            )
-        })?;
-        entries.push(entry);
+        if let Some(entry) = exit_entry_from_line(line)? {
+            entries.push(entry);
+        }
     }
     Ok(entries)
 }
 
-fn print_log_entry(entry: &LogEntry) {
+fn print_exit_record(entry: &ExitRecord) {
     eprintln!("  TSC: {}", entry.tsc);
     eprintln!("  RIP: {:#x}", entry.rip);
     eprintln!("  RFLAGS: {:#x}", entry.rflags);
@@ -1341,7 +1371,7 @@ fn print_log_entry(entry: &LogEntry) {
     );
 }
 
-fn compare_logs(a: &LogEntry, b: &LogEntry) -> Option<String> {
+fn compare_exit_records(a: &ExitRecord, b: &ExitRecord) -> Option<String> {
     let mut diffs = Vec::new();
     macro_rules! cmp {
         ($f:ident) => {
@@ -1408,7 +1438,7 @@ fn compare_checkpoint_results(ref_result: &RunResult, test_result: &RunResult) -
         let ref_entry = &ref_entries[i];
         let test_entry = &test_entries[i];
 
-        if let Some(diff) = compare_logs(ref_entry, test_entry) {
+        if let Some(diff) = compare_exit_records(ref_entry, test_entry) {
             // Get checkpoint index from exit_qualification
             let checkpoint_idx = ref_entry.exit_qualification;
             return Some(format!(

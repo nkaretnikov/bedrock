@@ -4,12 +4,14 @@
 
 use std::sync::{Arc, Weak};
 
-use bedrock_vm::{ExitKind, RdrandConfig, Vm};
+use bedrock_vm::{
+    EventCategories, EventConfig as VmEventConfig, ExitKind, RdrandConfig, Vm, VmError,
+};
 
 use crate::branch::{Branch, BranchId};
 use crate::error::{LabError, Result};
 use crate::event::{
-    drain_serial_into_sink, emit_feedback_buffer_registered, Discard, Event, EventSink, PartialLine,
+    drain_serial_events, emit_feedback_buffer_registered, Discard, Event, EventSink, PartialLine,
 };
 use crate::inner::LabInner;
 use crate::rng::{InputRecording, InputSource, IoInput, RngMode};
@@ -124,22 +126,35 @@ impl Checkpoint {
     /// If `opts.rng` is [`RngMode::Source`], the userspace source is not
     /// consumed during the root boot; root boot simply exits to userspace if
     /// the guest executes `RDRAND`/`RDSEED` before ready.
-    pub fn initial_when_ready_with(vm: Vm, deadline: VirtTime, opts: LabOpts) -> Result<Self> {
+    pub fn initial_when_ready_with(mut vm: Vm, deadline: VirtTime, opts: LabOpts) -> Result<Self> {
         Self::check_frequency(deadline.frequency(), opts.tsc_frequency)?;
         let (opts, input_source) = Self::configure_rng(&vm, opts)?;
+        // Capture guest console output as `Serial` event records during boot,
+        // the same channel branches use; the root VM gets reserved `BranchId(0)`.
+        vm.set_event_config(&VmEventConfig::enabled(EventCategories::SERIAL))
+            .map_err(|source| {
+                LabError::Vm(VmError::Ioctl {
+                    operation: "SET_EVENT_CONFIG",
+                    source,
+                })
+            })?;
         vm.set_stop_at_tsc(Some(deadline.instructions()))?;
         let mut partial_line = PartialLine::default();
         loop {
             let exit = vm.run()?;
             let at = VirtTime::from_instructions(exit.emulated_tsc, opts.tsc_frequency);
-            drain_serial_into_sink(
-                &vm,
-                exit.serial_len as usize,
-                at,
-                BranchId(0),
-                opts.sink.as_ref(),
-                &mut partial_line,
-            );
+            let event_len = exit.event_len as usize;
+            if event_len > 0 {
+                if let Some(buffer) = vm.event_buffer() {
+                    drain_serial_events(
+                        &buffer[..event_len.min(buffer.len())],
+                        opts.tsc_frequency,
+                        BranchId(0),
+                        opts.sink.as_ref(),
+                        &mut partial_line,
+                    );
+                }
+            }
             match exit.kind() {
                 ExitKind::VmcallReady => {
                     vm.set_stop_at_tsc(None)?;
@@ -155,7 +170,7 @@ impl Checkpoint {
                     emit_feedback_buffer_registered(&vm, at, BranchId(0), opts.sink.as_ref())?;
                     continue;
                 }
-                ExitKind::Continue | ExitKind::LogBufferFull => continue,
+                ExitKind::Continue | ExitKind::EventBufferFull => continue,
                 kind => return Err(LabError::UnexpectedExit { at, kind }),
             }
         }
@@ -290,7 +305,7 @@ impl Checkpoint {
             child_vm.set_rdrand_config(&RdrandConfig::exit_to_userspace())?;
         }
         let id = BranchId(self.inner.lab.next_branch_id());
-        Ok(Branch::new(
+        let mut branch = Branch::new(
             id,
             self.clone(),
             child_vm,
@@ -301,7 +316,12 @@ impl Checkpoint {
             self.inner.pending_input_io.clone(),
             self.inner.input_io_exhausted,
             self.inner.input_recording.clone(),
-        ))
+        );
+        // Forked VMs start with the event stream disabled; turn on the lab's
+        // always-on capture (SERIAL, plus the input-recording categories for a
+        // sourced branch) from the first instruction.
+        branch.enable_event_capture()?;
+        Ok(branch)
     }
 
     /// Logical parent checkpoint in the lab tree, if any. `None` for the root.

@@ -7,7 +7,8 @@
 //! to the sink so the consumer can persist, stream, or discard the data
 //! however it likes (BigQuery, a local database, stdout, or `/dev/null`).
 
-use bedrock_vm::{parse_line_tsc_entries, LogEntry, Vm};
+use bedrock_vm::events::EventKind;
+use bedrock_vm::{EventRecord, EventStream, Vm};
 
 use crate::branch::BranchId;
 use crate::checkpoint::CheckpointId;
@@ -73,18 +74,18 @@ pub enum Event<'a> {
         slot: usize,
         size: u64,
     },
-    /// A VM exit captured by the determinism-debugging exit logger. Fires
-    /// once per kernel-written [`LogEntry`] for branches that have been
-    /// configured via [`Branch::set_log_config`](crate::Branch::set_log_config).
+    /// One record drained from the branch's unified event stream — an exit
+    /// snapshot, served randomness, an injected interrupt, an I/O-channel
+    /// transaction, etc. Fires once per record for branches that have enabled
+    /// the stream via [`Branch::set_event_config`](crate::Branch::set_event_config).
     ///
-    /// The logger captures guest registers and device-state hashes at each
-    /// covered exit; diffing two runs' streams pinpoints where execution
-    /// diverged. `entry` borrows from the kernel-mapped log buffer for the
-    /// duration of the `on_event` call — copy out if the sink needs to
-    /// retain it.
-    ExitLogged {
+    /// Inspect the kind/payload with [`record.event()`](bedrock_vm::EventRecord::event)
+    /// or serialize it with [`record.to_json()`](bedrock_vm::EventRecord::to_json).
+    /// `record` borrows from the kernel-mapped event buffer for the duration of
+    /// the `on_event` call — copy out if the sink needs to retain it.
+    Record {
         branch: BranchId,
-        entry: &'a LogEntry,
+        record: EventRecord<'a>,
     },
 }
 
@@ -119,36 +120,26 @@ pub(crate) struct PartialLine {
     pub(crate) start_tsc: u64,
 }
 
-/// Drain `serial_len` bytes from `vm`'s serial buffer, split them into
-/// complete lines using per-line TSC metadata for accurate start timestamps,
-/// and forward each completed line to `sink`. Bytes that don't terminate in
-/// `\n` accumulate onto `partial` until a future drain completes them.
-pub(crate) fn drain_serial_into_sink(
-    vm: &Vm,
-    serial_len: usize,
-    exit_at: VirtTime,
+/// Feed one `Serial` event record's bytes through the per-branch line
+/// reassembler, emitting one [`Event::SerialLine`] per `\n`-terminated line.
+///
+/// The kernel accumulates a console line and emits it as one `Serial` record
+/// stamped with the emulated TSC of its *first* byte, so a fresh line takes the
+/// record's TSC as its start time; a line continued from an earlier record (a
+/// line longer than the kernel's accumulator, split across records) keeps the
+/// earlier start TSC. Bytes not yet terminated by `\n` stay in `partial` until
+/// a later record completes them.
+pub(crate) fn serial_record_into_sink(
+    bytes: &[u8],
+    record_tsc: u64,
+    freq: u64,
     branch: BranchId,
     sink: &dyn EventSink,
     partial: &mut PartialLine,
 ) {
-    if serial_len == 0 {
-        return;
-    }
-    let serial_bytes = &vm.serial_buffer()[..serial_len];
-    let line_entries = parse_line_tsc_entries(vm.serial_tsc_buffer()).unwrap_or_default();
-    let freq = exit_at.frequency();
-    let fallback_tsc = exit_at.instructions();
-    let mut next_entry = 0usize;
-    for (i, &byte) in serial_bytes.iter().enumerate() {
+    for &byte in bytes {
         if partial.bytes.is_empty() {
-            while next_entry < line_entries.len() && (line_entries[next_entry].offset as usize) < i
-            {
-                next_entry += 1;
-            }
-            partial.start_tsc = match line_entries.get(next_entry) {
-                Some(e) if e.offset as usize == i => e.tsc,
-                _ => fallback_tsc,
-            };
+            partial.start_tsc = record_tsc;
         }
         if byte == b'\n' {
             let at = VirtTime::from_instructions(partial.start_tsc, freq);
@@ -160,6 +151,24 @@ pub(crate) fn drain_serial_into_sink(
             partial.bytes.clear();
         } else {
             partial.bytes.push(byte);
+        }
+    }
+}
+
+/// Feed every `Serial` record in a drained event buffer through
+/// [`serial_record_into_sink`]. Used by the root-boot loop, which has no other
+/// per-record handling; a live [`Branch`](crate::Branch) inlines the same call
+/// into its single event drain so it can also forward non-serial records.
+pub(crate) fn drain_serial_events(
+    drained: &[u8],
+    freq: u64,
+    branch: BranchId,
+    sink: &dyn EventSink,
+    partial: &mut PartialLine,
+) {
+    for record in EventStream::new(drained) {
+        if record.kind() == EventKind::Serial.as_u16() {
+            serial_record_into_sink(record.payload, record.tsc(), freq, branch, sink, partial);
         }
     }
 }

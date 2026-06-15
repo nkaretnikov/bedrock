@@ -8,7 +8,7 @@
 //! - VM creation (root and forked with copy-on-write)
 //! - Memory mapping of guest physical memory
 //! - Register access via ioctls
-//! - Deterministic execution (RDRAND emulation, TSC control, logging)
+//! - Deterministic execution (RDRAND emulation, TSC control, event capture)
 //! - Proper cleanup on drop
 //!
 //! # Creating a VM with VmBuilder
@@ -16,12 +16,11 @@
 //! The recommended way to create VMs is using [`VmBuilder`]:
 //!
 //! ```ignore
-//! use bedrock_vm::{VmBuilder, RdrandConfig, LogConfig};
+//! use bedrock_vm::{VmBuilder, RdrandConfig};
 //!
 //! let mut vm = VmBuilder::new()
 //!     .memory_mb(64)
 //!     .rdrand(RdrandConfig::seeded_rng(0xdeadbeef))
-//!     .logging(LogConfig::all_exits(0))
 //!     .build()?;
 //!
 //! // Write code to guest memory
@@ -64,17 +63,14 @@
 //! loop {
 //!     let exit = vm.run()?;
 //!
-//!     // Handle serial output
-//!     if exit.serial_len > 0 {
-//!         print!("{}", vm.serial_output_str(exit.serial_len as usize));
-//!     }
-//!
+//!     // Guest serial output arrives as `Serial` records in the event buffer
+//!     // (`buffer[0..exit.event_len]`); see the `events` module.
 //!     match exit.kind() {
 //!         ExitKind::VmcallShutdown => {
 //!             println!("Clean shutdown");
 //!             break;
 //!         }
-//!         ExitKind::Continue | ExitKind::LogBufferFull => continue,
+//!         ExitKind::Continue | ExitKind::EventBufferFull => continue,
 //!         kind => {
 //!             println!("Unexpected exit: {:?}", kind);
 //!             break;
@@ -97,49 +93,52 @@
 //! let config = RdrandConfig::exit_to_userspace();
 //! ```
 //!
-//! # Logging and Debugging
+//! # Capturing exits via the event stream
 //!
-//! Enable exit logging for debugging:
+//! `Exit` records are part of the unified event stream. Enable the stream with
+//! the [`EXIT`](EventCategories::EXIT) category and an [`ExitTrigger`]:
 //!
 //! ```ignore
-//! use bedrock_vm::LogConfig;
+//! use bedrock_vm::{EventCategories, EventConfig, ExitTrigger};
 //!
-//! // Log all exits
-//! let config = LogConfig::all_exits(0);
+//! // Capture every exit:
+//! let config = EventConfig::enabled(EventCategories::EXIT)
+//!     .with_exit_trigger(ExitTrigger::AllExits, 0);
 //!
-//! // Log only at specific TSC
-//! let config = LogConfig::at_tsc(target_tsc);
+//! // Capture one record at a target TSC:
+//! let config = EventConfig::enabled(EventCategories::EXIT)
+//!     .with_exit_trigger(ExitTrigger::AtTsc, target_tsc);
 //!
-//! // Log at regular intervals
-//! let config = LogConfig::checkpoints(interval);
+//! // Capture checkpoints at regular intervals:
+//! let config = EventConfig::enabled(EventCategories::EXIT)
+//!     .with_exit_trigger(ExitTrigger::Checkpoints, interval);
 //!
-//! // Single-step through a TSC range
-//! let vm = VmBuilder::new()
-//!     .single_step(start_tsc, end_tsc)
-//!     .logging(LogConfig::tsc_range())
-//!     .build()?;
+//! vm.set_event_config(&config)?;
 //! ```
 
 pub mod boot;
 mod builder;
 mod error;
-mod logging;
+pub mod events;
+pub mod io_channel;
 mod rdrand;
 mod registers;
 mod vm;
 
+pub use bedrock_vmx::exit_record::{ExitRecord, EXIT_RECORD_FLAG_DETERMINISTIC, EXIT_RECORD_SIZE};
 pub use boot::{load_kernel, LinuxBootConfig, LinuxBootInfo};
 pub use builder::VmBuilder;
 pub use error::VmError;
-pub use logging::{
-    write_jsonl, write_jsonl_file, LogEntry, LOG_ENTRY_FLAG_DETERMINISTIC, LOG_ENTRY_SIZE,
-    MAX_LOG_ENTRIES,
+pub use events::{
+    category_of, write_jsonl as write_events_jsonl,
+    write_jsonl_filtered as write_events_jsonl_filtered, Event, EventBody, EventCategories,
+    EventJson, EventRecord, EventStream,
 };
 pub use rdrand::{RdrandConfig, RdrandExitInfo, RdrandMode, RdrandValue};
 pub use registers::*;
 pub use vm::{
-    parse_line_tsc_entries, ExitKind, ExitStatEntry, ExitStats, ExitStatsReport,
-    FeedbackBufferInfo, IoctlStats, LineTscEntry, LogConfig, LogMode, SingleStepConfig, Vm, VmExit,
-    BEDROCK_DEVICE_PATH, DEFAULT_MEMORY_SIZE, DEFAULT_TSC_FREQUENCY, EXIT_REASON_CHECKPOINT,
-    LOG_BUFFER_SIZE, MAX_FEEDBACK_BUFFERS, SERIAL_BUFFER_SIZE,
+    EventConfig, ExitKind, ExitStatEntry, ExitStats, ExitStatsReport, ExitTrigger,
+    FeedbackBufferInfo, IoctlStats, SingleStepConfig, Vm, VmExit, BEDROCK_DEVICE_PATH,
+    DEFAULT_MEMORY_SIZE, DEFAULT_TSC_FREQUENCY, EVENT_BUFFER_SIZE, EXIT_REASON_CHECKPOINT,
+    MAX_FEEDBACK_BUFFERS,
 };

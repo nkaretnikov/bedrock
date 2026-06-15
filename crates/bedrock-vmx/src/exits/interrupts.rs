@@ -78,6 +78,21 @@ pub fn check_apic_timer<C: VmContext>(ctx: &mut C) {
         // One-shot: stop timer
         apic.timer_deadline = 0;
     }
+
+    // Record the injection on the event stream. `target_tsc` is the deadline
+    // this firing was scheduled for; pairing it with the header's actual emit
+    // tsc (== current_tsc) exposes scheduled-vs-delivered drift — the key
+    // signal for interrupt-timing divergence. Buffer-full is handled centrally
+    // by the exit dispatcher, so the return value is ignored.
+    let payload = InjectPayload {
+        vector,
+        source: InjectSource::Timer as u8,
+        _pad: [0; 6],
+        target_tsc: timer_deadline,
+    };
+    let _ = ctx
+        .state_mut()
+        .event_append(EventKind::Inject, payload.as_bytes());
 }
 
 /// Check whether an I/O channel request is queued and not yet delivered to
@@ -125,6 +140,19 @@ pub fn check_io_channel<C: VmContext>(ctx: &mut C) {
 
     ioapic_deliver_irq(ctx, IO_CHANNEL_IRQ);
     ctx.state_mut().io_channel.request_delivered = true;
+
+    // Record the request-signal on the event stream. Its own category so the
+    // request firing (a determinism-relevant point) is capturable without the
+    // heavyweight `Exit` capture. The metadata is followed by the actual request
+    // bytes (the injected command); `target_tsc` is the scheduled request target;
+    // `status`/`exit_code` are 0 on a request. Buffer-full handled centrally.
+    let target_tsc = ctx.state().io_channel.request_target_tsc;
+    let payload = IoChannelPayload {
+        phase: IoChannelPhase::Request as u8,
+        _pad: [0; 7],
+        target_tsc,
+    };
+    let _ = ctx.state_mut().event_emit_io_channel(&payload);
 }
 
 /// Calculate APIC timer divisor from the Divide Configuration Register (DCR).

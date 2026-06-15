@@ -38,7 +38,6 @@ EXIT_REASONS = {
     57: "RDRAND",
     61: "RDSEED",
     256: "NEED_RESCHED",
-    257: "LOG_BUFFER_FULL",
     258: "VMCALL_SHUTDOWN",
     259: "STOP_TSC_REACHED",
     260: "VMCALL_SNAPSHOT",
@@ -110,14 +109,29 @@ def fmt_entry_short(e, prefix=""):
     return f"{prefix}tsc={e['tsc']}  exit={e['exit_reason']}({reason})  rip={hex(e['rip'])}  eq={e['exit_qualification']}"
 
 
-def load_jsonl(path):
-    entries = []
+def load_exit_records(path):
+    """Read an event-stream JSONL file and split its `exit` records by
+    determinism.
+
+    Returns `(deterministic, non_deterministic)`, two lists of exit-record dicts
+    (each record's `data` payload). Non-exit events (serial, randomness, ...)
+    are ignored.
+    """
+    det, nondet = [], []
     with open(path) as f:
         for line in f:
             line = line.strip()
-            if line:
-                entries.append(json.loads(line))
-    return entries
+            if not line:
+                continue
+            ev = json.loads(line)
+            if ev.get("kind") != "exit":
+                continue
+            entry = ev.get("data", {})
+            if ev.get("deterministic"):
+                det.append(entry)
+            else:
+                nondet.append(entry)
+    return det, nondet
 
 
 def find_nondeterm_in_window(nondeterm_entries, tsc_start, tsc_end):
@@ -147,14 +161,14 @@ def main():
     ref_dir = os.path.join(test_dir, ref_name)
     bad_dir = os.path.join(test_dir, bad_name)
 
-    # Load deterministic exit logs
-    ref_log = os.path.join(ref_dir, "exit-log.jsonl")
-    bad_log = os.path.join(bad_dir, "exit-log.jsonl")
+    # Load exit records from the event stream and split by determinism.
+    ref_events = os.path.join(ref_dir, "events.jsonl")
+    bad_events = os.path.join(bad_dir, "events.jsonl")
 
-    print(f"Loading {ref_log}...")
-    ref_entries = load_jsonl(ref_log)
-    print(f"Loading {bad_log}...")
-    bad_entries = load_jsonl(bad_log)
+    print(f"Loading {ref_events}...")
+    ref_entries, ref_nondeterm = load_exit_records(ref_events)
+    print(f"Loading {bad_events}...")
+    bad_entries, bad_nondeterm = load_exit_records(bad_events)
 
     print(f"REF: {len(ref_entries)} deterministic exits")
     print(f"BAD: {len(bad_entries)} deterministic exits")
@@ -190,7 +204,7 @@ def main():
 
     if diverge_idx is None:
         if len(ref_entries) == len(bad_entries):
-            print("Deterministic exit logs are identical.")
+            print("Deterministic exit records are identical.")
             return
         else:
             print(f"Logs match for {min_len} entries but differ in length: "
@@ -257,26 +271,16 @@ def main():
 
     tsc_end += args.nondeterm_window
 
-    # Load and show non-determ exits in the window
-    ref_nd_path = os.path.join(ref_dir, "exit-log-nondeterm.jsonl")
-    bad_nd_path = os.path.join(bad_dir, "exit-log-nondeterm.jsonl")
-
-    has_nondeterm = os.path.exists(ref_nd_path) or os.path.exists(bad_nd_path)
-    if not has_nondeterm:
-        print("No non-deterministic exit logs found.")
+    # Show non-determ exits (from the same event stream) in the window.
+    if not ref_nondeterm and not bad_nondeterm:
+        print("No non-deterministic exits in the event stream.")
         return
 
     print(f"=== NON-DETERMINISTIC EXITS in TSC window [{tsc_start}, {tsc_end}] ===")
     print()
 
-    for label, nd_path in [("REF", ref_nd_path), ("BAD", bad_nd_path)]:
-        if not os.path.exists(nd_path):
-            print(f"  {label}: no non-determ log")
-            continue
-
-        nd_entries = load_jsonl(nd_path)
+    for label, nd_entries in [("REF", ref_nondeterm), ("BAD", bad_nondeterm)]:
         window = find_nondeterm_in_window(nd_entries, tsc_start, tsc_end)
-
         print(f"  {label}: {len(window)} non-determ exits in window "
               f"({len(nd_entries)} total)")
         for e in window:
@@ -286,10 +290,7 @@ def main():
     # Summary of non-determ exit type counts
     print("=== NON-DETERM EXIT SUMMARY (full run) ===")
     print()
-    for label, nd_path in [("REF", ref_nd_path), ("BAD", bad_nd_path)]:
-        if not os.path.exists(nd_path):
-            continue
-        nd_entries = load_jsonl(nd_path)
+    for label, nd_entries in [("REF", ref_nondeterm), ("BAD", bad_nondeterm)]:
         counts = {}
         for e in nd_entries:
             reason = exit_name(e["exit_reason"], e.get("exit_qualification"))

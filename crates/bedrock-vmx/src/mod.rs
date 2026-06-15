@@ -11,12 +11,13 @@ mod compat;
 mod cow;
 mod decoder;
 mod devices;
+mod events;
+mod exit_record;
 mod exits;
 mod fields;
 mod handler;
 mod host;
 mod hypercalls;
-mod logging;
 mod prelude;
 pub mod registers;
 mod timing;
@@ -38,7 +39,7 @@ pub use traits::{
 pub use cow::CowPageMap;
 pub use vm::{ForkableVm, ForkedVm, ParentVm, RootVm};
 pub use vm_state::{
-    EnqueueResult, FeedbackBufferInfo, LogMode, PendingIoAction, VmState,
+    EnqueueResult, ExitTrigger, FeedbackBufferInfo, PendingIoAction, VmState,
     FEEDBACK_BUFFER_ID_MAX_LEN, MAX_FEEDBACK_BUFFERS,
 };
 
@@ -50,3 +51,6 @@ pub use exits::ExitReason;
 
 // Device emulation types
 pub use devices::RdrandMode;
+
+// Event stream (wire-format types shared with userspace)
+pub use events::{EventCategories, EventKind, EVENT_BUFFER_SIZE};

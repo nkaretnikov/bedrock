@@ -270,26 +270,6 @@ int bedrock_remap_vmalloc_range(struct vm_area_struct *vma, void *addr,
 EXPORT_SYMBOL_GPL(bedrock_remap_vmalloc_range);
 
 /*
- * Map a single page into a userspace VMA.
- * This wraps remap_pfn_range() for a single page.
- *
- * The page should be allocated via alloc_page() or similar.
- *
- * Returns: 0 on success, negative error code on failure.
- */
-int bedrock_remap_page(struct vm_area_struct *vma, struct page *page)
-{
-	unsigned long pfn = page_to_pfn(page);
-	unsigned long size = vma->vm_end - vma->vm_start;
-
-	/* Mark VMA as IO memory to prevent merging and other issues */
-	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
-
-	return remap_pfn_range(vma, vma->vm_start, pfn, size, vma->vm_page_prot);
-}
-EXPORT_SYMBOL_GPL(bedrock_remap_page);
-
-/*
  * Map multiple (potentially non-contiguous) physical pages into a userspace VMA.
  *
  * This function maps an array of host physical addresses to a contiguous

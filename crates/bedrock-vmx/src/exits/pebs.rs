@@ -121,7 +121,7 @@ pub struct PebsState {
     /// (`target_tsc - PEBS_MARGIN`, not the final interrupt deadline).
     /// Used to compute the PEBS skid (`current_tsc - armed_target_tsc`,
     /// where `current_tsc = last_instruction_count + tsc_offset`) recorded
-    /// on the EPT_VIOLATION_PEBS entry in the non-deterministic exit log
+    /// on the EPT_VIOLATION_PEBS entry in the non-deterministic exit records
     /// so userspace can see how far each PEBS exit landed from its programmed
     /// firing point. Only meaningful while `armed_action.is_some()`.
     pub armed_target_tsc: u64,

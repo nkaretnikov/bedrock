@@ -11,47 +11,44 @@
  * but runs the slow `call_usermodehelper` (podman exec) outside the
  * lock — so many long-running guest commands overlap.
  *
- * Three actions are implemented for now:
- *   ACTION_GET_WORKLOAD_DETAILS — lists each running container; for
- *                                 every container also enumerates the
- *                                 executables under `/opt/bedrock/drivers/`
- *                                 so a fuzzer can pick (container, driver)
- *                                 invocation targets.
- *   ACTION_EXEC_BASH            — runs `podman exec <container> /bin/sh -c <cmd>`
- *   ACTION_EXEC_HOST_BASH       — runs `/bin/sh -c <cmd>` directly on the
- *                                 guest, outside any container
- *
- * GetWorkloadDetails response format — every line is one record with
- * exactly two tab-separated fields, parseable by a single
- * `split('\t', 1)` per line:
- *
- *   <container>\t              — header line: this container exists
- *                                (driver field empty). Always emitted
- *                                once per container, even when the
- *                                container has driver entries below.
- *   <container>\t<driver-path> — one such line per executable found
- *                                under `/opt/bedrock/drivers/` inside
- *                                <container>.
- *
- * Output is sorted (container names alphabetically, drivers within each
- * container alphabetically) so identical guest state yields identical
- * bytes — important for the determinism log.
+ * The channel does exactly one thing: run a bash command. The request
+ * names a target (a container, or the host itself when the container
+ * field is empty) and a command, and a flag says whether to record the
+ * command's output.
  *
  * Wire format on the shared page (both directions reuse the same 4KB):
  *
- *   request:  u32 magic | u32 action_id | u32 payload_len | u8 payload[]
- *   response: u32 magic | u32 action_id | i32 status | i32 exit_code | u32 data_len | u8 data[]
+ *   request:  u32 magic | u32 flags | u32 payload_len | u8 payload[]
+ *   response: u32 magic | u32 flags | i32 status | i32 exit_code | u32 output_len
  *
- * The response's `action_id` mirrors the request's so the host CLI
- * can dispatch on it without tracking expected response order.
+ * The request payload is two NUL-terminated strings back to back:
+ * "<container>\0<cmd>\0". An empty <container> means "run on the host"
+ * (`/bin/sh -c <cmd>`); otherwise the command runs via
+ * `podman exec <container> /bin/sh -c <cmd>`.
  *
- * For ACTION_EXEC_BASH the payload is two NUL-terminated strings back to
- * back: "<container>\0<cmd>\0". For ACTION_EXEC_HOST_BASH the payload is a
- * single NUL-terminated string: "<cmd>\0".
+ * The command's combined stdout+stderr always flows into journald via
+ * systemd-cat, so it is observable on the serial/journal path regardless
+ * of recording. The IO_FLAG_RECORD_OUTPUT request flag additionally
+ * captures it for the host:
  *
- * Each parallel worker uses a unique /tmp/bedrock-io-output-<id> file to
- * avoid racing on the shared OUTPUT_PATH that the single-worker version
- * relied on.
+ *   - set:   the output is `tee`'d into a per-worker temp file on its way
+ *            to systemd-cat, then copied into the dedicated output
+ *            *feedback buffer* (registered once at init under
+ *            OUTPUT_BUFFER_ID) and its length reported in the response's
+ *            `output_len`. The host reads the bytes back through the
+ *            feedback-buffer mechanism. The copy into the shared output
+ *            buffer happens under the page mutex, immediately before
+ *            PUT_RESPONSE, so concurrent workers can't clobber each
+ *            other's bytes before the host reads them at the (serialised)
+ *            response exit.
+ *   - clear: nothing is captured for the host; `output_len` stays 0.
+ *
+ * `set -o pipefail` is prepended so the exit status reflects the command
+ * (not the trailing tee / systemd-cat), and the host-bound `exit_code` is
+ * meaningful in both modes.
+ *
+ * Each parallel worker uses a unique /tmp/bedrock-io-output-<id> file so
+ * concurrent recorded commands don't race on a shared capture path.
  */
 
 #include <linux/atomic.h>
@@ -68,11 +65,13 @@
 #include <linux/string.h>
 #include <linux/types.h>
 #include <linux/umh.h>
+#include <linux/vmalloc.h>
 #include <linux/workqueue.h>
 
-#define HYPERCALL_IO_REGISTER_PAGE 4ULL
-#define HYPERCALL_IO_GET_REQUEST   5ULL
-#define HYPERCALL_IO_PUT_RESPONSE  6ULL
+#define HYPERCALL_REGISTER_FEEDBACK_BUFFER 2ULL
+#define HYPERCALL_IO_REGISTER_PAGE         4ULL
+#define HYPERCALL_IO_GET_REQUEST           5ULL
+#define HYPERCALL_IO_PUT_RESPONSE          6ULL
 
 /*
  * Pin number must match `IO_CHANNEL_IRQ` on the hypervisor side and the MP
@@ -85,32 +84,40 @@
 #define IO_REQUEST_MAGIC  0xB10C1010U
 #define IO_RESPONSE_MAGIC 0x1010B10CU
 
-#define ACTION_GET_WORKLOAD_DETAILS 0U
-#define ACTION_EXEC_BASH            1U
-#define ACTION_EXEC_HOST_BASH       2U
+/* Request flag: capture combined stdout+stderr into the output feedback
+ * buffer instead of routing it to the guest journal. Must match
+ * `bedrock_vm::io_channel::IO_FLAG_RECORD_OUTPUT`. */
+#define IO_FLAG_RECORD_OUTPUT 0x1U
+
+/* Identifier the host reads recorded command output under; must match
+ * `bedrock_vm::io_channel::IO_OUTPUT_BUFFER_ID`. */
+#define OUTPUT_BUFFER_ID "bedrock-io-output"
+/* Capacity of the command-output feedback buffer (<= the hypervisor's
+ * FEEDBACK_BUFFER_MAX_PAGES * 4096 = 1 MB). */
+#define BEDROCK_IO_OUTPUT_SIZE (256U * 1024U)
 
 #define OUTPUT_PATH_FMT "/tmp/bedrock-io-output-%u"
 #define OUTPUT_PATH_MAX 64
 
 struct io_request_header {
 	__u32 magic;
-	__u32 action_id;
+	__u32 flags;
 	__u32 payload_len;
 };
 
 struct io_response_header {
 	__u32 magic;
-	__u32 action_id;
+	__u32 flags;
 	__s32 status;
 	__s32 exit_code;
-	__u32 data_len;
+	__u32 output_len;
 };
 
 /*
  * Per-work-item state. Allocated by the IRQ handler (GFP_ATOMIC) and
  * freed by the work function. The `id` is used to mint a unique
- * /tmp/bedrock-io-output-<id> file so parallel workers don't clobber
- * each other's command output.
+ * /tmp/bedrock-io-output-<id> file so parallel recorded commands don't
+ * clobber each other's captured output.
  */
 struct bedrock_io_work {
 	struct work_struct work;
@@ -118,9 +125,15 @@ struct bedrock_io_work {
 };
 
 static void *shared_page;
+/* Dedicated feedback buffer holding the most recent recorded command's
+ * combined stdout+stderr. Registered once at init; written under
+ * `page_mutex` right before PUT_RESPONSE so the host reads a consistent
+ * snapshot at each response exit. */
+static __u8 *output_buf;
 static struct workqueue_struct *io_wq;
-/* Serialises access to `shared_page` for the VMCALL handshakes only —
- * the slow call_usermodehelper / kernel_read runs outside the lock. */
+/* Serialises access to `shared_page` and `output_buf` for the VMCALL
+ * handshakes only — the slow call_usermodehelper / file read runs outside
+ * the lock. */
 static DEFINE_MUTEX(page_mutex);
 /* Monotonically-increasing worker ID used for per-worker output files.
  * Wrapping is fine (any concurrent collisions would have to be ~4B
@@ -133,9 +146,7 @@ static atomic_t worker_counter = ATOMIC_INIT(0);
  * `request_delivered = true`, so no GET_REQUEST is ever issued and the
  * in-flight slot sticks forever. mempool_alloc(GFP_ATOMIC) returns from
  * the reserve when the page allocator can't satisfy the request, which
- * is exactly the regime we have to survive deterministically. Size is
- * generous relative to the I/O queue depth we drive in practice
- * (single-digit concurrent commands). */
+ * is exactly the regime we have to survive deterministically. */
 #define BEDROCK_IO_WORK_POOL_MIN 16
 static mempool_t *work_pool;
 
@@ -167,6 +178,19 @@ static inline __u64 vmcall0(__u64 nr)
 	return result;
 }
 
+/* Four-argument VMCALL (RBX/RCX/RDX/RSI) — used to register the output
+ * feedback buffer. */
+static inline __u64 vmcall4(__u64 nr, __u64 a1, __u64 a2, __u64 a3, __u64 a4)
+{
+	__u64 result;
+
+	asm volatile("vmcall"
+		     : "=a"(result)
+		     : "a"(nr), "b"(a1), "c"(a2), "d"(a3), "S"(a4)
+		     : "memory");
+	return result;
+}
+
 /*
  * IRQ handler — runs in hardirq context, must not block. Just allocate a
  * per-request work struct and queue it to the unbounded workqueue, then
@@ -177,7 +201,7 @@ static irqreturn_t bedrock_io_irq_handler(int irq, void *dev_id);
 
 /*
  * Read `path` into `out` up to `cap` bytes; returns bytes read or a
- * negative errno. Partial reads pass through — the response payload is
+ * negative errno. Partial reads pass through — the recorded output is
  * truncated stdout, which is fine for the MVP.
  */
 static ssize_t read_output_file(const char *path, __u8 *out, size_t cap)
@@ -238,8 +262,8 @@ static int append_shell_quoted(char *dst, size_t cap, size_t *off,
  * Append a NUL-terminated literal to `dst[*off..cap]`. Returns 0 on
  * success and updates `*off`; returns -ENAMETOOLONG if the literal
  * doesn't fit. Trusted-input cousin of `append_shell_quoted` for the
- * fixed shell scaffolding (`podman exec `, ` /bin/sh -c `,
- * ` > … 2>&1`).
+ * fixed shell scaffolding (`podman exec `, ` /bin/sh -c `, the redirect /
+ * journal-pipe suffix).
  */
 static int append_literal(char *dst, size_t cap, size_t *off,
 			  const char *src)
@@ -261,7 +285,7 @@ static int append_literal(char *dst, size_t cap, size_t *off,
  * the basename of the first whitespace-delimited token. Examples:
  *
  *   "bitcoin-cli getblockchaininfo"        → "bitcoin-cli"
- *   "/opt/bedrock/drivers/dummy --arg"     → "dummy"
+ *   "/usr/local/bin/bedrock-miner --arg"   → "bedrock-miner"
  *   "podman stop bitcoind1"                → "podman"
  *
  * The result becomes SYSLOG_IDENTIFIER and what the journalctl-side
@@ -313,131 +337,41 @@ static int extract_command_name(const char *cmd, char *out, size_t cap)
 }
 
 /*
- * Append the trailing journal-pipe suffix used by every exec action.
- * Builds:
- *
- *   2>&1 | systemd-cat -t <tag>
- *
- * so the command's combined stdout+stderr lands in journald with
- * SYSLOG_IDENTIFIER=<tag> and shows up in the init script's
- * `journalctl -f` formatter as `[<tag>] | <line>`. The shell's
- * `set -o pipefail` (prepended by `build_command`) makes the
- * pipeline's exit status fall back to the failing command's, so the
- * host-bound `exit_code` still reflects whether the action itself
- * succeeded — even though no output bytes flow back through the I/O
- * response. `tag` is the short command name from
- * `extract_command_name`; it's shell-quoted defensively because the
- * extractor doesn't restrict character classes.
- */
-static int append_pipe_to_journal(char *cmd, size_t cmd_cap, size_t *off,
-				  const char *tag)
-{
-	int err;
-
-	err = append_literal(cmd, cmd_cap, off, " 2>&1 | systemd-cat -t ");
-	if (err)
-		return err;
-	return append_shell_quoted(cmd, cmd_cap, off, tag);
-}
-
-/*
  * Build the shell command that will run inside call_usermodehelper.
- * Two output paths:
  *
- *   - ACTION_GET_WORKLOAD_DETAILS captures stdout+stderr to
- *     `output_path` so the worker can read it back into the I/O
- *     response payload; the host needs the structured workload list
- *     (e.g. to pick fuzz targets).
- *   - Exec actions pipe stdout+stderr straight into `systemd-cat`,
- *     so journald owns the output and the host-bound response carries
- *     just an exit code (no payload bytes). `set -o pipefail` is
- *     prepended so the pipeline's exit status falls back to the exec
- *     command's failure instead of always being systemd-cat's zero.
+ * `container` is the (possibly empty) target container; an empty string
+ * runs the command directly on the host. `command` is the guest-supplied
+ * bash command. Both are single-quote-escaped before being spliced into
+ * the wrapper so a stray `'` can't break out of it.
  *
- * `output_path` is per-worker so concurrent ACTION_GET_WORKLOAD_DETAILS
- * invocations don't race on a shared file; exec actions don't touch it.
+ * Combined stdout+stderr always flows into journald via `systemd-cat`, so
+ * the output is observable on the serial/journal path regardless of
+ * recording. When `record` is set, the output is additionally `tee`'d into
+ * the per-worker capture file on the way, so the worker can read it back
+ * into the output feedback buffer.
  *
- * Emits a pr_info trace identifying the action and its parameters,
- * tagged with `worker_id`, so concurrent workers can be followed in
- * the kernel log.
+ * `set -o pipefail` keeps the pipeline exit status reflective of the inner
+ * command (not `tee` / `systemd-cat`). Emits a pr_info trace tagged with
+ * `worker_id`.
  *
  * Returns 0 on success, negative on a malformed request.
  */
-static int build_command(const struct io_request_header *hdr,
-			 const __u8 *payload, char *cmd, size_t cmd_cap,
+static int build_command(const char *container, const char *command,
+			 bool record, char *cmd, size_t cmd_cap,
 			 const char *output_path, unsigned int worker_id)
 {
-	switch (hdr->action_id) {
-	case ACTION_GET_WORKLOAD_DETAILS:
-		pr_info("bedrock-io: worker %u: list\n", worker_id);
-		/*
-		 * For each running container, emit one `<container>\t` header
-		 * line, then one `<container>\t<driver>` line per executable
-		 * found under `/opt/bedrock/drivers/` inside that container.
-		 * Every output line therefore has the same shape (two
-		 * tab-separated fields) which a consumer can parse with a
-		 * single split per line — no state carried between lines.
-		 *
-		 * `-perm -100` matches files with at least user-execute
-		 * (POSIX-portable, no `-executable` dependency on BusyBox
-		 * version). Sorting at both levels (container names and
-		 * drivers within each container) keeps the output
-		 * byte-identical across runs with the same workload set,
-		 * which bedrock's determinism log compares.
-		 *
-		 * Inner `2>/dev/null` swallows `find`'s errors when
-		 * `/opt/bedrock/drivers` is absent in a container; outer
-		 * `2>/dev/null` does the same for `podman exec` against a
-		 * non-running container.
-		 */
-		snprintf(cmd, cmd_cap,
-			 "podman ps --format '{{.Names}}' 2>/dev/null | sort | "
-			 "while IFS= read -r c; do "
-			 "printf '%%s\\t\\n' \"$c\"; "
-			 "podman exec \"$c\" sh -c "
-			 "'find /opt/bedrock/drivers -type f -perm -100 2>/dev/null | sort' "
-			 "2>/dev/null | "
-			 "while IFS= read -r f; do "
-			 "printf '%%s\\t%%s\\n' \"$c\" \"$f\"; "
-			 "done; "
-			 "done > %s 2>&1",
-			 output_path);
-		return 0;
-	case ACTION_EXEC_BASH: {
-		const char *container = (const char *)payload;
-		size_t clen;
-		const char *bash_cmd;
-		size_t blen;
-		size_t off = 0;
-		int err;
+	size_t off = 0;
+	int err;
 
-		if (hdr->payload_len == 0)
-			return -EINVAL;
-		clen = strnlen(container, hdr->payload_len);
-		if (clen == hdr->payload_len)
-			return -EINVAL;
-		bash_cmd = container + clen + 1;
-		blen = strnlen(bash_cmd, hdr->payload_len - clen - 1);
-		if (blen == hdr->payload_len - clen - 1)
-			return -EINVAL;
+	pr_info("bedrock-io: worker %u: exec target=%s record=%d cmd='%s'\n",
+		worker_id, *container ? container : "host", record, command);
 
-		pr_info("bedrock-io: worker %u: exec '%s' '%s'\n",
-			worker_id, container, bash_cmd);
+	err = append_literal(cmd, cmd_cap, &off, "set -o pipefail; ");
+	if (err)
+		return err;
 
-		/*
-		 * `podman exec ... /bin/sh -c <cmd>` lets the caller supply
-		 * arbitrary shell expressions (pipes, redirects). The outer
-		 * `/bin/sh -c "<full>"` is the call_usermodehelper wrapper.
-		 * Combined stdout+stderr is piped into systemd-cat (see
-		 * `append_pipe_to_journal`) so journald receives the output;
-		 * `set -o pipefail` keeps the pipeline's exit reflective of
-		 * the inner command. `container` and `bash_cmd` are
-		 * guest-supplied so they get single-quote-escaped via
-		 * `append_shell_quoted` — a `'` in either would otherwise
-		 * break out of the wrapper.
-		 */
-		err = append_literal(cmd, cmd_cap, &off,
-				     "set -o pipefail; podman exec ");
+	if (*container) {
+		err = append_literal(cmd, cmd_cap, &off, "podman exec ");
 		if (err)
 			return err;
 		err = append_shell_quoted(cmd, cmd_cap, &off, container);
@@ -446,76 +380,54 @@ static int build_command(const struct io_request_header *hdr,
 		err = append_literal(cmd, cmd_cap, &off, " /bin/sh -c ");
 		if (err)
 			return err;
-		err = append_shell_quoted(cmd, cmd_cap, &off, bash_cmd);
+	} else {
+		err = append_literal(cmd, cmd_cap, &off, "/bin/sh -c ");
 		if (err)
 			return err;
-		{
-			char cmd_name[64];
-			char tag[128];
-
-			err = extract_command_name(bash_cmd, cmd_name,
-						   sizeof(cmd_name));
-			if (err)
-				return err;
-			/* Append " [<container>]" so the formatter shows
-			 * which container each exec ran inside
-			 * (e.g. `[bitcoin-cli [bitcoind1]] | …`), matching
-			 * the " [host]" convention used by ACTION_EXEC_HOST_BASH. */
-			snprintf(tag, sizeof(tag), "%s [%s]", cmd_name, container);
-			return append_pipe_to_journal(cmd, cmd_cap, &off, tag);
-		}
 	}
-	case ACTION_EXEC_HOST_BASH: {
-		const char *bash_cmd = (const char *)payload;
-		size_t blen;
-		size_t off = 0;
-		int err;
+	err = append_shell_quoted(cmd, cmd_cap, &off, command);
+	if (err)
+		return err;
 
-		if (hdr->payload_len == 0)
-			return -EINVAL;
-		blen = strnlen(bash_cmd, hdr->payload_len);
-		if (blen == hdr->payload_len)
-			return -EINVAL;
+	/* Redirect combined stdout+stderr into the pipeline. */
+	err = append_literal(cmd, cmd_cap, &off, " 2>&1 | ");
+	if (err)
+		return err;
 
-		pr_info("bedrock-io: worker %u: exec-host '%s'\n",
-			worker_id, bash_cmd);
-
-		/*
-		 * Run `/bin/sh -c <cmd>` directly on the guest — no
-		 * `podman exec` wrapper. Combined stdout+stderr is piped
-		 * into systemd-cat (see `append_pipe_to_journal`) so the
-		 * output lands in journald rather than being buffered for
-		 * the host. `set -o pipefail` keeps the pipeline's exit
-		 * reflective of the inner command. `bash_cmd` is
-		 * guest-supplied so it gets single-quote-escaped before
-		 * being spliced into the inner `-c` argument.
-		 */
-		err = append_literal(cmd, cmd_cap, &off,
-				     "set -o pipefail; /bin/sh -c ");
+	/* When recording, `tee` the output into the per-worker capture file
+	 * on its way to journald, so the worker can read it back into the
+	 * output feedback buffer. The path is module-generated (alnum + fixed
+	 * prefix), so it needs no shell quoting. */
+	if (record) {
+		err = append_literal(cmd, cmd_cap, &off, "tee ");
 		if (err)
 			return err;
-		err = append_shell_quoted(cmd, cmd_cap, &off, bash_cmd);
+		err = append_literal(cmd, cmd_cap, &off, output_path);
 		if (err)
 			return err;
-		{
-			char cmd_name[64];
-			char tag[80];
-
-			err = extract_command_name(bash_cmd, cmd_name,
-						   sizeof(cmd_name));
-			if (err)
-				return err;
-			/* Append " [host]" so the journal formatter can tell
-			 * host-side execs apart from in-container ones at a
-			 * glance (e.g. `[dummy [host]] | …`). */
-			snprintf(tag, sizeof(tag), "%s [host]", cmd_name);
-			return append_pipe_to_journal(cmd, cmd_cap, &off, tag);
-		}
+		err = append_literal(cmd, cmd_cap, &off, " | ");
+		if (err)
+			return err;
 	}
-	default:
-		pr_warn("bedrock-io: worker %u: unknown action_id=%u\n",
-			worker_id, hdr->action_id);
-		return -EINVAL;
+
+	/* Always pipe into journald via systemd-cat, so the output is visible
+	 * on the journal regardless of recording. */
+	{
+		char cmd_name[64];
+		char tag[128];
+
+		err = extract_command_name(command, cmd_name, sizeof(cmd_name));
+		if (err)
+			return err;
+		/* Tag with the command name and where it ran, so the journal
+		 * formatter shows e.g. `[bitcoin-cli [bitcoind1]] | …` or
+		 * `[dummy [host]] | …`. */
+		snprintf(tag, sizeof(tag), "%s [%s]", cmd_name,
+			 *container ? container : "host");
+		err = append_literal(cmd, cmd_cap, &off, "systemd-cat -t ");
+		if (err)
+			return err;
+		return append_shell_quoted(cmd, cmd_cap, &off, tag);
 	}
 }
 
@@ -528,13 +440,15 @@ static void bedrock_io_work_fn(struct work_struct *work)
 	__u64 req_len;
 	char *cmd = NULL;
 	char *payload_copy = NULL;
+	const char *container;
+	const char *command;
+	size_t clen;
+	bool record;
 	char output_path[OUTPUT_PATH_MAX];
 	char *argv[4];
 	int exit_code = 0;
 	ssize_t data_read = 0;
 	__s32 read_status = 0;
-	__u8 *resp_data;
-	size_t resp_data_cap;
 	int rc;
 	bool got_request = false;
 	static char *envp[] = {
@@ -552,9 +466,9 @@ static void bedrock_io_work_fn(struct work_struct *work)
 	/*
 	 * Phase 1: page-mutexed GET_REQUEST.
 	 *
-	 * We copy the request into local kthread storage so the lock can be
-	 * dropped before the slow call_usermodehelper call. That's what
-	 * lets long-running guest commands overlap: many workers can be in
+	 * Copy the request into local kthread storage so the lock can be
+	 * dropped before the slow call_usermodehelper. That's what lets
+	 * long-running guest commands overlap: many workers can be in
 	 * call_usermodehelper at once, but only one holds the page mutex at
 	 * any moment.
 	 */
@@ -596,56 +510,76 @@ static void bedrock_io_work_fn(struct work_struct *work)
 	got_request = true;
 	mutex_unlock(&page_mutex);
 
+	record = (req_hdr.flags & IO_FLAG_RECORD_OUTPUT) != 0;
+
+	/*
+	 * Parse the payload: "<container>\0<cmd>\0". An empty container
+	 * (leading NUL) means "run on the host".
+	 */
+	if (req_hdr.payload_len == 0) {
+		pr_err("bedrock-io: worker %u: empty request payload\n", w->id);
+		exit_code = -EINVAL;
+		goto respond;
+	}
+	container = payload_copy;
+	clen = strnlen(container, req_hdr.payload_len);
+	if (clen == req_hdr.payload_len) {
+		pr_err("bedrock-io: worker %u: unterminated container\n", w->id);
+		exit_code = -EINVAL;
+		goto respond;
+	}
+	command = container + clen + 1;
+	if (strnlen(command, req_hdr.payload_len - clen - 1) ==
+	    req_hdr.payload_len - clen - 1) {
+		pr_err("bedrock-io: worker %u: unterminated command\n", w->id);
+		exit_code = -EINVAL;
+		goto respond;
+	}
+
 	/*
 	 * Phase 2: build + run command (no lock held).
 	 *
-	 * Other workers can run their GET_REQUEST / PUT_RESPONSE during
-	 * this window; the only contention is for `shared_page`, which we
-	 * don't touch here.
+	 * Other workers can run their GET_REQUEST / PUT_RESPONSE during this
+	 * window; the only shared state is `shared_page` / `output_buf`,
+	 * which we don't touch here.
 	 */
-	rc = build_command(&req_hdr, (const __u8 *)payload_copy, cmd,
+	rc = build_command(container, command, record, cmd,
 			   BEDROCK_IO_PAGE_SIZE, output_path, w->id);
 	if (rc) {
 		pr_err("bedrock-io: worker %u: build_command failed: %d\n",
 		       w->id, rc);
 		exit_code = rc;
-	} else {
-		argv[0] = "/bin/sh";
-		argv[1] = "-c";
-		argv[2] = cmd;
-		argv[3] = NULL;
-		/*
-		 * call_usermodehelper starts the child with an empty
-		 * environment by default; we mirror the PATH the initrd's
-		 * init script exports so unqualified binaries resolve the
-		 * same way they would from an interactive guest shell.
-		 */
-		exit_code = call_usermodehelper("/bin/sh", argv, envp,
-						UMH_WAIT_PROC);
-		pr_info("bedrock-io: worker %u: command finished, exit=%d\n",
-			w->id, exit_code);
+		goto respond;
 	}
-
+	argv[0] = "/bin/sh";
+	argv[1] = "-c";
+	argv[2] = cmd;
+	argv[3] = NULL;
 	/*
-	 * Phase 3: page-mutexed PUT_RESPONSE.
+	 * call_usermodehelper starts the child with an empty environment by
+	 * default; we mirror the PATH the initrd's init script exports so
+	 * unqualified binaries resolve the same way they would from an
+	 * interactive guest shell.
+	 */
+	exit_code = call_usermodehelper("/bin/sh", argv, envp, UMH_WAIT_PROC);
+	pr_info("bedrock-io: worker %u: command finished, exit=%d\n",
+		w->id, exit_code);
+
+respond:
+	/*
+	 * Phase 3: page-mutexed copy-into-output-buffer + PUT_RESPONSE.
 	 *
-	 * Only ACTION_GET_WORKLOAD_DETAILS sends bytes back through the
-	 * I/O response — exec actions stream their output into journald
-	 * via systemd-cat, so the response for them is exit-code only
-	 * and `data_read` stays 0.
-	 *
-	 * `read_status` preserves any negative errno from
-	 * `read_output_file`; `data_read` is clamped to 0 so the
-	 * data_len field stays a valid byte count, but the original
-	 * error code reaches the host via `resp_hdr.status`.
+	 * For a recorded command, read the per-worker capture file straight
+	 * into the shared output feedback buffer, then PUT_RESPONSE — both
+	 * under `page_mutex` so a concurrent worker can't overwrite the
+	 * output buffer before the host reads it at this command's
+	 * (serialised) response exit. Non-recorded commands stream to
+	 * journald, so `output_len` stays 0 and the buffer is untouched.
 	 */
 	mutex_lock(&page_mutex);
-	resp_data = (__u8 *)shared_page + sizeof(resp_hdr);
-	resp_data_cap = BEDROCK_IO_PAGE_SIZE - sizeof(resp_hdr);
-	memset(resp_data, 0, resp_data_cap);
-	if (req_hdr.action_id == ACTION_GET_WORKLOAD_DETAILS) {
-		data_read = read_output_file(output_path, resp_data,
-					     resp_data_cap);
+	if (got_request && record) {
+		data_read = read_output_file(output_path, output_buf,
+					     BEDROCK_IO_OUTPUT_SIZE);
 		if (data_read < 0) {
 			pr_warn("bedrock-io: read_output_file(%s) failed: %zd\n",
 				output_path, data_read);
@@ -655,25 +589,23 @@ static void bedrock_io_work_fn(struct work_struct *work)
 	}
 
 	resp_hdr.magic = IO_RESPONSE_MAGIC;
-	resp_hdr.action_id = req_hdr.action_id;
+	resp_hdr.flags = req_hdr.flags;
 	resp_hdr.status = read_status;
 	resp_hdr.exit_code = (__s32)exit_code;
-	resp_hdr.data_len = (__u32)data_read;
+	resp_hdr.output_len = (__u32)data_read;
 	memcpy(shared_page, &resp_hdr, sizeof(resp_hdr));
 
-	vmcall1(HYPERCALL_IO_PUT_RESPONSE,
-		sizeof(resp_hdr) + (size_t)data_read);
+	vmcall1(HYPERCALL_IO_PUT_RESPONSE, sizeof(resp_hdr));
 	mutex_unlock(&page_mutex);
 
-	/* Unlink the per-worker temp file once the response has been
-	 * handed to the host. Only ACTION_GET_WORKLOAD_DETAILS writes to
-	 * this path; exec actions stream through systemd-cat and never
-	 * touch the filesystem here.
+	/*
+	 * Unlink the per-worker capture file once the response has been
+	 * handed to the host. Only recorded commands write it.
 	 *
-	 * vfs_unlink requires the parent inode's i_rwsem held for write
-	 * (LOOKUP semantics for non-NULL `delegated_inode`), so lock the
-	 * parent dentry's inode before calling and unlock after. */
-	if (got_request && req_hdr.action_id == ACTION_GET_WORKLOAD_DETAILS) {
+	 * vfs_unlink requires the parent inode's i_rwsem held for write, so
+	 * lock the parent dentry's inode before calling and unlock after.
+	 */
+	if (got_request && record) {
 		struct path p;
 		int unlink_err = kern_path(output_path, 0, &p);
 
@@ -707,12 +639,12 @@ static irqreturn_t bedrock_io_irq_handler(int irq, void *dev_id)
 
 	/*
 	 * mempool_alloc returns from the BEDROCK_IO_WORK_POOL_MIN reserve
-	 * when the page allocator can't satisfy GFP_ATOMIC, so dropping
-	 * the IRQ only happens if every reserved item is already in use —
-	 * a state we don't reach at realistic queue depths. The pool
-	 * keeps the determinism contract: every IRQ either runs the
-	 * worker or the hypervisor sees the failure via the dropped
-	 * GET_REQUEST, never silently sticks.
+	 * when the page allocator can't satisfy GFP_ATOMIC, so dropping the
+	 * IRQ only happens if every reserved item is already in use — a state
+	 * we don't reach at realistic queue depths. The pool keeps the
+	 * determinism contract: every IRQ either runs the worker or the
+	 * hypervisor sees the failure via the dropped GET_REQUEST, never
+	 * silently sticks.
 	 */
 	w = mempool_alloc(work_pool, GFP_ATOMIC);
 	if (!w) {
@@ -727,6 +659,7 @@ static irqreturn_t bedrock_io_irq_handler(int irq, void *dev_id)
 
 static int __init bedrock_io_init(void)
 {
+	static const char output_id[] = OUTPUT_BUFFER_ID;
 	__u64 rc;
 	int err;
 
@@ -735,14 +668,24 @@ static int __init bedrock_io_init(void)
 		return -ENOMEM;
 
 	/*
-	 * WQ_UNBOUND lets workers run on any CPU; default max_active gives
-	 * us a generous concurrency budget (so many long-running podman
-	 * commands can overlap). WQ_MEM_RECLAIM ensures forward progress
-	 * even under memory pressure.
+	 * Output feedback buffer for recorded command output. vmalloc gives
+	 * a virtually-contiguous region the hypervisor translates page by
+	 * page when it reads the buffer back.
 	 */
-	io_wq = alloc_workqueue("bedrock-io",
-				WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
+	output_buf = vzalloc(BEDROCK_IO_OUTPUT_SIZE);
+	if (!output_buf) {
+		free_page((unsigned long)shared_page);
+		return -ENOMEM;
+	}
+
+	/*
+	 * WQ_UNBOUND lets workers run on any CPU; default max_active gives us
+	 * a generous concurrency budget. WQ_MEM_RECLAIM ensures forward
+	 * progress under memory pressure.
+	 */
+	io_wq = alloc_workqueue("bedrock-io", WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
 	if (!io_wq) {
+		vfree(output_buf);
 		free_page((unsigned long)shared_page);
 		return -ENOMEM;
 	}
@@ -751,14 +694,31 @@ static int __init bedrock_io_init(void)
 						sizeof(struct bedrock_io_work));
 	if (!work_pool) {
 		destroy_workqueue(io_wq);
+		vfree(output_buf);
 		free_page((unsigned long)shared_page);
 		return -ENOMEM;
 	}
 
 	/*
-	 * Register the page first so the hypervisor knows where to write
-	 * request bytes — without this, the channel IRQ would deliver but
-	 * the GET_REQUEST hypercall would fail.
+	 * Register the output feedback buffer so recorded command output has
+	 * somewhere to go before the first request arrives.
+	 */
+	rc = vmcall4(HYPERCALL_REGISTER_FEEDBACK_BUFFER, (__u64)output_buf,
+		     BEDROCK_IO_OUTPUT_SIZE, (__u64)output_id,
+		     sizeof(output_id) - 1);
+	if (rc == ~0ULL) {
+		pr_err("bedrock-io: HYPERCALL_REGISTER_FEEDBACK_BUFFER failed\n");
+		mempool_destroy(work_pool);
+		destroy_workqueue(io_wq);
+		vfree(output_buf);
+		free_page((unsigned long)shared_page);
+		return -EIO;
+	}
+
+	/*
+	 * Register the request/response page so the hypervisor knows where to
+	 * write request bytes — without this, the channel IRQ would deliver
+	 * but the GET_REQUEST hypercall would fail.
 	 */
 	rc = vmcall1(HYPERCALL_IO_REGISTER_PAGE, (__u64)shared_page);
 	if (rc != 0) {
@@ -766,6 +726,7 @@ static int __init bedrock_io_init(void)
 		       rc);
 		mempool_destroy(work_pool);
 		destroy_workqueue(io_wq);
+		vfree(output_buf);
 		free_page((unsigned long)shared_page);
 		return -EIO;
 	}
@@ -777,23 +738,25 @@ static int __init bedrock_io_init(void)
 		       BEDROCK_IO_IRQ, err);
 		mempool_destroy(work_pool);
 		destroy_workqueue(io_wq);
+		vfree(output_buf);
 		free_page((unsigned long)shared_page);
 		return err;
 	}
 
-	pr_info("bedrock-io: registered page=%p irq=%d (parallel workers)\n",
-		shared_page, BEDROCK_IO_IRQ);
+	pr_info("bedrock-io: registered page=%p output_buf=%p irq=%d (parallel workers)\n",
+		shared_page, output_buf, BEDROCK_IO_IRQ);
 	return 0;
 }
 
 static void __exit bedrock_io_exit(void)
 {
 	free_irq(BEDROCK_IO_IRQ, &worker_counter);
-	/* Flush any pending workers before tearing down the workqueue, so
-	 * no in-flight worker is left dereferencing the pool we're about
-	 * to destroy. */
+	/* Flush any pending workers before tearing down the workqueue, so no
+	 * in-flight worker is left dereferencing the pool we're about to
+	 * destroy. */
 	destroy_workqueue(io_wq);
 	mempool_destroy(work_pool);
+	vfree(output_buf);
 	free_page((unsigned long)shared_page);
 }
 

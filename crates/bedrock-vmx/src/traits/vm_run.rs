@@ -431,7 +431,7 @@ where
         match handle_exit(ctx, kernel, allocator) {
             ExitHandlerResult::Continue => {
                 // Finalize log entry with memory hash (if logging is enabled)
-                ctx.finalize_log_entry(kernel);
+                ctx.finalize_exit_record(kernel);
 
                 // Record total run loop time for this iteration
                 let loop_end_tsc = rdtsc();
@@ -450,7 +450,7 @@ where
             }
             ExitHandlerResult::ExitToUserspace(reason) => {
                 // Finalize log entry with memory hash (if logging is enabled)
-                ctx.finalize_log_entry(machine.kernel());
+                ctx.finalize_exit_record(machine.kernel());
 
                 // Record total run loop time for this iteration
                 let loop_end_tsc = rdtsc();

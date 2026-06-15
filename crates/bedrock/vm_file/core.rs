@@ -9,7 +9,7 @@ use core::sync::atomic::AtomicBool;
 use kernel::sync::Arc;
 
 use super::super::instruction_counter::LinuxInstructionCounter;
-use super::super::page::{KernelGuestMemory, KernelPage, LogBuffer, PagePool};
+use super::super::page::{EventBuffer, KernelGuestMemory, KernelPage, PagePool};
 use super::super::vmcs::RealVmcs;
 use super::super::vmx::{ForkedVm, RootVm};
 
@@ -42,9 +42,10 @@ pub(crate) struct BedrockVmFile {
     /// Flag to detect concurrent access to RUN ioctl.
     /// Set to true when RUN is in progress, false otherwise.
     pub running: AtomicBool,
-    /// Optional log buffer for deterministic exit logging.
-    /// Allocated on ENABLE_LOGGING, freed on DISABLE_LOGGING or file close.
-    pub log_buffer: Option<LogBuffer>,
+    /// Optional unified event-stream buffer. Allocated when the event stream is
+    /// enabled (SET_EVENT_CONFIG), freed on disable or file close. Carries all
+    /// event records, including `Exit` records.
+    pub event_buffer: Option<EventBuffer>,
     /// Pre-allocated page pool for COW allocation during run loop.
     /// Root VMs don't do COW, so target=0.
     pub page_pool: PagePool,
@@ -61,7 +62,7 @@ impl BedrockVmFile {
             vm,
             vm_id,
             running: AtomicBool::new(false),
-            log_buffer: None,
+            event_buffer: None,
             page_pool: PagePool::new(0),
         }
     }
@@ -132,8 +133,8 @@ pub(crate) struct BedrockForkedVmFile {
     pub vm_id: u64,
     /// Flag to detect concurrent access to RUN ioctl.
     pub running: AtomicBool,
-    /// Optional log buffer for deterministic exit logging.
-    pub log_buffer: Option<LogBuffer>,
+    /// Optional unified event-stream buffer (see [`BedrockVmFile::event_buffer`]).
+    pub event_buffer: Option<EventBuffer>,
     /// Pre-allocated page pool for COW allocation during run loop.
     pub page_pool: PagePool,
 }
@@ -155,7 +156,7 @@ impl BedrockForkedVmFile {
             _parent: parent,
             vm_id,
             running: AtomicBool::new(false),
-            log_buffer: None,
+            event_buffer: None,
             page_pool: PagePool::new(COW_POOL_SIZE),
         }
     }

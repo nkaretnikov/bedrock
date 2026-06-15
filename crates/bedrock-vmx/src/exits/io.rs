@@ -38,19 +38,14 @@ pub fn handle_io<C: VmContext>(ctx: &mut C, qual: IoQualification) -> ExitHandle
                         // Divisor Latch Low
                         ctx.state_mut().devices.serial.dll = byte;
                     } else {
-                        // Transmit data - buffer for userspace
-                        // If buffer is full, save the byte for delivery after
-                        // the buffer is drained and exit to userspace. RIP is
-                        // advanced so the OUT instruction is counted exactly
-                        // once (avoiding non-deterministic double-counting when
-                        // the guest retries the same instruction).
-                        if !ctx.state_mut().serial_write(byte) {
-                            ctx.state_mut().serial_pending_byte = Some(byte);
-                            if let Err(e) = advance_rip(ctx) {
-                                return ExitHandlerResult::Error(e);
-                            }
-                            return ExitHandlerResult::ExitToUserspace(ExitReason::IoInstruction);
-                        }
+                        // Transmit data (the `earlyprintk=serial` per-byte path).
+                        // Feed the line accumulator, which emits one `Serial`
+                        // event per line (on `\n` or when its fixed buffer fills)
+                        // instead of one event per byte. No-op unless the Serial
+                        // category is enabled. A full event buffer is handled
+                        // centrally by the dispatcher (`event_buffer_full`), so
+                        // the return value is ignored.
+                        let _ = ctx.state_mut().event_serial_byte(byte);
                     }
                 }
                 0x3F9 => {
@@ -108,8 +103,8 @@ pub fn handle_io<C: VmContext>(ctx: &mut C, qual: IoQualification) -> ExitHandle
                         // Divisor Latch Low
                         u32::from(ctx.state().devices.serial.dll)
                     } else {
-                        // RX data (RBR) - return byte from input buffer
-                        u32::from(ctx.state_mut().devices.serial.read_input())
+                        // RX data (RBR) - no host->guest serial input, always 0
+                        0
                     }
                 }
                 0x3F9 => {
@@ -146,15 +141,10 @@ pub fn handle_io<C: VmContext>(ctx: &mut C, qual: IoQualification) -> ExitHandle
                 }
                 0x3FD => {
                     // Line Status Register (LSR)
-                    // Bit 0: Data Ready (set when input available)
+                    // Bit 0: Data Ready (never set — no host->guest serial input)
                     // Bit 5: Transmitter holding register empty
                     // Bit 6: Transmitter empty
-                    let data_ready = if ctx.state().devices.serial.has_input() {
-                        0x01
-                    } else {
-                        0x00
-                    };
-                    0x60 | data_ready
+                    0x60
                 }
                 0x3FE => {
                     // Modem Status Register (MSR)
