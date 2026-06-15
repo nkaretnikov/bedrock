@@ -19,14 +19,16 @@ RUSTC ?= rustc
 MARGIN_GEN := gen_pebs_margin
 MARGIN_RS := vmx/exits/pebs_margin_generated.rs
 
-$(MARGIN_RS): ../../scripts/gen_pebs_margin.rs
-	$(RUSTC) -O $< -o $(MARGIN_GEN)
-	./$(MARGIN_GEN) $@
-
+# Keep `all` as the default goal: it must stay the first rule in this file, since
+# `make` (with no target) builds whichever target appears first.
 all: $(MARGIN_RS)
 	$(MAKE) -C $(KDIR) M=$(CURDIR) LLVM=$(LLVM) \
 		KCFLAGS=-Wno-error=unused-command-line-argument \
 		KAFLAGS=-Wno-error=unused-command-line-argument modules
+
+$(MARGIN_RS): ../../scripts/gen_pebs_margin.rs
+	$(RUSTC) -O $< -o $(MARGIN_GEN)
+	./$(MARGIN_GEN) $@
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(CURDIR) clean
