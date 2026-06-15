@@ -1,15 +1,15 @@
 ---
 name: determ-analysis
-description: Analyze bedrock determinism test output directories on the remote machine. Invoke for checking test results, finding failures, comparing runs, and diagnosing divergences.
+description: Analyze bedrock determinism test output directories. Invoke for checking test results, finding failures, comparing runs, and diagnosing divergences.
 ---
 
-You are an expert at analyzing bedrock hypervisor determinism test results. The test data lives on a remote machine and must be accessed via SSH.
+You are an expert at analyzing bedrock hypervisor determinism test results.
 
-## Remote Access
+## Test Data Location
 
-The remote host is configured in the `.env` file at the project root (see `.env.example` for the format). Read `REMOTE_HOST` from `.env` before running commands.
-
-All commands must be run via `ssh $REMOTE_HOST '<command>'`. Test output directories are typically under `~/workspace/determ-tests/` on the remote machine.
+The `bedrock-determinism` binary writes test output under its workdir (e.g.
+`~/workspace/determ-tests/`). Point the commands below at the test directory you
+want to analyze; the placeholder `<test-dir>` stands for its path.
 
 ## Test Output Directory Structure
 
@@ -138,7 +138,7 @@ A run is marked DIVERGENT if either comparison finds a difference.
 ### 1. Read Configuration
 
 ```bash
-ssh $REMOTE_HOST 'cat ~/workspace/determ-tests/<dir>/config.txt'
+cat <test-dir>/config.txt
 ```
 
 Note the key parameters: `runs`, `parallel`, `stop_at_tsc`/`stop_at_vt`, `checkpoint_interval`, `all_exits`, `parent_id`, `no_memory_hash`, `intercept_pf`.
@@ -146,7 +146,7 @@ Note the key parameters: `runs`, `parallel`, `stop_at_tsc`/`stop_at_vt`, `checkp
 ### 2. Check Summary (with caveat)
 
 ```bash
-ssh $REMOTE_HOST 'cat ~/workspace/determ-tests/<dir>/summary.txt'
+cat <test-dir>/summary.txt
 ```
 
 **WARNING**: The summary.txt may be stale (from an older test run that reused the same directory). Always verify by cross-referencing the number of runs in the summary against the actual run directories.
@@ -166,7 +166,7 @@ Since matching runs are deleted, the remaining run directories (besides run-001)
 
 ```bash
 # List all run directories (these are run-001 + divergent runs only)
-ssh $REMOTE_HOST 'find ~/workspace/determ-tests/<dir> -maxdepth 1 -type d -name "run-*" | sort'
+find <test-dir> -maxdepth 1 -type d -name "run-*" | sort
 ```
 
 ### 4. Analyze Divergent Runs
@@ -175,36 +175,34 @@ For each divergent run, examine artifacts:
 
 ```bash
 # Status
-ssh $REMOTE_HOST 'cat ~/workspace/determ-tests/<dir>/run-NNNNNN/status.txt'
+cat <test-dir>/run-NNNNNN/status.txt
 
 # Diff guest console output (shows crash messages, extra output, etc.)
-ssh $REMOTE_HOST 'diff ~/workspace/determ-tests/<dir>/run-001/stdout.txt ~/workspace/determ-tests/<dir>/run-NNNNNN/stdout.txt'
+diff <test-dir>/run-001/stdout.txt <test-dir>/run-NNNNNN/stdout.txt
 
 # Full guest console output if diff is large or you need more context
-ssh $REMOTE_HOST 'cat ~/workspace/determ-tests/<dir>/run-NNNNNN/stdout.txt'
+cat <test-dir>/run-NNNNNN/stdout.txt
 
 # Hypervisor logs
-ssh $REMOTE_HOST 'cat ~/workspace/determ-tests/<dir>/run-NNNNNN/stderr.txt'
+cat <test-dir>/run-NNNNNN/stderr.txt
 
 # Event stream sizes (total records; exit records dominate in determinism runs)
-ssh $REMOTE_HOST 'wc -l ~/workspace/determ-tests/<dir>/run-NNNNNN/events.jsonl ~/workspace/determ-tests/<dir>/run-001/events.jsonl'
+wc -l <test-dir>/run-NNNNNN/events.jsonl <test-dir>/run-001/events.jsonl
 ```
 
 ### 5. Find Divergence Point
 
-Use the `determ-divergence.py` script to analyze divergent runs. The script must be copied to the remote machine first.
-
-First run `just sync` to ensure the remote has the latest scripts, then:
+Use the `contrib/determ-divergence.py` script to analyze divergent runs:
 
 ```bash
 # Run divergence analysis
-ssh $REMOTE_HOST 'python3 $REMOTE_DIR/contrib/determ-divergence.py ~/workspace/determ-tests/<dir> run-NNNNNN'
+python3 contrib/determ-divergence.py <test-dir> run-NNNNNN
 
 # With more context exits before divergence
-ssh $REMOTE_HOST 'python3 $REMOTE_DIR/contrib/determ-divergence.py ~/workspace/determ-tests/<dir> run-NNNNNN --context 20'
+python3 contrib/determ-divergence.py <test-dir> run-NNNNNN --context 20
 
 # Widen the non-determ exit search window beyond the divergence point
-ssh $REMOTE_HOST 'python3 $REMOTE_DIR/contrib/determ-divergence.py ~/workspace/determ-tests/<dir> run-NNNNNN --nondeterm-window 50000'
+python3 contrib/determ-divergence.py <test-dir> run-NNNNNN --nondeterm-window 50000
 ```
 
 The script outputs:
