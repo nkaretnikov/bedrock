@@ -59,21 +59,22 @@ enable the kernel build to include them as submodules.
 
 ```bash
 just test       # Run cargo tests
-just remote     # Sync and build kernel module on remote host
 just fmt        # Format code
 ```
 
-Configure `REMOTE_HOST` and `REMOTE_DIR` in `.env` (see `.env.example`).
+**Do not build the kernel module locally with Claude unless asked** — it
+requires a configured Linux kernel build environment.
 
-**Do not build the kernel module locally with Claude** — it requires a
-configured Linux kernel build environment. Use `just remote` instead.
-
-**Always verify both**: `just test` (cargo tests pass) and `just remote`
-(kernel module compiles).
+**Verify**: `just test` (cargo tests pass).
 
 ## Skills
 
 - **`/sdm`**: Intel SDM — VMX, VMCS, EPT, MSRs, control registers, instruction semantics.
 - **`/linux`**: Linux kernel (6.18) — KVM/VMX, memory management, drivers, syscalls.
 - **`/bhyve`**: FreeBSD bhyve — compare virtualization approaches.
-- **`/determ-analysis`**: Analyze determinism test results on the remote machine.
+- **`/determ-analysis`**: Analyze determinism test output directories.
+
+The `/sdm` PDFs are committed to the repo, but the `/linux` and `/bhyve` source
+trees are large and gitignored. `contrib/setup-skills.sh` fetches them; a
+`PreToolUse` hook (`.claude/settings.json`) runs it automatically the first time
+those skills are invoked.
