@@ -19,6 +19,7 @@
 use super::ept::translate_gva_to_gpa;
 use super::helpers::ExitHandlerResult;
 use super::qualifications::EptViolationQualification;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(not(feature = "cargo"))]
 use super::super::prelude::*;
@@ -237,18 +238,76 @@ pub const PEBS_MIN_DELTA: u64 = 257;
 
 /// Margin (in retired guest instructions) by which the PEBS-armed precise
 /// exit fires *before* the requested target. The PEBS exit lands at
-/// `target_tsc - PEBS_MARGIN`; MTF then single-steps the remaining
-/// `PEBS_MARGIN` instructions to land exactly on `target_tsc`.
+/// `target_tsc - get_pebs_margin()`; MTF then single-steps the remaining
+/// `get_pebs_margin()` instructions to land exactly on `target_tsc`.
 ///
 /// PEBS+PDist on `IA32_FIXED_CTR0` lands with skid 0 in the common case —
 /// but the asynchronous record-write path can occasionally drift by 1
 /// instruction. The margin absorbs that drift so the timer interrupt
 /// always arrives at the requested deadline rather than off-by-one. The
 /// MTF single-step path (`update_mtf_state` in `exits/mod.rs`) takes over
-/// once the count is within `PEBS_MARGIN` of the target.
-pub const PEBS_MARGIN: u64 = PEBS_MARGIN_GENERATED;
+/// once the count is within `get_pebs_margin()` of the target.
+///
+/// The required margin is CPU-model-specific (the async record-write skid
+/// differs across microarchitectures), so it is resolved from CPUID on the
+/// host once and cached for the process lifetime: the CPUID read happens
+/// exactly once regardless of how many times this is called.
+pub fn get_pebs_margin() -> u64 {
+    // `u64::MAX` is the "not yet resolved" sentinel; a real margin is small.
+    let cached = PEBS_MARGIN_CACHE.load(Ordering::Relaxed);
+    if cached != u64::MAX {
+        return cached;
+    }
+    // Racing callers all decode the same family/model and so store the same
+    // value; an unsynchronized load/store race is therefore benign.
+    let margin = margin_for_host_cpu();
+    PEBS_MARGIN_CACHE.store(margin, Ordering::Relaxed);
+    margin
+}
 
-include!("pebs_margin_generated.rs");
+/// Cache backing [`get_pebs_margin`]. Initialized to the `u64::MAX` sentinel.
+static PEBS_MARGIN_CACHE: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Select the margin for the host CPU from its family/model.
+fn margin_for_host_cpu() -> u64 {
+    let (family, model) = host_family_model();
+    // Margins were tested on the Bitcoin workload (0 timer late injects in the
+    // child VM). See `intel-family.h` in Linux for the model numbers.
+    match (family, model) {
+        (0x6, 0x8F) => 3, // Sapphire Rapids-SP (ex: Xeon Gold 5412U)
+        (0x6, 0x6A) => 8, // Ice Lake-SP (ex: Xeon Silver 4310)
+        _ => 8,           // default for untested models
+    }
+}
+
+/// CPU family and model decoded from CPUID leaf 1 (EAX). See Intel SDM,
+/// Volume 1, Chapter 21.3 CPUID Leaves, CPUID.01H -- Version and Features.
+fn host_family_model() -> (u32, u32) {
+    let (eax, _, _, _) = super::cpuid::cpuid(1, 0);
+
+    let base_model = (eax >> 4) & 0xF;
+    let base_family = (eax >> 8) & 0xF;
+    let ext_model = (eax >> 16) & 0xF;
+    let ext_family = (eax >> 20) & 0xFF;
+
+    // When the Family ID is 06H or 0FH, this field is prepended to the Model
+    // ID to provide an 8-bit model identification.
+    let model = if base_family == 0x6 || base_family == 0xF {
+        (ext_model << 4) | base_model
+    } else {
+        base_model
+    };
+
+    // When the Family ID is 0FH, this field is added to the Family ID to
+    // provide an 8-bit family identification.
+    let family = if base_family == 0xF {
+        base_family + ext_family
+    } else {
+        base_family
+    };
+
+    (family, model)
+}
 
 /// Outcome of arming a precise exit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -290,15 +349,16 @@ pub fn arm_precise_exit(
     if target_tsc < current_tsc {
         return ArmResult::AlreadyPast;
     }
+    let pebs_margin = get_pebs_margin();
     let delta = target_tsc - current_tsc;
     // Encoded distance to overflow must be ≥ PEBS_MIN_DELTA for Bedrock to
     // use PDist. The SDM minimum is 256 (Vol 3B 21.9.6); this code keeps a
     // one-event cushion and lets the MTF single-step window handle shorter
     // deltas directly.
-    if delta < PEBS_MIN_DELTA + PEBS_MARGIN {
+    if delta < PEBS_MIN_DELTA + pebs_margin {
         return ArmResult::BelowMinDelta;
     }
-    let encoded_delta = delta - PEBS_MARGIN;
+    let encoded_delta = delta - pebs_margin;
     // Counter reload: FIXED_CTR0 = -encoded_delta, masked to the 48-bit
     // counter width. After `encoded_delta` increments the counter wraps to 0
     // (overflow); PDist records on that same overflowing instruction —
@@ -308,7 +368,7 @@ pub fn arm_precise_exit(
     // Track the actual PEBS firing point (target - margin) for skid
     // diagnostics: skid = emulated_tsc_at_pebs_exit - armed_target_tsc
     // should be 0 with PDist, regardless of margin.
-    pebs.armed_target_tsc = target_tsc - PEBS_MARGIN;
+    pebs.armed_target_tsc = target_tsc - pebs_margin;
     pebs.armed_inst_count = inst_count_now;
     pebs.armed_tsc_offset = tsc_offset_now;
     pebs.iters_since_arm = 0;
@@ -904,7 +964,7 @@ mod tests {
         // delta < PEBS_MIN_DELTA + PEBS_MARGIN: encoded distance would be
         // below the PDist threshold. Caller falls back to MTF stepping
         // for the entire remaining range.
-        let target = 100 + PEBS_MIN_DELTA + PEBS_MARGIN - 1;
+        let target = 100 + PEBS_MIN_DELTA + get_pebs_margin() - 1;
         let r = arm_precise_exit(&mut p, 100, target, PebsAction::InjectInterrupt(0x20), 0, 0);
         assert_eq!(r, ArmResult::BelowMinDelta);
         assert!(p.armed_action.is_none());
@@ -915,7 +975,7 @@ mod tests {
         let mut p = make_pebs_state();
         // Smallest delta that arms PEBS under Bedrock's conservative cutoff:
         // encoded distance = PEBS_MIN_DELTA.
-        let delta = PEBS_MIN_DELTA + PEBS_MARGIN;
+        let delta = PEBS_MIN_DELTA + get_pebs_margin();
         let r = arm_precise_exit(
             &mut p,
             100,
@@ -925,11 +985,11 @@ mod tests {
             0,
         );
         assert_eq!(r, ArmResult::Armed);
-        let encoded = delta - PEBS_MARGIN;
+        let encoded = delta - get_pebs_margin();
         assert_eq!(p.counter_reload, encoded.wrapping_neg() & PMC_COUNTER_MASK);
         // armed_target_tsc tracks the PEBS firing point (target - margin),
         // not the requested target — so skid measures hardware imprecision.
-        assert_eq!(p.armed_target_tsc, 100 + delta - PEBS_MARGIN);
+        assert_eq!(p.armed_target_tsc, 100 + delta - get_pebs_margin());
         assert!(matches!(
             p.armed_action,
             Some(PebsAction::InjectInterrupt(0x20))
@@ -943,7 +1003,7 @@ mod tests {
         let delta: u64 = 1_000_000;
         let r = arm_precise_exit(&mut p, 0, delta, PebsAction::InjectInterrupt(0x20), 0, 0);
         assert_eq!(r, ArmResult::Armed);
-        let encoded = delta - PEBS_MARGIN;
+        let encoded = delta - get_pebs_margin();
         let expected = encoded.wrapping_neg() & PMC_COUNTER_MASK;
         assert_eq!(p.counter_reload, expected);
         // Sanity: counter wraps to zero after `encoded` increments.

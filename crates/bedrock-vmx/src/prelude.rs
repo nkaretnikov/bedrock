@@ -98,19 +98,19 @@ pub use bedrock_ept::{EptMemoryType, EptPageTable, EptPermissions, FrameAllocato
 // =============================================================================
 #[cfg(not(feature = "cargo"))]
 pub use super::exits::{
-    arm_for_next_iteration, arm_precise_exit, check_io_channel, disarm_precise_exit, handle_exit,
-    inject_pending_interrupt, pebs_post_vm_exit, pebs_pre_vm_entry, update_mtf_state, ArmResult,
-    DsManagementArea, ExitError, ExitHandlerResult, ExitReason, PebsAction, PebsState, APIC_BASE,
-    APIC_SIZE, IOAPIC_BASE, IOAPIC_SIZE, IO_CHANNEL_IRQ, PEBS_MARGIN, PEBS_MIN_DELTA,
-    PERF_GLOBAL_CTRL_FIXED_CTR0,
+    arm_for_next_iteration, arm_precise_exit, check_io_channel, disarm_precise_exit,
+    get_pebs_margin, handle_exit, inject_pending_interrupt, pebs_post_vm_exit, pebs_pre_vm_entry,
+    update_mtf_state, ArmResult, DsManagementArea, ExitError, ExitHandlerResult, ExitReason,
+    PebsAction, PebsState, APIC_BASE, APIC_SIZE, IOAPIC_BASE, IOAPIC_SIZE, IO_CHANNEL_IRQ,
+    PEBS_MIN_DELTA, PERF_GLOBAL_CTRL_FIXED_CTR0,
 };
 #[cfg(feature = "cargo")]
 pub use crate::exits::{
-    arm_for_next_iteration, arm_precise_exit, check_io_channel, disarm_precise_exit, handle_exit,
-    inject_pending_interrupt, pebs_post_vm_exit, pebs_pre_vm_entry, update_mtf_state, ArmResult,
-    DsManagementArea, ExitError, ExitHandlerResult, ExitReason, PebsAction, PebsState, APIC_BASE,
-    APIC_SIZE, IOAPIC_BASE, IOAPIC_SIZE, IO_CHANNEL_IRQ, PEBS_MARGIN, PEBS_MIN_DELTA,
-    PERF_GLOBAL_CTRL_FIXED_CTR0,
+    arm_for_next_iteration, arm_precise_exit, check_io_channel, disarm_precise_exit,
+    get_pebs_margin, handle_exit, inject_pending_interrupt, pebs_post_vm_exit, pebs_pre_vm_entry,
+    update_mtf_state, ArmResult, DsManagementArea, ExitError, ExitHandlerResult, ExitReason,
+    PebsAction, PebsState, APIC_BASE, APIC_SIZE, IOAPIC_BASE, IOAPIC_SIZE, IO_CHANNEL_IRQ,
+    PEBS_MIN_DELTA, PERF_GLOBAL_CTRL_FIXED_CTR0,
 };
 
 // =============================================================================
