@@ -43,8 +43,8 @@ pub use interrupts::{
     check_io_channel, inject_pending_interrupt, reinject_vectored_event, IO_CHANNEL_IRQ,
 };
 pub use pebs::{
-    arm_for_next_iteration, arm_precise_exit, disarm_precise_exit, pebs_post_vm_exit,
-    pebs_pre_vm_entry, ArmResult, DsManagementArea, PebsAction, PebsState, PEBS_MARGIN,
+    arm_for_next_iteration, arm_precise_exit, disarm_precise_exit, get_pebs_margin,
+    pebs_post_vm_exit, pebs_pre_vm_entry, ArmResult, DsManagementArea, PebsAction, PebsState,
     PEBS_MIN_DELTA, PERF_GLOBAL_CTRL_FIXED_CTR0,
 };
 pub use qualifications::{
@@ -165,19 +165,24 @@ fn next_single_step_start_count<C: VmContext>(ctx: &C) -> Option<u64> {
 
 /// Width of the MTF single-step window approaching an APIC timer deadline.
 ///
-/// PEBS arms to fire at `target - PEBS_MARGIN`. When the encoded distance
-/// is too short for PDist (`delta < PEBS_MIN_DELTA + PEBS_MARGIN` in
+/// PEBS arms to fire at `target - get_pebs_margin()`. When the encoded distance
+/// is too short for PDist (`delta < PEBS_MIN_DELTA + get_pebs_margin()` in
 /// `arm_precise_exit`), PEBS doesn't arm at all — but the count is by
-/// construction within `PEBS_MIN_DELTA + PEBS_MARGIN` of the target, so
+/// construction within `PEBS_MIN_DELTA + get_pebs_margin()` of the target, so
 /// MTF single-stepping starting at the entering exit lands on the
 /// boundary in at most that many steps. Sized to cover both the normal
 /// case (PEBS lands inside the window, MTF steps the final
-/// `PEBS_MARGIN`) and the BelowMinDelta case (no PEBS, MTF steps the
+/// `get_pebs_margin()`) and the BelowMinDelta case (no PEBS, MTF steps the
 /// full window). Without this width, a non-deterministic exit landing
 /// close to the deadline produces a `BelowMinDelta` arming, no PEBS
 /// trap, and the timer fires at whatever natural deterministic exit
 /// happens past the deadline — which differs across runs.
-const MTF_MARGIN: u64 = PEBS_MIN_DELTA + PEBS_MARGIN;
+///
+/// `get_pebs_margin()` reads from a process-lifetime cache, so this stays cheap
+/// to call on the hot path.
+fn get_mtf_margin() -> u64 {
+    PEBS_MIN_DELTA + get_pebs_margin()
+}
 
 /// Update MTF (Monitor Trap Flag) state.
 ///
@@ -225,8 +230,9 @@ pub fn update_mtf_state<C: VmContext>(ctx: &mut C) -> Result<(), ExitError> {
     // exact boundary, regardless of which target PEBS itself happened to
     // arm for this iteration (PEBS is a single counter; the others get
     // covered by MTF stepping when their windows are entered).
+    let mtf_margin = get_mtf_margin();
     let in_margin = |target_opt: Option<u64>| match target_opt {
-        Some(target) => count >= target.saturating_sub(MTF_MARGIN) && count < target,
+        Some(target) => count >= target.saturating_sub(mtf_margin) && count < target,
         None => false,
     };
     let stop_at_count = ctx

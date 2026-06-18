@@ -256,7 +256,7 @@ pub fn handle_cpuid<C: VmContext>(ctx: &mut C) -> ExitHandlerResult {
 
 /// Execute CPUID instruction.
 #[cfg(target_arch = "x86_64")]
-fn cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
+pub(super) fn cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
     let eax: u32;
     let ebx: u32;
     let ecx: u32;
@@ -281,6 +281,6 @@ fn cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
 
 /// Mock CPUID for non-x86_64 targets (for testing).
 #[cfg(not(target_arch = "x86_64"))]
-fn cpuid(_leaf: u32, _subleaf: u32) -> (u32, u32, u32, u32) {
+pub(super) fn cpuid(_leaf: u32, _subleaf: u32) -> (u32, u32, u32, u32) {
     (0, 0, 0, 0)
 }
