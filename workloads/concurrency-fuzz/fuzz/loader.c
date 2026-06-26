@@ -18,9 +18,12 @@
 // Usage: fuzz-loader <seed> <target> [target-args...]
 //   <seed> is decimal or 0x-prefixed hex.
 //
-// Exit status: 0 if the target crashed (non-zero exit), the expected outcome
-// of a successful fuzz, and 2 on a loader/setup error. The caller (run.sh)
-// issues the shutdown VMCALL afterwards either way.
+// Exit status:
+//   0 - target crashed (non-zero exit or terminating signal); the goal of a
+//       successful fuzz run.
+//   1 - target exited cleanly; no crash found this run.
+//   2 - loader/setup error.
+// The caller (run.sh) issues the shutdown VMCALL afterwards regardless.
 
 #include <errno.h>
 #include <stdbool.h>
