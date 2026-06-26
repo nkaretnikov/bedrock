@@ -23,11 +23,6 @@
  * it sits in the queue but dispatch refuses to run it until its time arrives.
  * A periodic timer kicks the CPUs so dispatch re-checks eligibility even when
  * the system would otherwise idle.
- *
- * Carried from the concurrency-fuzz-scheduler PoC and adopted as a bedrock
- * workload. The scx kfunc names/signatures track recent sched_ext (kernel
- * 6.12+); on the bedrock guest kernel (6.18) confirm the spots marked
- * "REVIEW:" against the scx headers pinned in the Dockerfile.
  */
 #include <scx/common.bpf.h>
 #include "intf.h"
