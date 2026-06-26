@@ -13,8 +13,6 @@
 FROM debian:trixie AS build
 
 # scx tag whose sched_ext kfunc ABI matches the bedrock guest kernel (6.18).
-# Override with --build-arg SCX_REF=... if a kfunc used in bpf/main.bpf.c does
-# not resolve (see the "REVIEW:" notes there).
 ARG SCX_REF=v1.0.18
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
