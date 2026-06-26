@@ -12,8 +12,11 @@
 
 FROM debian:trixie AS build
 
-# scx tag whose sched_ext kfunc ABI matches the bedrock guest kernel (6.18).
-ARG SCX_REF=v1.0.18
+# scx commit whose sched_ext kfunc ABI matches the bedrock guest kernel (6.18).
+# Pinned to a full commit hash (not a tag) for reproducible, tamper-evident
+# builds: a tag can be force-moved upstream, a commit hash cannot.
+# This is the commit tag v1.0.18 points to.
+ARG SCX_HASH=5bff813ccc5e56d0dd628632e4ca355305e77d94
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       clang llvm libbpf-dev bpftool libelf-dev zlib1g-dev pkg-config \
@@ -24,8 +27,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # vmlinux.h for CO-RE. CO-RE relocations are resolved at load time against the
 # guest kernel's /sys/kernel/btf/vmlinux, so the bundled header need not match
 # the guest exactly.
-RUN git clone --depth 1 --branch "$SCX_REF" \
-      https://github.com/sched-ext/scx.git /opt/scx
+# Require a full 40-char hash; an empty SCX_HASH would otherwise degrade the
+# fetch below to the default branch's moving HEAD and silently defeat the pin.
+RUN [ "${#SCX_HASH}" = 40 ] || { echo "SCX_HASH must be a full 40-char commit hash, got: '$SCX_HASH'" >&2; exit 1; } \
+ && mkdir -p /opt/scx \
+ && cd /opt/scx \
+ && git init -q \
+ && git remote add origin https://github.com/sched-ext/scx.git \
+ && git fetch --depth 1 origin "$SCX_HASH" \
+ && git checkout -q FETCH_HEAD
 
 WORKDIR /src
 COPY bpf/ bpf/
