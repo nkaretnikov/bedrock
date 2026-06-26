@@ -2,8 +2,7 @@
 //
 // Static C loader + supervisor for the in-kernel concurrency-fuzz scheduler.
 //
-// This replaces the PoC's Rust loader (fuzz.rs) and supervisor (supervisor.rs)
-// with a small libbpf program, matching bedrock's static-C-helper idiom. It:
+// This code:
 //   - opens the BPF skeleton, writes the read-only config (run/sleep ranges,
 //     slices, seed) into rodata, loads it, and attaches the sched_ext
 //     struct_ops;
