@@ -40,8 +40,7 @@
 #include "intf.h"
 #include "fuzz_bpf.skel.h"
 
-// Fixed fuzzing parameters, matching the PoC defaults. Hardcoded rather than
-// exposed as flags: the workload runs one fixed configuration and the only
+// Fixed fuzzing flags: the workload runs one fixed configuration and the only
 // knob that needs to vary (for the determinism negative control) is the seed.
 #define RUN_MIN_NS	(1ULL * 1000000)	// 1ms
 #define RUN_MAX_NS	(100ULL * 1000000)	// 100ms
