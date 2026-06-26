@@ -304,8 +304,6 @@ void BPF_STRUCT_OPS(fifo_fuzz_dispatch, s32 cpu, struct task_struct *prev)
 	/*
 	 * Peek the head. The DSQ is vtime-ordered, so the head has the earliest
 	 * eligibility time; if it is not yet eligible, nothing else is either.
-	 * REVIEW: bpf_for_each(scx_dsq, ...) is the scx DSQ iterator; confirm it
-	 * exists on the target kernel/scx.
 	 */
 	bpf_for_each(scx_dsq, p, SHARED_DSQ_ID, 0) {
 		head_vtime = p->scx.dsq_vtime;
