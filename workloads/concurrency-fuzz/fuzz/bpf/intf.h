@@ -5,9 +5,6 @@
  * it has to be valid both as BPF C (where the fixed width types come from
  * vmlinux.h) and as plain C for the loader (where we define them ourselves
  * below).
- *
- * Carried from the concurrency-fuzz-scheduler PoC and adopted for bedrock; the
- * only consumer is now the static C loader, so the bindgen path is gone.
  */
 #ifndef __INTF_H
 #define __INTF_H
