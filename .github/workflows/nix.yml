@@ -79,12 +79,6 @@ jobs:
 
   concurrency-fuzz:
     name: "Run concurrency-fuzz workload [nested-virt, bedrock-cli]"
-    # Serialize after the bitcoin job: both want the scarce m7i-nested-virt
-    # runner, and requesting two at once risks one being lost (spot/capacity),
-    # which GitHub surfaces as a canceled job. Running after bitcoin also lets
-    # this job pull the shared guest kernel from cachix instead of recompiling
-    # it a second time in parallel.
-    needs: bitcoin
     runs-on: runs-on=${{ github.run_id }}/runner=m7i-nested-virt
     steps:
       - uses: actions/checkout@v4
