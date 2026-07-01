@@ -55,6 +55,20 @@ let
     installPhase = "mkdir -p $out/bin && cp bedrock-file-store $out/bin/";
   };
 
+  # Manual-registration helper: thread-fuzz <cmd> switches itself to SCHED_EXT
+  # and execs the command, so the command and its descendants are governed by
+  # the fuzzing scheduler while everything else stays on the stock scheduler. It
+  # runs inside the workload container (wrapping the process to fuzz), so it is
+  # bind-mounted into every container via containers.conf below rather than baked
+  # into any image. Built static (like the other guest helpers) so the single
+  # binary can be bind-mounted with no library closure to carry along.
+  threadFuzz = pkgs.pkgsStatic.stdenv.mkDerivation {
+    name = "thread-fuzz";
+    dontUnpack = true;
+    buildPhase = "$CC -O2 -static -o thread-fuzz ${../guest/scx-fuzz/thread-fuzz.c}";
+    installPhase = "mkdir -p $out/bin && cp thread-fuzz $out/bin/";
+  };
+
   # scx headers (sched_ext BPF headers + bundled vmlinux.h for CO-RE). Pinned to
   # the same commit the workload image used to vendor, whose kfunc ABI matches
   # the bedrock guest kernel (6.18). This is the commit tag v1.0.18 points to.
@@ -65,11 +79,10 @@ let
     hash = "sha256-RkTY7gDcKbkNUKl7NJDX3Ac/I+dRG1Gj8rRHynbbxUU=";
   };
 
-  # The in-kernel concurrency-fuzz scheduler, its guest-side init service, and
-  # the crun wrapper. Lives in the generic initrd (not in any workload image):
-  # the scheduler is a generic guest capability loaded once at boot, and the
-  # crun wrapper is podman's OCI runtime, so both belong to the guest, not to
-  # the workload.
+  # The in-kernel concurrency-fuzz scheduler and its guest-side init service.
+  # Lives in the generic initrd (not in any workload image): the scheduler is a
+  # generic guest capability loaded once at boot, so it belongs to the guest,
+  # not to the workload.
   #
   # scx-init links libbpf dynamically (static libbpf needs static elfutils,
   # which nixpkgs refuses to build); its runtime closure is pulled into the
@@ -116,15 +129,12 @@ let
       $CC -O2 -Ibpf -I. -o scx-init scx-init.c \
         $(pkg-config --cflags --libs libbpf)
 
-      # crun wrapper; REAL_CRUN points at the real crun in the closure.
-      $CC -O2 -DREAL_CRUN='"${pkgs.crun}/bin/crun"' -o crun-shim crun-shim.c
-
       runHook postBuild
     '';
 
     installPhase = ''
       mkdir -p $out/bin
-      cp scx-init crun-shim $out/bin/
+      cp scx-init $out/bin/
     '';
   };
 
@@ -292,9 +302,11 @@ let
   };
 
   # scxFuzz is added explicitly so its runtime closure (libbpf, elfutils, zlib,
-  # glibc) is copied into the rootfs — scx-init and crun-shim are
-  # dynamically linked and referenced by store path, not via runtimeEnv.
-  closureInfo = pkgs.closureInfo { rootPaths = [ runtimeEnv scxFuzz ]; };
+  # glibc) is copied into the rootfs: scx-init is dynamically linked and
+  # referenced by store path, not via runtimeEnv. threadFuzz is added so its
+  # store path (bind-mounted into containers by containers.conf below) lands in
+  # the rootfs too.
+  closureInfo = pkgs.closureInfo { rootPaths = [ runtimeEnv scxFuzz threadFuzz ]; };
 
   # Containers.conf with absolute Nix store paths so podman finds its helpers
   # regardless of PATH or wrapper behaviour.
@@ -313,25 +325,30 @@ let
     #     `eventually_` drivers); and
     #   - the coverage dir, where each instrumented process keeps its feedback
     #     bitmap as a file (see guest/libfeedback.c), so the pages outlive the
-    #     container that produced them.
-    # Each source must exist (the initrd pre-creates them) before a container
-    # starts, else podman bind-mounts an auto-created path in its place.
+    #     container that produced them; and
+    #   - thread-fuzz, the manual-registration helper (read-only): a workload
+    #     opts a process into the fuzzing scheduler by wrapping it, e.g.
+    #     `thread-fuzz /usr/local/bin/queue`. Mounting it here (from the guest
+    #     store path) makes it available in every container with no per-image
+    #     build; it does nothing unless a workload actually invokes it.
+    # Each source must exist (the initrd pre-creates them, and the store path is
+    # in the rootfs) before a container starts, else podman bind-mounts an
+    # auto-created path in its place.
     volumes = [
       "/bedrock/assertions.jsonl:/bedrock/assertions.jsonl",
       "/bedrock/coverage:/bedrock/coverage",
+      "${threadFuzz}/bin/thread-fuzz:/usr/local/bin/thread-fuzz:ro",
     ]
 
     [engine]
     cgroup_manager = "cgroupfs"
-    # crun-shim wraps crun: for create/run/exec it runs the real crun and then
-    # switches the container payload into SCHED_EXT (by pid), so the in-kernel
-    # fuzzing scheduler (loaded at boot by scx-init) governs it while every other
-    # host process stays on the stock scheduler. Other subcommands pass straight
-    # through to crun, so behaviour is otherwise unchanged.
-    runtime = "crun-shim"
+    # Stock crun. The fuzzing scheduler is opt-in per workload: a container's
+    # command wraps the process to fuzz in thread-fuzz (bind-mounted above),
+    # which switches that process into SCHED_EXT so scx-init's scheduler governs
+    # it while everything else stays on the stock scheduler.
+    runtime = "crun"
 
     [engine.runtimes]
-    crun-shim = ["${scxFuzz}/bin/crun-shim"]
     crun = ["${pkgs.crun}/bin/crun"]
 
     helper_binaries_dir = ["${pkgs.conmon}/bin", "${pkgs.netavark}/bin", "${pkgs.aardvark-dns}/bin"]
@@ -426,8 +443,8 @@ pkgs.stdenv.mkDerivation {
     ln -sf ${bedrockFileStore}/bin/bedrock-file-store rootfs/usr/local/bin/bedrock-file-store
 
     # scx-init at /usr/local/bin/ so the init script can start the in-kernel
-    # fuzzing scheduler at boot. crun-shim is referenced by absolute store path
-    # from containers.conf (podman's runtime), so it needs no rootfs symlink.
+    # fuzzing scheduler at boot. thread-fuzz needs no rootfs symlink: it runs
+    # inside containers and is bind-mounted there by store path (containers.conf).
     ln -sf ${scxFuzz}/bin/scx-init rootfs/usr/local/bin/scx-init
 
     # workload-monitor: watches podman container/exec lifecycle events and

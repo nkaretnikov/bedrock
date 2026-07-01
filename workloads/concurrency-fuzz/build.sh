@@ -8,8 +8,9 @@
 #
 # The image bakes the producer/consumer sample target and the VMCALL helper.
 # The fuzzing scheduler itself is guest infrastructure (sched_ext BPF + scx-init
-# + crun-shim in nix/podman-initrd.nix), not part of this image. The guest
-# kernel must be built with sched_ext + BTF (see nix/guest-kernel.nix).
+# in nix/podman-initrd.nix), and thread-fuzz (which opts the sample in) is
+# bind-mounted into the container by the guest, so neither is part of this image.
+# The guest kernel must be built with sched_ext + BTF (see nix/guest-kernel.nix).
 #
 # Usage:  ./build.sh
 #

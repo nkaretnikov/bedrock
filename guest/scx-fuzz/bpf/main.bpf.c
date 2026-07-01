@@ -39,10 +39,10 @@
  * Membership (who is governed):
  *   - Attached with SCX_OPS_SWITCH_PARTIAL, so it governs ONLY tasks whose
  *     policy is SCHED_EXT. Every ordinary host task stays on stock CFS/EEVDF.
- *   - crun-shim (podman's OCI runtime) switches the container init directly
- *     into SCHED_EXT by pid, after crun creates it; the payload's fork/exec
- *     descendants inherit it. crun itself stays on stock CFS. So every task we
- *     see is a workload container payload — there is nothing to exclude.
+ *   - A workload opts in by wrapping the process it wants fuzzed in thread-fuzz,
+ *     which sets SCHED_EXT on itself and execs the target; the target's
+ *     fork/exec descendants inherit it. So every task we see was opted in
+ *     explicitly: there is nothing to exclude.
  *
  * Mechanism: two DSQs. A vtime-ordered "fair" queue holds everything allowed to
  * run; dispatch() always pulls the lowest-vtime task from it. A "frozen" queue
@@ -306,10 +306,10 @@ void BPF_STRUCT_OPS(chaos_enqueue, struct task_struct *p, u64 enq_flags)
 	u64 vtime = p->scx.dsq_vtime;
 
 	/*
-	 * Every task we see is a container payload: crun-shim switches only the
-	 * container init into SCHED_EXT (crun itself stays on stock CFS), and
+	 * Every task we see was opted in explicitly: thread-fuzz sets SCHED_EXT
+	 * on the wrapped process (its descendants inherit it), and
 	 * SCX_OPS_SWITCH_PARTIAL means only SCHED_EXT tasks reach us. So there is
-	 * nothing to exclude — fuzz them all. Advance the chaos schedule first.
+	 * nothing to exclude: fuzz them all. Advance the chaos schedule first.
 	 */
 	advance_schedule(p, now);
 
@@ -453,7 +453,7 @@ struct sched_ext_ops chaos_ops = {
 	.init       = (void *)chaos_init,
 	/*
 	 * SCX_OPS_SWITCH_PARTIAL: govern only tasks whose policy is SCHED_EXT
-	 * (crun-shim opts the workload in); everything else stays on stock CFS.
+	 * (thread-fuzz opts the workload in); everything else stays on stock CFS.
 	 * SCX_OPS_ENQ_LAST: keep getting enqueue() for the last runnable task so
 	 * a lone victim still cycles through the policy.
 	 */

@@ -4,11 +4,11 @@
 # VMCALL ready/shutdown helper.
 #
 # The fuzzing scheduler itself is NOT in this image. It is a generic guest
-# capability: the sched_ext BPF scheduler + its init service (scx-init) and the
-# crun wrapper (crun-shim) live in the initrd (see nix/podman-initrd.nix) and
-# are loaded once at boot. crun-shim — registered as podman's OCI runtime —
-# switches this container's processes into SCHED_EXT, so everything the
-# container runs is governed by the fuzzing scheduler with no per-image setup.
+# capability: the sched_ext BPF scheduler and its init service (scx-init) live
+# in the initrd (see nix/podman-initrd.nix) and are loaded once at boot. The
+# thread-fuzz helper, which opts a process into the scheduler, is bind-mounted
+# into the container by the guest (not baked here); run.sh wraps the sample in
+# it. So no fuzzing machinery needs per-image setup.
 #
 # Build context is this directory (fuzz/); build.sh stages guest/libvmcall.h in.
 

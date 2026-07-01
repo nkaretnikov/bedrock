@@ -10,10 +10,10 @@
 //   - drains the ring buffer of scheduler events for the log and runs until
 //     terminated by a signal (the guest shuts down via the VMCALL path).
 //
-// Which tasks are SCHED_EXT is decided entirely by crun-shim (podman's OCI
-// runtime), which switches each container's payload by pid as crun creates it.
-// So this service needs no notion of "which cgroup" — every task it sees is a
-// workload payload.
+// Which tasks are SCHED_EXT is decided by the workload itself: it wraps the
+// process it wants fuzzed in thread-fuzz, which switches that process (and its
+// descendants) into SCHED_EXT. So this service needs no notion of "which
+// cgroup": every task it sees was opted in explicitly.
 //
 // Determinism: all timestamps printed come from the kernel (bpf_ktime_get_ns),
 // which derives from bedrock's deterministic emulated TSC. The schedule is
