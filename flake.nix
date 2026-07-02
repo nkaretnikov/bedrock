@@ -220,6 +220,57 @@
           program = "${script}";
         };
 
+        # Boot the mptest concurrency-fuzz workload guest directly on the host:
+        #   nix run .#test-mptest-workload
+        # Requires the bedrock module loaded, /dev/bedrock present, and the
+        # workload image built (./workloads/mptest/build.sh). The guest kernel
+        # must have sched_ext + BTF (see nix/guest-kernel.nix).
+        #
+        # The schedule is a pure function of bedrock's getrandom stream, fixed by
+        # bedrock-cli's -s/--rdrand-seed. This app leaves the seed at bedrock's
+        # default unless BEDROCK_RDRAND_SEED is set, so a plain run is fully
+        # deterministic (boot it twice and diff the result line). To search for a
+        # schedule that reproduces the IPC race, sweep the seed, e.g.:
+        #   for s in $(seq 1 64); do
+        #     BEDROCK_RDRAND_SEED=$s nix run .#test-mptest-workload | grep mptest
+        #   done
+        # A seed that prints "mptest FAILED at iteration K: ..." is a permanent,
+        # replayable repro: re-running it reproduces the same failure at the same K.
+        test-mptest-workload = let
+          script = pkgs.writeShellScript "bedrock-test-mptest-workload" ''
+            set -e
+            export PATH=${pkgs.lib.makeBinPath [ userland.bedrock-cli pkgs.coreutils ]}:$PATH
+
+            echo "=== Bedrock mptest concurrency-fuzz workload ==="
+
+            if ! lsmod | grep -q bedrock; then
+              echo "ERROR: bedrock module not loaded. Run: insmod bedrock.ko"
+              exit 1
+            fi
+            if [ ! -c /dev/bedrock ]; then
+              echo "ERROR: /dev/bedrock not found"
+              exit 1
+            fi
+            if [ ! -f workloads/mptest/images.tar ]; then
+              echo "ERROR: workloads/mptest/images.tar not found." >&2
+              echo "Build it first: ./workloads/mptest/build.sh" >&2
+              exit 1
+            fi
+
+            echo "--- Booting mptest podman guest ---"
+            bedrock-cli -m 5120 \
+              ''${BEDROCK_RDRAND_SEED:+-s "$BEDROCK_RDRAND_SEED"} \
+              -i ${podmanInitrd} \
+              --file compose.yaml=workloads/mptest/compose.yaml \
+              --file images.tar=workloads/mptest/images.tar \
+              ${guestKernel}/vmlinux
+            echo "=== mptest workload: OK ==="
+          '';
+        in {
+          type = "app";
+          program = "${script}";
+        };
+
         # bedrock-lab integration tests: nix run .#integration-tests
         #
         # The test binary is compiled hermetically by nix (cargo runs inside

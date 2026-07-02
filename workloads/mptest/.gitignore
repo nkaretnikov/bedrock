@@ -1,0 +1,8 @@
+images.tar
+
+# Staged by build.sh into the Docker build context and normally removed on exit;
+# ignored here in case a build is interrupted before cleanup.
+#   - libvmcall.h    : copied from guest/libvmcall.h (single source of truth).
+#   - libmultiprocess: the vendored mptest source from the Bitcoin Core checkout.
+mptest/libvmcall.h
+mptest/libmultiprocess/

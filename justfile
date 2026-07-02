@@ -90,6 +90,13 @@ nix-test-vm:
 nix-test-bitcoin-workload:
     nix run .#test-bitcoin-workload
 
+# Boot the mptest concurrency-fuzz workload (requires bedrock module loaded and
+# the image built: ./workloads/mptest/build.sh). Sweep BEDROCK_RDRAND_SEED to
+# hunt for a schedule that reproduces the libmultiprocess IPC race.
+[group: 'nix']
+nix-test-mptest-workload:
+    nix run .#test-mptest-workload
+
 # Run the bedrock-lab integration tests (requires bedrock module loaded and the
 # workload image built: ./workloads/integration-tests/build.sh)
 [group: 'nix']
