@@ -231,9 +231,15 @@
         # default unless BEDROCK_RDRAND_SEED is set, so a plain run is fully
         # deterministic (boot it twice and diff the result line). To search for a
         # schedule that reproduces the IPC race, sweep the seed, e.g.:
-        #   for s in $(seq 1 64); do
-        #     BEDROCK_RDRAND_SEED=$s nix run .#test-mptest-workload | grep mptest
+        #   for _ in $(seq 128); do
+        #     s=0x$(head -c8 /dev/urandom | od -An -tx8 | tr -d ' ')
+        #     echo "=== seed $s ==="
+        #     BEDROCK_RDRAND_SEED=$s nix run .#test-mptest-workload 2>&1 | tee "run-$s.log" \
+        #       | grep -E 'mptest (FAILED|survived)' || true
         #   done
+        # (grep must not use -m1: the workload's banner line contains "mptest ",
+        # so an early match would SIGPIPE the boot; matching FAILED|survived skips
+        # it. The result line is guest console output, so it is not ^-anchored.)
         # A seed that prints "mptest FAILED at iteration K: ..." is a permanent,
         # replayable repro: re-running it reproduces the same failure at the same K.
         test-mptest-workload = let
