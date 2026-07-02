@@ -21,6 +21,10 @@ result-*
 # (staged with `git add -f` only for the duration of a nix build).
 workloads/*/images.tar
 
+# Seed-fuzz output from workloads/mptest/fuzz.sh (per-run logs + summary),
+# created under ./fuzz-runs at the repo root.
+/fuzz-runs/
+
 # Kernel module build artifacts
 crates/bedrock/*.o
 crates/bedrock/*.ko
