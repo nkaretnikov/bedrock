@@ -27,17 +27,52 @@
 
 FROM debian:trixie AS build
 
+# Coverage build (opt-in, default off). When 1, mptest is compiled with
+# SanitizerCoverage trace-pc-guard and linked against the libfeedback runtime, so
+# a run registers an edge-coverage buffer the host reads back via
+# `bedrock-cli --coverage-out`. The trace-pc-guard guard-init ABI
+# (__sanitizer_cov_trace_pc_guard*) is clang-specific, so the instrumented build
+# uses clang; the default (COVERAGE=0) build is the unchanged gcc build.
+ARG COVERAGE=0
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential cmake libcapnp-dev capnproto pkg-config \
+      $( [ "$COVERAGE" = 1 ] && echo clang ) \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
 
+# Coverage-feedback runtime (staged by build.sh): the LLVM trace-pc-guard
+# frontend (libpcguard.c) over the generic hitcount backend (libfeedback.c),
+# which registers the buffer with the host over the hypercall (libvmcall.h).
+# Compiled WITHOUT -fsanitize-coverage (or the hooks would instrument themselves)
+# and archived; only linked into mptest when COVERAGE=1.
+COPY libvmcall.h libfeedback.h libfeedback.c libpcguard.c ./
+RUN mkdir -p /cov \
+ && if [ "$COVERAGE" = 1 ]; then \
+      clang -O2 -fPIC -c libfeedback.c -o /cov/libfeedback.o && \
+      clang -O2 -fPIC -c libpcguard.c  -o /cov/libpcguard.o  && \
+      ar rcs /cov/libcov.a /cov/libfeedback.o /cov/libpcguard.o; \
+    fi
+
 # Vendored libmultiprocess subtree (staged by build.sh). Build just the mptest
 # target; BUILD_TESTING is forced on so the test executable is configured even
-# if the standalone default differs.
+# if the standalone default differs. Under COVERAGE=1 the whole tree compiles
+# with clang + trace-pc-guard and links libcov.a (+ --build-id, which libfeedback
+# keys the buffer id on; + -ldl for dl_iterate_phdr in libfeedback).
 COPY libmultiprocess ./libmultiprocess
-RUN cmake -B build -S libmultiprocess -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Release \
+RUN set -e; \
+    if [ "$COVERAGE" = 1 ]; then \
+      CC=clang; CXX=clang++; \
+      COV_C="-fsanitize-coverage=trace-pc-guard"; \
+      COV_LD="-Wl,--build-id -L/cov -lcov -ldl"; \
+    else \
+      CC=cc; CXX=c++; COV_C=""; COV_LD=""; \
+    fi; \
+    cmake -B build -S libmultiprocess -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX" \
+      -DCMAKE_C_FLAGS="$COV_C" -DCMAKE_CXX_FLAGS="$COV_C" \
+      -DCMAKE_EXE_LINKER_FLAGS="$COV_LD" \
  && cmake --build build --target mptest -j"$(nproc)"
 # The mptest binary lands under build/ (typically build/test/mptest); locate it
 # robustly rather than hard-coding the path.

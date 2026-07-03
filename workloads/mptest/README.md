@@ -3,7 +3,8 @@
 Hunts the libmultiprocess IPC races behind bitcoin/bitcoin#35491 (the "make
 simultaneous IPC calls on a single remote thread" hang) and #34014 ("Promise
 already satisfied" / segfault) by running Bitcoin Core's `mptest` in a loop under
-an in-kernel `sched_ext` chaos scheduler, inside a deterministic bedrock VM.
+an in-kernel `sched_ext` PCT scheduler — Probabilistic Concurrency Testing,
+Burckhardt et al. ASPLOS'10 — inside a deterministic bedrock VM.
 
 ## How it works
 
@@ -11,14 +12,23 @@ an in-kernel `sched_ext` chaos scheduler, inside a deterministic bedrock VM.
   `MPTEST_MAX_ITERS` is reached, then emits one result line and halts the VM.
 - `run.sh` opts `mptest` into the fuzzing scheduler by wrapping it in
   `thread-fuzz`, which switches the process (and its forked IPC server) into
-  `SCHED_EXT`. The in-guest chaos scheduler (`guest/scx-fuzz`, loaded at boot by
-  `scx-init`) then starves threads in bursts to widen the race window.
+  `SCHED_EXT`. The in-guest PCT scheduler (`guest/scx-fuzz`, loaded at boot by
+  `scx-init`) then runs the highest-priority runnable thread and inserts a few
+  randomly-placed "change points" that demote the running thread, forcing the
+  rare preemptions that expose depth-d bugs. Unlike uniform chaos, PCT gives a
+  probabilistic lower bound on hitting a depth-d bug, concentrating the search on
+  the shallow (2-3 constraint) races these issues actually need.
+- Each `mptest` iteration is a fresh process, so the scheduler draws a fresh PCT
+  schedule (base priorities + change points) per execution — one boot is ~500
+  independent PCT samples, not one. Change points are placed on the emulated-TSC
+  clock (the deterministic proxy for PCT's step index) and demotions expire after
+  a bounded window, so scheduler starvation cannot masquerade as the #35491 hang.
 - Under bedrock's single vCPU + emulated TSC, the entire schedule is a pure
   function of the getrandom stream, which is fixed by the RDRAND seed. So a seed
   that reproduces a failure is a permanent, replayable repro.
-- The chaos profile (starvation timescale, gap, victim density, timeslice) is
-  drawn fresh per boot from that same seed-driven stream, so different seeds
-  explore genuinely different scheduling regimes rather than one fixed profile.
+- The per-boot PCT bounds (horizon range, timeslice, demotion cap, depth ceiling,
+  priority spread) are drawn fresh per boot from that same seed-driven stream, so
+  different seeds explore genuinely different regimes rather than one fixed one.
 
 ## Prerequisites
 
@@ -61,11 +71,11 @@ BEDROCK_RDRAND_SEED=0x<seed> nix run .#test-mptest-workload
 ```
 
 Without `BEDROCK_RDRAND_SEED` the run uses the fixed default seed (a single
-deterministic run). Each boot prints its chaos profile:
+deterministic run). Each boot prints its PCT profile:
 
 ```
-scx-fuzz profile:       starve=..us gap=..us reroll=..us slice=..us low=1/N cap=N%
-scx-fuzz profile-exact: starve_min_ns=.. starve_max_ns=.. ... starve_cap_pct=..
+scx-fuzz profile:       horizon=..us slice=..us demote<=..us depth<=N spread=N
+scx-fuzz profile-exact: horizon_min_ns=.. horizon_max_ns=.. ... prio_spread=..
 ```
 
 ## Fuzz
@@ -110,6 +120,46 @@ Pick N by RAM, not cores: at ~5 GB/VM, budget roughly `floor(free_GB / 5)` and
 leave headroom for the host. Prefix with `STOP_ON_REPRO=0` to keep all workers
 hunting after a find.
 
+## Coverage-guided fuzzing (optional)
+
+`fuzz-cov.sh` adds an edge-coverage feedback loop on top of the PCT sweep: each
+run dumps the guest's coverage buffer and the driver keeps a running union of
+edge coverage (AFL hitcount buckets), recording seeds that reach new edges as a
+corpus and reporting when new coverage plateaus.
+
+It needs an **instrumented image** (the default image carries no coverage):
+
+```bash
+COVERAGE=1 ./workloads/mptest/build.sh   # clang + trace-pc-guard + libfeedback
+./workloads/mptest/fuzz-cov.sh           # coverage-guided PCT sweep
+tail -f fuzz-cov-runs/summary.txt        # columns include new=/total=/plateau=
+```
+
+Under the hood: `COVERAGE=1` links `guest/libpcguard.c` + `libfeedback.c` into
+`mptest`, which registers a `cov-<build>` feedback buffer; `bedrock-cli
+--coverage-out <file>` (wired through the `BEDROCK_COVERAGE_OUT` env of the nix
+app) dumps it after the run. Without instrumentation the dumps are empty and
+`fuzz-cov.sh` degrades to a plain PCT seed sweep (`new=0` every run).
+
+Scope and caveats — read before relying on the numbers:
+
+- **This is coverage *accumulation + novelty + plateau* (Tier A), not local
+  mutation.** It selects and ranks whole seeds; it cannot yet breed a seed,
+  because the fuzzer input is a single PRNG seed with no positional locality
+  (flip one bit and the whole schedule re-rolls). Genuine AFL-style mutation
+  needs a **host-supplied positional pool input** feeding `scx-init`'s randomness
+  pool (so byte range k ↔ execution k, mutable in isolation). That is designed
+  but not yet wired — the two candidate paths (a file-backed GET_RANDOM source in
+  the random device, or a host-side file-xfer change so `scx-init` can pull the
+  pool at early boot) both touch determinism-critical code and need on-hardware
+  validation. The corpus `fuzz-cov.sh` records is exactly what that phase breeds.
+- **Edge coverage is *code* coverage, not *interleaving* coverage.** It rewards
+  schedules that reach new code (e.g. a race-opened error path) but cannot tell
+  two schedules apart when they run the same lines in a different racy order. A
+  concurrency-specific metric (communication pairs, cross-context-switch PC
+  pairs, or PCT-native change-point buckets — the scheduler can emit the last
+  almost for free) is the stronger follow-on.
+
 ## Reproduce a repro
 
 A found seed replays the same crash at the same iteration, given the same build.
@@ -131,9 +181,10 @@ BEDROCK_RDRAND_SEED=0x<seed> nix run .#test-mptest-workload
 Confirm determinism by running a repro seed 2-3 times: the result line and the
 `profile-exact` line must be identical each time.
 
-Note: editing `draw_profile` in `scx-init.c` re-maps every seed (it shifts the
-getrandom stream), so freeze the scheduler source once a hunt is underway, or use
-the logged `profile-exact` values to reconstruct the exact regime.
+Note: editing `draw_profile` in `scx-init.c` (or the per-epoch draws in
+`main.bpf.c`) re-maps every seed — it shifts the getrandom stream — so freeze the
+scheduler source once a hunt is underway, or use the logged `profile-exact`
+values to reconstruct the exact regime.
 
 ## Validate detection
 
@@ -166,9 +217,10 @@ Workload (set in `compose.yaml`, no image rebuild needed except as noted):
 | Path | Role |
 | --- | --- |
 | `run.sh` | Container entrypoint: the mptest loop + result classification. |
-| `build.sh` | Builds `images.tar` (+ provenance sidecar). |
+| `build.sh` | Builds `images.tar` (+ provenance sidecar). `COVERAGE=1` instruments mptest. |
 | `fuzz.sh` | Single-driver seed sweep. |
 | `fuzz-parallel.sh` | Runs N `fuzz.sh` workers in parallel. |
+| `fuzz-cov.sh` | Coverage-guided seed sweep (needs `COVERAGE=1` image). |
 | `compose.yaml` | Compose service + runtime env knobs. |
 | `mptest/` | Dockerfile + sources for the image. |
 

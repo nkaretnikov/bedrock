@@ -152,6 +152,46 @@ fn read_io_output(vm: &mut Vm, len: usize) -> io::Result<Vec<u8>> {
         .unwrap_or_default())
 }
 
+/// Dump the guest's coverage feedback buffer(s) to `path` as raw edge
+/// hitcounts. The guest registers coverage under an id of the form `cov-<build>`
+/// (or bare `cov`; see guest/libfeedback.c), and there may be several — one per
+/// instrumented process/build — so we enumerate registered buffers and
+/// prefix-match `cov` rather than look up a fixed id the way `read_io_output`
+/// does. All matches are merged byte-wise (saturating max) into one vector, the
+/// natural union of edge coverage. Writes an empty file if the guest registered
+/// no coverage buffer (e.g. an uninstrumented target). Returns the number of
+/// coverage buffers merged.
+fn dump_coverage(vm: &mut Vm, path: &str) -> io::Result<usize> {
+    let mut slots = Vec::new();
+    let mut idx = 0usize;
+    // Registration is contiguous, so the first unregistered slot ends the walk.
+    while let Some(info) = vm.get_feedback_buffer_info_at(idx)? {
+        if info.id_bytes().starts_with(b"cov") {
+            slots.push(idx);
+        }
+        idx += 1;
+    }
+
+    let mut merged: Vec<u8> = Vec::new();
+    for slot in slots.iter().copied() {
+        // Map lazily (map takes &mut, so it can't be held across the read).
+        if vm.feedback_buffer_at(slot).is_none() {
+            vm.map_feedback_buffer_at(slot)?;
+        }
+        if let Some(bytes) = vm.feedback_buffer_at(slot) {
+            if bytes.len() > merged.len() {
+                merged.resize(bytes.len(), 0);
+            }
+            for (m, &b) in merged.iter_mut().zip(bytes.iter()) {
+                *m = (*m).max(b);
+            }
+        }
+    }
+
+    std::fs::write(path, &merged)?;
+    Ok(slots.len())
+}
+
 /// Wait for Ctrl-C if wait flag is set.
 fn maybe_wait_for_ctrl_c(wait: bool) {
     if wait {
@@ -644,6 +684,16 @@ fn run() -> io::Result<()> {
         );
     } else {
         warn!("Failed to retrieve exit statistics");
+    }
+
+    // Dump the guest coverage buffer if requested (the signal a coverage-guided
+    // driver reads back). Independent of exit stats; a failure here must not sink
+    // the run, so it is logged, not propagated.
+    if let Some(ref path) = args.coverage_out {
+        match dump_coverage(&mut vm, path) {
+            Ok(n) => debug!("Wrote coverage ({} buffer(s)) to {}", n, path),
+            Err(e) => warn!("Failed to write coverage to {}: {}", path, e),
+        }
     }
 
     // Display userspace ioctl timing statistics

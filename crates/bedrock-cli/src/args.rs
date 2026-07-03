@@ -101,6 +101,13 @@ pub struct Args {
     #[arg(long = "exit-stats-json")]
     pub exit_stats_json: Option<String>,
 
+    /// After the run, dump the guest's coverage feedback buffer (edge
+    /// hitcounts, one saturating byte per edge) to this file. The guest must be
+    /// instrumented (e.g. `-fsanitize-coverage=trace-pc-guard` + libpcguard);
+    /// all `cov-*` buffers are merged (byte-wise max). Empty file if none.
+    #[arg(long = "coverage-out")]
+    pub coverage_out: Option<String>,
+
     /// Emulated TSC frequency in Hz (defaults to the kernel's built-in default)
     #[arg(long = "virt-tsc-frequency", value_parser = parse_u64)]
     pub virt_tsc_frequency: Option<u64>,

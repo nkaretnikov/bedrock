@@ -1,41 +1,62 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * Concurrency fuzzing scheduler, in-kernel BPF version.
+ * Concurrency fuzzing scheduler, in-kernel BPF version -- PCT policy.
  *
- * A sched_ext scheduler that perturbs the scheduling of a workload's containers
- * to manufacture the rare interleavings that surface concurrency bugs. The
- * whole policy runs here in the kernel, so that under a deterministic
- * hypervisor (bedrock: single vCPU + emulated TSC) a run is fully reproducible
- * from the getrandom stream that drives it.
+ * A sched_ext scheduler that manufactures the rare interleavings that surface
+ * concurrency bugs. The whole policy runs here in the kernel, so that under a
+ * deterministic hypervisor (bedrock: single vCPU + emulated TSC) a run is fully
+ * reproducible from the pool that drives it.
  *
- * Base policy: weighted virtual-time fair scheduling (à la scx_simple / CFS).
- * Non-frozen threads are scheduled fairly by accumulated, weight-scaled vtime;
- * the deliberate perturbations are the freezing below plus the base timeslice
- * length (slice_ns), both drawn per boot by scx-init — not a custom ordering
- * scheme. Each task's vtime is the kernel-provided p->scx.dsq_vtime; the shared
- * DSQ is ordered by it.
+ * Policy: PCT ("A Randomized Scheduler with Probabilistic Guarantees of Finding
+ * Bugs", Burckhardt et al., ASPLOS'10), replacing the earlier rr-style chaos
+ * starvation. PCT gives a provable lower bound on hitting any bug of "depth" d
+ * (d ordering constraints among n threads over k steps): >= 1 / (n * k^(d-1)).
+ * For the shallow libmultiprocess IPC races we hunt (bitcoin/bitcoin #35491,
+ * #34014), which need only 2-3 ordering constraints, that concentrates the
+ * search where the bugs are, rather than spending budget on deep, unlikely
+ * schedules the way uniform chaos does.
  *
- * Chaos (after rr's "chaos mode", R. O'Callahan 2016): designate a few "victim"
- * threads and starve them in bursts.
- *   - Two priorities, high and low. Each thread is low with probability
- *     1/low_prob_inv; the rest are high. The victim set re-randomizes every
- *     prio_reroll_ns: each period draws a fresh epoch_seed from the randomness pool
- *     and task_is_low() hashes (pid, epoch_seed), so membership re-rolls without
- *     any per-task storage (see task_is_low).
- *   - Periodically, for a short random interval (starve_min_ns..starve_max_ns),
- *     low-priority threads are not allowed to run at all — even if they are the
- *     only runnable threads. dispatch() simply skips them while an interval is
- *     open; everything else runs fair. High-priority threads are never frozen.
- *   - Because such intervals can stall forward progress, cumulative starvation
- *     is capped at starve_cap_pct% of elapsed run time.
- *   - Randomness (interval gaps/lengths and the per-epoch victim set) is drawn,
- *     one value per decision, from a pool that scx-init fills and continuously
- *     refreshes from the getrandom vmcall (NOT bpf_get_prandom_u32). bedrock
- *     serves that vmcall from its controlled, fuzzer-driven, replayable stream:
- *     deterministic on replay (same stream -> same schedule), and because each
- *     decision consumes a distinct pool entry the fuzzer steers decisions
- *     independently — mutating a late decision's input does not perturb the
- *     earlier schedule.
+ * Mechanism, textbook PCT:
+ *   - Each thread gets a random, fixed base priority. The scheduler always runs
+ *     the highest-priority *enabled* (runnable) thread -- a strict priority
+ *     policy. A thread only yields the CPU when it blocks (leaves the runnable
+ *     set) or when a higher-priority thread wakes.
+ *   - d-1 "change points" are placed in the execution. When a change point is
+ *     reached, the *currently running* thread's priority is lowered below every
+ *     base priority, so a different thread takes over. Those d-1 forced
+ *     preemptions, placed randomly, are what expose depth-d bugs.
+ *
+ * Three adaptations to this platform, each noted at its site below:
+ *   1. Per-execution epochs. mptest runs in a 500-iteration loop, each iteration
+ *      a fresh `thread-fuzz mptest` process; textbook PCT assumes ONE bounded
+ *      execution. So a fresh PCT schedule (base priorities + change points) is
+ *      drawn every time the governed task set goes empty -> non-empty (see
+ *      start_epoch / chaos_enable). One boot thus yields ~500 independent PCT
+ *      samples instead of one.
+ *   2. Change points are placed on the emulated-TSC clock, not on a count of
+ *      "steps" (visible memory operations, which we cannot see at the sched_ext
+ *      layer and whose total is unknown a priori). Time is the deterministic
+ *      proxy for PCT's step index; a per-epoch horizon is drawn and the d-1
+ *      points scattered across it, fired by a one-shot bpf_timer.
+ *   3. Bounded demotion lifetime as a starvation cap. Textbook PCT lowers a
+ *      thread's priority permanently, which -- if a higher-priority thread
+ *      busy-waits on a demoted one -- can livelock and masquerade as the #35491
+ *      hang. Each demotion therefore expires after max_demote_ns (drawn well
+ *      under run.sh's 30s hang watchdog), so a demotion cannot suppress its
+ *      victim long enough to look like the hang. For the typical sub-second
+ *      mptest iteration the demotion effectively lasts the whole execution
+ *      anyway. NOTE this bounds only *demotion*-induced starvation; the base
+ *      policy is strict priority, so PCT's standard assumption still holds --
+ *      threads are expected to make progress by blocking (futex/KJ async), and a
+ *      genuinely CPU-bound governed thread could still monopolize the vCPU and
+ *      surface as a hang. Under this deterministic VM such a case is a
+ *      reproducible, inspectable result rather than a silent flake.
+ *
+ * Input: the randomness pool (see intf.h). It is consumed positionally, one
+ * fixed SLOTS_PER_EPOCH window per epoch, so a host mutator can perturb a single
+ * execution's schedule in isolation. scx-init fills the pool from a testcase
+ * file if present, else from bedrock's deterministic getrandom stream; either
+ * way the whole run is a pure function of that input and replays exactly.
  *
  * Membership (who is governed):
  *   - Attached with SCX_OPS_SWITCH_PARTIAL, so it governs ONLY tasks whose
@@ -45,94 +66,83 @@
  *     fork/exec descendants inherit it. So every task we see was opted in
  *     explicitly: there is nothing to exclude.
  *
- * Mechanism: two DSQs. A vtime-ordered "fair" queue holds everything allowed to
- * run; dispatch() always pulls the lowest-vtime task from it. A "frozen" queue
- * holds low-priority victims parked during a starvation interval; while an
- * interval is open enqueue() routes victims there and dispatch() does not pull
- * from it, so they sit unrun (in the kernel's custody) until the interval ends,
- * when dispatch() releases them back to the runqueue. A one-shot timer kicks the
- * CPU at interval end so the release happens even if the CPU went idle.
+ * Mechanism (sched_ext): one vtime-ordered DSQ whose key encodes priority
+ * (KEY_BASE - priority), so dispatch() -- which always pulls the lowest key --
+ * runs the highest-priority runnable task. A thread that blocks leaves the DSQ;
+ * on wake it is re-inserted at its current priority. Demotions take effect the
+ * next time the demoted (running) thread is re-enqueued, hurried along by a
+ * preempt kick.
  */
 #include <scx/common.bpf.h>
 #include "intf.h"
 
 char _license[] SEC("license") = "GPL";
 
-/*
- * Two dispatch queues. The fair queue is vtime-ordered (p->scx.dsq_vtime) and
- * holds everything allowed to run; dispatch() always pulls from it. The frozen
- * queue holds low-priority victims parked during a starvation interval;
- * dispatch() does not pull from it while an interval is open, so those tasks sit
- * unrun until the interval ends and they are released back to the runqueue.
- */
-#define FAIR_DSQ_ID   0
-#define FROZEN_DSQ_ID 1
+/* Single dispatch queue, ordered by the priority-derived key below. */
+#define FAIR_DSQ_ID 0
 
 /* Bound for the kick loop in the timer callback. */
 #define MAX_CPUS 1024
 
-/* Virtual-time comparison that is safe across u64 wraparound. */
-#define vtime_before(a, b) ((s64)((a) - (b)) < 0)
+/*
+ * Maximum change points per epoch = max bug depth - 1. Must satisfy
+ * SLOTS_PER_EPOCH == 3 + MAX_CP (see intf.h): slots 3..3+MAX_CP-1 hold the
+ * change-point offset selectors.
+ */
+#define MAX_CP 5
+
+/*
+ * Priority-to-DSQ-key base. A task's key is KEY_BASE - priority, and dispatch
+ * pulls the lowest key, so a higher priority runs first. KEY_BASE is far above
+ * any priority (base priorities are max_depth + [0, prio_spread), demotions are
+ * [1, max_depth)), so the subtraction never underflows.
+ */
+#define KEY_BASE (1ULL << 20)
 
 /*
  * Read-only configuration, set by scx-init before the program is loaded.
  * "const volatile" is how sched_ext schedulers expose rodata to user space.
+ * These are per-boot bounds; the actual per-epoch values (depth, horizon,
+ * change-point placement, base priorities) are drawn from the pool at runtime.
  */
-const volatile u64 starve_min_ns;	/* starvation interval, low bound */
-const volatile u64 starve_max_ns;	/* starvation interval, high bound */
-const volatile u64 gap_min_ns;		/* gap between intervals, low bound */
-const volatile u64 gap_max_ns;		/* gap between intervals, high bound */
-const volatile u64 prio_reroll_ns;	/* how often priorities re-randomize */
-const volatile u64 low_prob_inv;	/* P(low) = 1/low_prob_inv */
-const volatile u64 starve_cap_pct;	/* max % of run time spent starving */
-const volatile u64 slice_ns;		/* base timeslice for the fair policy */
+const volatile u64 slice_ns;		/* base timeslice for the priority policy */
+const volatile u64 horizon_min_ns;	/* change-point horizon, low bound */
+const volatile u64 horizon_max_ns;	/* change-point horizon, high bound */
+const volatile u64 max_demote_ns;	/* how long a demotion lasts (starvation cap) */
+const volatile u32 max_depth;		/* max bug depth d (>= 2); depth drawn in [2, max_depth] */
+const volatile u32 prio_spread;		/* base-priority spread (>= 1) */
 const volatile bool logging;
 const volatile bool debug;		/* emit per-task membership diagnostics */
 
 /*
- * Running consume counter for the randomness pool (slot = rnd_idx % RND_POOL_N;
- * see intf.h for the pool's positional-control semantics). Non-static so scx-init
- * can read it (skel->bss->rnd_idx) to drive its half-at-a-time refresh.
+ * Global PCT epoch state. All of it is rewritten by start_epoch() and only ever
+ * touched from the ops callbacks, which are serialized on the single-vCPU
+ * target. Times are bpf_ktime_get_ns(), i.e. the deterministic emulated TSC.
  */
-u64 rnd_idx;
+static u64 epoch_no;		/* which execution this is; indexes the pool window */
+static bool epoch_active;	/* is a governed execution currently running */
+static u32 n_governed;		/* live SCHED_EXT tasks (epoch brackets its 0->…->0) */
+static u64 base_seed;		/* per-epoch key for the base-priority hash */
+static u32 depth;		/* bug depth d drawn this epoch */
+static u32 n_cp;		/* change points this epoch = depth - 1 */
+static u32 cur_pid;		/* pid of the task currently running (for demotion) */
+static u32 cur_prio;		/* its priority (for wake-preemption) */
 
-/*
- * Global virtual-time clock for the fair policy. Advances as tasks run (see
- * chaos_running); a task's vtime is clamped to within one slice of this so a
- * long-sleeping task can't accumulate unbounded scheduling credit.
- */
-static u64 vtime_now;
-
-/*
- * Global chaos schedule state, advanced lazily from enqueue (serialized on the
- * single-vCPU target). All times are bpf_ktime_get_ns(), i.e. the deterministic
- * emulated TSC.
- */
-static u64 epoch_start;		/* time of first enqueue (run start); 0 = unset */
-static u64 next_decision;	/* earliest time to open a new starvation interval */
-static u64 starve_begin;	/* start of the current interval */
-static u64 starve_until;	/* end of the current interval; 0 = not starving */
-static u64 total_starve_ns;	/* cumulative completed starvation (for the cap) */
-static u64 epoch_seed;		/* pool-drawn seed for the current victim epoch */
-static u64 prio_reroll_at;	/* next time to re-roll the victim set (new epoch_seed) */
-
-/*
- * No per-task storage. "Victim" status is derived deterministically from the
- * task's pid and the current priority epoch (see task_is_low), so there is
- * nothing to allocate on the enqueue hot path. Task-local storage is unusable
- * here anyway: bpf_task_storage_get() uses a trylock, and since enqueue runs
- * under the rq lock it returns NULL under load — on a busy workload (bitcoind's
- * ~50 threads) that fails >99% of the time, silently skipping the chaos policy.
- */
+/* The change-point schedule for this epoch, and the demotions it has produced. */
+static u64 cp_time[MAX_CP];	/* emulated-TSC time each change point fires */
+static u32 cp_prio[MAX_CP];	/* priority the demoted thread drops to */
+static bool cp_fired[MAX_CP];	/* whether it has fired yet */
+static u32 dem_pid[MAX_CP];	/* pid demoted by change point i */
+static u32 dem_prio[MAX_CP];	/* priority it was demoted to */
+static u64 dem_expire[MAX_CP];	/* when the demotion lifts (starvation cap) */
+static bool dem_active[MAX_CP];	/* whether this demotion is live */
 
 /*
  * Membership-log throttle (gated by the "debug" rodata flag). enqueue() runs on
  * every wakeup, so the "governed" membership line is sampled only for the first
- * few tasks to confirm the scheduler is live without flooding. The per-freeze
- * log is not throttled — it fires at most once per victim per starvation
- * interval, so it stays bounded yet keeps naming frozen threads for the whole run.
+ * few tasks to confirm the scheduler is live without flooding.
  */
-static u64 dbg_logged;		/* membership lines emitted so far */
+static u64 dbg_logged;
 
 /* Wrapper so the timer can live in an array map (bpf_timer needs map storage). */
 struct timer_wrap {
@@ -152,7 +162,7 @@ struct {
 	__uint(max_entries, 256 * 1024);
 } events SEC(".maps");
 
-/* Randomness pool, filled and refreshed by scx-init from the getrandom vmcall. */
+/* Randomness pool = the fuzzer input, filled by scx-init (see intf.h). */
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, RND_POOL_N);
@@ -160,31 +170,34 @@ struct {
 	__type(value, u64);
 } rnd_pool SEC(".maps");
 
-/*
- * Next value from the randomness pool, consumed strictly in order (see intf.h).
- * The mask is safe because RND_POOL_N is a power of two, keeping the index in
- * range for the verifier.
- */
-static __always_inline u64 rng_next(void)
+/* Read pool[idx], masked into range (RND_POOL_N is a power of two). */
+static __always_inline u64 pool_at(u32 idx)
 {
-	u32 i = rnd_idx & (RND_POOL_N - 1);
-	u64 *v;
+	u32 i = idx & (RND_POOL_N - 1);
+	u64 *v = bpf_map_lookup_elem(&rnd_pool, &i);
 
-	rnd_idx++;
-	v = bpf_map_lookup_elem(&rnd_pool, &i);
 	return v ? *v : 0;
 }
 
-/* Random value in the half-open range [min, max). */
-static __always_inline u64 rng_range(u64 min, u64 max)
+/*
+ * Finalizing hash of (a, b) -> u64. Used to derive stable per-thread base
+ * priorities from (pid, base_seed) with no per-task storage: task-local storage
+ * is unusable on the enqueue hot path here (bpf_task_storage_get() trylocks
+ * under the rq lock and fails >99% of the time on a busy workload).
+ */
+static __always_inline u64 hash2(u64 a, u64 b)
 {
-	if (min >= max)
-		return min;
-	return min + rng_next() % (max - min);
+	u64 h = a * 0x9E3779B97F4A7C15ULL;
+
+	h ^= b * 0xD1B54A32D192ED03ULL;
+	h ^= h >> 33;
+	h *= 0xFF51AFD7ED558CCDULL;
+	h ^= h >> 33;
+	return h;
 }
 
-static __always_inline void log_event(struct task_struct *p, u32 type, u64 now,
-				       u64 duration_ns)
+static __always_inline void log_event(u32 pid, const char *comm, u32 type,
+				       u64 now, u64 payload)
 {
 	struct fuzz_event *e;
 
@@ -194,97 +207,156 @@ static __always_inline void log_event(struct task_struct *p, u32 type, u64 now,
 	if (!e)
 		return;
 	e->time_ns = now;
-	e->duration_ns = duration_ns;
-	e->pid = BPF_CORE_READ(p, pid);
+	e->duration_ns = payload;
+	e->pid = pid;
 	e->event_type = type;
-	bpf_probe_read_kernel_str(e->comm, sizeof(e->comm), BPF_CORE_READ(p, comm));
+	if (comm)
+		bpf_probe_read_kernel_str(e->comm, sizeof(e->comm), comm);
+	else
+		e->comm[0] = '\0';
 	bpf_ringbuf_submit(e, 0);
 }
 
-/*
- * Arm the one-shot release timer to fire in `delay` ns. The timer exists only
- * to wake parked victims when a starvation interval ends, so it is armed when an
- * interval opens and never otherwise. A workload that isn't being starved pays
- * no periodic timer overhead at all.
- */
-static __always_inline void arm_release(u64 delay)
+/* Arm the one-shot change-point timer to fire in `delay` ns (delay clamped >0). */
+static __always_inline void arm_timer(u64 delay)
 {
 	struct timer_wrap *tw;
 	u32 zero = 0;
 
+	if ((s64)delay <= 0)
+		delay = 1;
 	tw = bpf_map_lookup_elem(&timer_map, &zero);
 	if (tw)
 		bpf_timer_start(&tw->timer, delay, 0);
 }
 
 /*
- * Advance the global chaos schedule: re-randomize priorities on a period, close
- * a finished starvation interval, and maybe open a new one (subject to the
- * cap). Driven by enqueue, which is serialized on the single-vCPU target.
+ * Start a fresh PCT epoch for a new governed execution. Draws the whole schedule
+ * from this epoch's pool window (positional; see intf.h): a base-priority seed, a
+ * bug depth d, a horizon, and d-1 change-point times scattered across it. The
+ * change points are laid down as cumulative gaps so cp_time[] is monotonic by
+ * construction -- no sort -- and each is assigned a distinct demotion priority
+ * d-1, d-2, …, 1 (earlier point -> higher residual priority, as textbook PCT).
  */
-static __always_inline void advance_schedule(struct task_struct *p, u64 now)
+static __always_inline void start_epoch(u64 now)
 {
-	if (epoch_start == 0) {
-		epoch_start = now;
-		next_decision = now + rng_range(gap_min_ns, gap_max_ns);
-		prio_reroll_at = now + prio_reroll_ns;
-	}
+	u32 base = (u32)((epoch_no % EPOCHS_MAX) * SLOTS_PER_EPOCH);
+	u64 horizon, span, t;
+	u32 d;
+	int i;
 
-	/* Periodically re-randomize thread priorities. A fresh epoch_seed drawn
-	 * from the randomness pool shifts the victim set: task_is_low() hashes
-	 * (pid, epoch_seed), so every task's low/high status re-rolls when the seed
-	 * changes — no per-task state, and each re-roll is its own fuzzer input. */
-	if (now >= prio_reroll_at) {
-		epoch_seed = rng_next();
-		prio_reroll_at = now + prio_reroll_ns;
-	}
+	base_seed = pool_at(base + 0);
 
-	/* Close a finished starvation interval and schedule the next gap. */
-	if (starve_until && now >= starve_until) {
-		total_starve_ns += starve_until - starve_begin;
-		starve_until = 0;
-		next_decision = now + rng_range(gap_min_ns, gap_max_ns);
-	}
+	/* Depth d in [2, max_depth]; n_cp = d-1 change points, capped at MAX_CP. */
+	d = 2 + (u32)(pool_at(base + 1) % (max_depth >= 2 ? max_depth - 1 : 1));
+	if (d < 2)
+		d = 2;
+	if (d > max_depth)
+		d = max_depth;
+	depth = d;
+	n_cp = d - 1;
+	if (n_cp > MAX_CP)
+		n_cp = MAX_CP;
 
-	/* Maybe open a new starvation interval. Gate on cumulative starvation so
-	 * far (not counting the new interval) so an interval can open from the
-	 * very start of the run, while long-run starvation still converges to
-	 * <= starve_cap_pct% of elapsed time. Bounds priority-inversion hangs. */
-	if (!starve_until && now >= next_decision) {
-		u64 elapsed = now - epoch_start;
+	/* Horizon: the emulated-TSC window the change points are scattered over. */
+	horizon = horizon_min_ns;
+	if (horizon_max_ns > horizon_min_ns)
+		horizon += pool_at(base + 2) % (horizon_max_ns - horizon_min_ns);
+	span = n_cp ? horizon / n_cp : horizon;
+	if (span == 0)
+		span = 1;
 
-		if (total_starve_ns * 100 <= elapsed * starve_cap_pct) {
-			u64 len = rng_range(starve_min_ns, starve_max_ns);
+	/* Scatter the change points as cumulative gaps in (0, 2*span] so they are
+	 * monotonically increasing and average out to ~horizon total. */
+	t = now;
+	for (i = 0; i < MAX_CP; i++) {
+		if (i < (int)n_cp) {
+			u64 gap = 1 + pool_at(base + 3 + i) % (2 * span);
 
-			starve_begin = now;
-			starve_until = now + len;
-			arm_release(len);
-			log_event(p, FUZZ_EVENT_STARVE_BEGIN, now, len);
+			t += gap;
+			cp_time[i] = t;
+			cp_prio[i] = d - 1 - (u32)i;	/* d-1, d-2, …, 1 */
+			cp_fired[i] = false;
 		} else {
-			next_decision = now + rng_range(gap_min_ns, gap_max_ns);
+			cp_time[i] = 0;
+			cp_prio[i] = 0;
+			cp_fired[i] = true;		/* inert */
 		}
+		dem_active[i] = false;
+		dem_pid[i] = 0;
+		dem_prio[i] = 0;
+		dem_expire[i] = 0;
 	}
+
+	log_event(depth, NULL, FUZZ_EVENT_EPOCH_BEGIN, now, horizon);
+
+	if (n_cp)
+		arm_timer(cp_time[0] - now);
+
+	epoch_no++;
+}
+
+/* Base priority of a thread: high (>= max_depth), stable within an epoch. */
+static __always_inline u32 base_prio(u32 pid)
+{
+	return max_depth + (u32)(hash2(pid, base_seed) % prio_spread);
 }
 
 /*
- * Is this task a low-priority "victim" in the current priority epoch? Derived
- * deterministically from (pid, epoch_seed) with a finalizing hash, so it needs
- * no per-task storage and draws nothing from the randomness pool itself: it is stable
- * within an epoch, re-rolls when epoch_seed is redrawn (every prio_reroll_ns),
- * and is low with probability 1/low_prob_inv. epoch_seed is a randomness-pool value,
- * so which threads are victims is fuzzer-driven yet reproducible on replay.
- * NOTE: must NOT call rng_next() — the pool-consume order has to stay tied to the
- * (deterministic) enqueue sequence, independent of which tasks are sampled.
+ * Current priority of a thread: its base priority, unless a live (unexpired)
+ * change-point demotion has lowered it. Multiple change points can demote the
+ * same thread; the lowest (most recent) demotion wins.
  */
-static __always_inline bool task_is_low(struct task_struct *p)
+static __always_inline u32 task_prio(u32 pid, u64 now)
 {
-	u64 h = (u64)BPF_CORE_READ(p, pid) * 0x9E3779B97F4A7C15ULL;
+	u32 prio = base_prio(pid);
+	int i;
 
-	h ^= epoch_seed * 0xD1B54A32D192ED03ULL;
-	h ^= h >> 33;
-	h *= 0xFF51AFD7ED558CCDULL;
-	h ^= h >> 33;
-	return low_prob_inv ? (h % low_prob_inv) == 0 : false;
+	for (i = 0; i < MAX_CP; i++) {
+		if (dem_active[i] && dem_pid[i] == pid && now < dem_expire[i] &&
+		    dem_prio[i] < prio)
+			prio = dem_prio[i];
+	}
+	return prio;
+}
+
+/*
+ * Advance the change-point schedule: fire every change point now due, demoting
+ * the currently-running thread, and re-arm the timer for the next one. Called
+ * from the scheduling hooks and from the timer, all serialized on the single
+ * vCPU. A preempt kick follows a firing so the just-demoted running thread is
+ * re-enqueued (at its new low priority) promptly.
+ */
+static __always_inline void advance_schedule(u64 now)
+{
+	bool need_preempt = false;
+	u64 next_t = 0;
+	int i;
+
+	if (!epoch_active)
+		return;
+
+	for (i = 0; i < MAX_CP; i++) {
+		if (i >= (int)n_cp || cp_fired[i])
+			continue;
+		if (now >= cp_time[i]) {
+			cp_fired[i] = true;
+			dem_active[i] = true;
+			dem_pid[i] = cur_pid;
+			dem_prio[i] = cp_prio[i];
+			dem_expire[i] = now + max_demote_ns;
+			log_event(cur_pid, NULL, FUZZ_EVENT_DEMOTE, now,
+				  cp_prio[i]);
+			need_preempt = true;
+		} else if (next_t == 0 || cp_time[i] < next_t) {
+			next_t = cp_time[i];
+		}
+	}
+
+	if (next_t)
+		arm_timer(next_t - now);
+	if (need_preempt)
+		scx_bpf_kick_cpu(0, SCX_KICK_PREEMPT);
 }
 
 s32 BPF_STRUCT_OPS(chaos_select_cpu, struct task_struct *p, s32 prev_cpu,
@@ -292,8 +364,7 @@ s32 BPF_STRUCT_OPS(chaos_select_cpu, struct task_struct *p, s32 prev_cpu,
 {
 	/*
 	 * Do not direct-dispatch here. Returning prev_cpu without inserting the
-	 * task forces every wakeup through enqueue(), so the chaos policy sees
-	 * it.
+	 * task forces every wakeup through enqueue(), so the policy sees it.
 	 */
 	return prev_cpu;
 }
@@ -301,90 +372,72 @@ s32 BPF_STRUCT_OPS(chaos_select_cpu, struct task_struct *p, s32 prev_cpu,
 void BPF_STRUCT_OPS(chaos_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	u64 now = bpf_ktime_get_ns();
-	u64 vtime = p->scx.dsq_vtime;
+	u32 pid = BPF_CORE_READ(p, pid);
+	u32 prio;
+	u64 key;
 
-	/*
-	 * Every task we see was opted in explicitly: thread-fuzz sets SCHED_EXT
-	 * on the wrapped process (its descendants inherit it), and
-	 * SCX_OPS_SWITCH_PARTIAL means only SCHED_EXT tasks reach us. So there is
-	 * nothing to exclude: fuzz them all. Advance the chaos schedule first.
-	 */
-	advance_schedule(p, now);
+	/* Fire any due change points before pricing this task. */
+	advance_schedule(now);
 
-	/* Membership diagnostic: log the first few governed tasks (the comm shows
-	 * the real payload — bitcoind, b-net, … — not crun's pre-exec name). */
+	prio = task_prio(pid, now);
+	key = KEY_BASE - prio;	/* higher priority -> lower key -> runs first */
+
 	if (debug && dbg_logged < 64) {
 		dbg_logged++;
-		log_event(p, FUZZ_EVENT_DEBUG, now, BPF_CORE_READ(p, pid));
+		log_event(pid, BPF_CORE_READ(p, comm), FUZZ_EVENT_DEBUG, now,
+			  pid);
 	}
 
-	/*
-	 * Freeze: while an interval is open, route low-priority victims to the
-	 * frozen DSQ. dispatch() does not pull from it until the interval ends, so
-	 * the victim is parked (in the kernel's custody) but unrun. Everything else
-	 * — and victims outside an interval — goes to the fair DSQ.
-	 */
-	if (task_is_low(p) && starve_until && now < starve_until) {
-		if (debug)
-			log_event(p, FUZZ_EVENT_LOW_PRIO, now, starve_until - now);
-		scx_bpf_dsq_insert(p, FROZEN_DSQ_ID, slice_ns, enq_flags);
-		return;
-	}
+	scx_bpf_dsq_insert_vtime(p, FAIR_DSQ_ID, slice_ns, key, enq_flags);
 
 	/*
-	 * Weighted-vtime fair ordering. Clamp the task's accumulated vtime so a
-	 * long sleeper gains at most one slice of credit, then queue it. dispatch
-	 * runs the lowest-vtime task in this DSQ.
+	 * PCT runs the highest-priority enabled thread: if this waker outranks the
+	 * task on the CPU, kick a preempt so it takes over at the next dispatch
+	 * rather than waiting out the running slice.
 	 */
-	if (vtime_before(vtime, vtime_now - slice_ns))
-		vtime = vtime_now - slice_ns;
-	scx_bpf_dsq_insert_vtime(p, FAIR_DSQ_ID, slice_ns, vtime, enq_flags);
+	if (epoch_active && prio > cur_prio)
+		scx_bpf_kick_cpu(0, SCX_KICK_PREEMPT);
 }
 
 void BPF_STRUCT_OPS(chaos_dispatch, s32 cpu, struct task_struct *prev)
 {
-	u64 now = bpf_ktime_get_ns();
-	bool starving = starve_until && now < starve_until;
-
-	/*
-	 * When no interval is open, first release any parked victims by moving the
-	 * head of the frozen DSQ to the local CPU; over successive dispatch calls
-	 * this drains the frozen queue back into normal scheduling. (No-op when the
-	 * frozen DSQ is empty.) During an interval we skip this, so victims stay
-	 * parked — even if they are the only runnable tasks, the CPU just idles
-	 * until the one-shot release timer fires at interval end.
-	 */
-	if (!starving)
-		scx_bpf_dsq_move_to_local(FROZEN_DSQ_ID);
-
-	/* Run the lowest-vtime fair task. */
+	advance_schedule(bpf_ktime_get_ns());
+	/* Run the highest-priority (lowest-key) runnable task. */
 	scx_bpf_dsq_move_to_local(FAIR_DSQ_ID);
 }
 
-/* Keep the global virtual clock moving forward as tasks start running. */
+/* Track the running task so a change point knows whom to demote and so
+ * wake-preemption can compare priorities. */
 void BPF_STRUCT_OPS(chaos_running, struct task_struct *p)
 {
-	if (vtime_before(vtime_now, p->scx.dsq_vtime))
-		vtime_now = p->scx.dsq_vtime;
+	cur_pid = BPF_CORE_READ(p, pid);
+	cur_prio = task_prio(cur_pid, bpf_ktime_get_ns());
 }
 
-/* Charge the time the task ran, scaled by the inverse of its weight, so
- * higher-weight (lower-nice) tasks accumulate vtime more slowly and thus get a
- * larger share of the CPU — i.e. weighted fairness. */
-void BPF_STRUCT_OPS(chaos_stopping, struct task_struct *p, bool runnable)
-{
-	u32 weight = p->scx.weight;
-
-	if (!weight)
-		weight = 100;	/* nice-0 weight; guards a div-by-zero */
-	p->scx.dsq_vtime += (slice_ns - p->scx.slice) * 100 / weight;
-}
-
-/* A task entering the scheduler starts at the current global vtime, so it
- * neither dominates (huge negative credit) nor is penalized on entry. */
+/*
+ * Per-execution epoch bracketing. n_governed counts live SCHED_EXT tasks; a new
+ * PCT schedule is drawn when it rises from zero (a fresh `thread-fuzz mptest`
+ * process starting) and the epoch closes when it falls back to zero (that
+ * iteration's threads and its forked IPC server have all exited).
+ */
 void BPF_STRUCT_OPS(chaos_enable, struct task_struct *p)
 {
-	p->scx.dsq_vtime = vtime_now;
+	n_governed++;
+	if (n_governed == 1) {
+		epoch_active = true;
+		start_epoch(bpf_ktime_get_ns());
+	}
+}
+
+void BPF_STRUCT_OPS(chaos_disable, struct task_struct *p)
+{
+	if (n_governed > 0)
+		n_governed--;
+	if (n_governed == 0) {
+		epoch_active = false;
+		cur_pid = 0;
+		cur_prio = 0;
+	}
 }
 
 static int timer_cb(void *map, int *key, struct timer_wrap *tw)
@@ -393,20 +446,17 @@ static int timer_cb(void *map, int *key, struct timer_wrap *tw)
 	u32 i;
 
 	/*
-	 * One-shot: kick the CPUs so dispatch re-runs and releases victims whose
-	 * starvation interval has just ended, even if the system would otherwise
-	 * idle. NOT re-armed here — the timer is re-armed only when the next
-	 * interval opens (advance_schedule), so a non-starving workload incurs no
-	 * periodic timer overhead. On the single-vCPU target this is just CPU 0;
-	 * the bounded loop keeps it correct on multi-CPU hosts and keeps the
-	 * verifier happy.
+	 * Kick the CPU(s) so dispatch re-runs and advance_schedule() fires the
+	 * change point that just came due, even if the CPU was idle. On the
+	 * single-vCPU target this is just CPU 0; the bounded loop keeps it correct
+	 * on a multi-CPU host and keeps the verifier happy. Not re-armed here --
+	 * advance_schedule() arms the next one.
 	 */
 	for (i = 0; i < MAX_CPUS; i++) {
 		if (i >= nr)
 			break;
 		scx_bpf_kick_cpu(i, 0);
 	}
-
 	return 0;
 }
 
@@ -419,23 +469,13 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(chaos_init)
 	ret = scx_bpf_create_dsq(FAIR_DSQ_ID, -1);
 	if (ret)
 		return ret;
-	ret = scx_bpf_create_dsq(FROZEN_DSQ_ID, -1);
-	if (ret)
-		return ret;
-
-	/* Draw the first victim set from the randomness pool. scx-init has already
-	 * filled the pool, so this consumes pool[0]; subsequent epochs re-roll from
-	 * later pool entries in advance_schedule. */
-	epoch_seed = rng_next();
 
 	tw = bpf_map_lookup_elem(&timer_map, &zero);
 	if (!tw)
 		return -1;
 	bpf_timer_init(&tw->timer, &timer_map, CLOCK_MONOTONIC);
 	bpf_timer_set_callback(&tw->timer, timer_cb);
-	/* Not started here: armed on demand (arm_release) when a starvation
-	 * interval opens, so there is no periodic timer when nothing is being
-	 * starved. */
+	/* Armed on demand by start_epoch/advance_schedule; no periodic timer. */
 
 	return 0;
 }
@@ -446,14 +486,14 @@ struct sched_ext_ops chaos_ops = {
 	.enqueue    = (void *)chaos_enqueue,
 	.dispatch   = (void *)chaos_dispatch,
 	.running    = (void *)chaos_running,
-	.stopping   = (void *)chaos_stopping,
 	.enable     = (void *)chaos_enable,
+	.disable    = (void *)chaos_disable,
 	.init       = (void *)chaos_init,
 	/*
 	 * SCX_OPS_SWITCH_PARTIAL: govern only tasks whose policy is SCHED_EXT
 	 * (thread-fuzz opts the workload in); everything else stays on stock CFS.
-	 * SCX_OPS_ENQ_LAST: keep getting enqueue() for the last runnable task so
-	 * a lone victim still cycles through the policy.
+	 * SCX_OPS_ENQ_LAST: keep getting enqueue() for the last runnable task so a
+	 * lone demoted thread still cycles through the policy.
 	 */
 	.flags      = SCX_OPS_SWITCH_PARTIAL | SCX_OPS_ENQ_LAST,
 	.timeout_ms = 5000,

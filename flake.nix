@@ -266,6 +266,7 @@
             echo "--- Booting mptest podman guest ---"
             bedrock-cli -m 5120 \
               ''${BEDROCK_RDRAND_SEED:+-s "$BEDROCK_RDRAND_SEED"} \
+              ''${BEDROCK_COVERAGE_OUT:+--coverage-out "$BEDROCK_COVERAGE_OUT"} \
               -i ${podmanInitrd} \
               --file compose.yaml=workloads/mptest/compose.yaml \
               --file images.tar=workloads/mptest/images.tar \

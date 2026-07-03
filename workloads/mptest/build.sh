@@ -42,18 +42,29 @@ fi
 # Stage inputs that live outside the Docker build context into it: Docker's COPY
 # cannot reach files outside the context, so we copy them in here and remove them
 # on exit, keeping one source of truth instead of committed dups.
-#   - guest/libvmcall.h : the shared header-only guest hypercall library.
-#   - libmultiprocess/  : the vendored mptest source from the Bitcoin checkout.
-trap 'rm -rf mptest/libvmcall.h mptest/libmultiprocess' EXIT
+#   - guest/libvmcall.h                       : shared header-only hypercall lib.
+#   - guest/libfeedback.{c,h}, libpcguard.c   : coverage-feedback runtime, linked
+#                                               into mptest only when COVERAGE=1.
+#   - libmultiprocess/                        : vendored mptest source.
+trap 'rm -rf mptest/libvmcall.h mptest/libfeedback.c mptest/libfeedback.h mptest/libpcguard.c mptest/libmultiprocess' EXIT
 cp ../../guest/libvmcall.h mptest/libvmcall.h
+cp ../../guest/libfeedback.c mptest/libfeedback.c
+cp ../../guest/libfeedback.h mptest/libfeedback.h
+cp ../../guest/libpcguard.c mptest/libpcguard.c
 rm -rf mptest/libmultiprocess
 # Copy the tree without its build artifacts / VCS metadata so the context stays
 # small and the build is not polluted by a prior host-side cmake build dir.
 cp -r "$LMP_SRC" mptest/libmultiprocess
 rm -rf mptest/libmultiprocess/build mptest/libmultiprocess/.git
 
-echo "Building mptest from $LMP_SRC"
-$DOCKER build -t bedrock/mptest:latest mptest/
+# Coverage build (opt-in): COVERAGE=1 compiles mptest with SanitizerCoverage
+# trace-pc-guard and links the libfeedback runtime, so a run registers an edge
+# coverage buffer the host reads back with `bedrock-cli --coverage-out`. Default
+# (COVERAGE=0) leaves the image byte-for-byte as before.
+COVERAGE="${COVERAGE:-0}"
+
+echo "Building mptest from $LMP_SRC (COVERAGE=$COVERAGE)"
+$DOCKER build --build-arg "COVERAGE=$COVERAGE" -t bedrock/mptest:latest mptest/
 
 # Pack into one docker-archive. `podman load` inside the initrd reads the
 # embedded manifest to recover the image's name+tag, so the tarball's filename

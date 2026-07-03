@@ -39,12 +39,12 @@
 #include "intf.h"
 #include "fuzz_bpf.skel.h"
 
-// Chaos-mode parameters (after rr's chaos mode) are drawn fresh per boot from
-// the deterministic getrandom stream (see draw_profile below), not fixed here:
-// each run samples a different scheduling regime -- timescale, victim density,
-// timeslice -- so the fuzzer explores schedules broadly instead of re-sampling a
-// single fixed profile through the randomness pool alone. The draw is a pure
-// function of the seed, so a given seed replays the same profile exactly.
+// Per-boot PCT bounds (depth ceiling, horizon range, timeslice, demotion cap,
+// priority spread) are drawn fresh per boot from the deterministic getrandom
+// stream (see draw_profile below), not fixed here: each boot samples a different
+// regime. The actual per-execution schedule is drawn by the BPF scheduler from
+// the randomness pool at runtime. Both draws are a pure function of the input, so
+// a given input replays the same profile and schedule exactly.
 
 static volatile sig_atomic_t stop;
 
@@ -66,15 +66,15 @@ static int handle_event(void *ctx, void *data, size_t size)
 	unsigned long long ms = (e->time_ns % 1000000000ULL) / 1000000ULL;
 
 	switch (e->event_type) {
-	case FUZZ_EVENT_STARVE_BEGIN:
-		printf("[%6llu.%03llu] starvation interval: %llums "
-		       "(low-priority threads blocked)\n",
-		       sec, ms, e->duration_ns / 1000000ULL);
+	case FUZZ_EVENT_EPOCH_BEGIN:
+		printf("[%6llu.%03llu] PCT epoch: depth=%u horizon=%lluus "
+		       "(new execution schedule)\n",
+		       sec, ms, e->pid, e->duration_ns / 1000ULL);
 		break;
-	case FUZZ_EVENT_LOW_PRIO:
-		printf("[%6llu.%03llu] froze %s (pid %u) for %llums "
-		       "(starvation victim)\n",
-		       sec, ms, e->comm, e->pid, e->duration_ns / 1000000ULL);
+	case FUZZ_EVENT_DEMOTE:
+		printf("[%6llu.%03llu] change point: demoted pid %u to prio %llu "
+		       "(forced preemption)\n",
+		       sec, ms, e->pid, (unsigned long long)e->duration_ns);
 		break;
 	case FUZZ_EVENT_DEBUG:
 		printf("[%6llu.%03llu] debug: %s (pid %u) governed by scx-fuzz\n",
@@ -144,56 +144,62 @@ static uint64_t log_uniform(uint64_t r_oct, uint64_t r_mant,
 	return base + (r_mant % base);
 }
 
-/* A chaos-mode configuration, drawn fresh per boot from the getrandom stream. */
-struct chaos_profile {
-	uint64_t starve_min_ns, starve_max_ns;
-	uint64_t gap_min_ns, gap_max_ns;
-	uint64_t prio_reroll_ns;
-	uint64_t low_prob_inv;
-	uint64_t starve_cap_pct;
-	uint64_t slice_ns;
+/*
+ * Per-boot PCT bounds. The BPF scheduler draws the actual per-epoch schedule
+ * (depth, horizon, change-point placement, base priorities) from the pool at
+ * runtime; these rodata values only set the ranges it draws within, and give
+ * each boot a distinct regime that is logged (profile-exact) for reproducibility.
+ */
+struct pct_profile {
+	uint64_t slice_ns;		/* base timeslice */
+	uint64_t horizon_min_ns;	/* change-point horizon, low bound */
+	uint64_t horizon_max_ns;	/* change-point horizon, high bound */
+	uint64_t max_demote_ns;		/* demotion lifetime = starvation cap */
+	uint32_t max_depth;		/* max bug depth d (>= 2) */
+	uint32_t prio_spread;		/* base-priority spread */
 };
 
 /*
- * Draw a chaos profile from getrandom (the guest kernel sources it from
- * bedrock's deterministic, seed-driven stream). Consumes randomness BEFORE the
- * pool is filled, so the whole run stays a pure function of BEDROCK_RDRAND_SEED
- * and replays exactly. Returns 0/-1.
+ * Draw a PCT profile from getrandom (the guest kernel sources it from bedrock's
+ * deterministic, seed-driven stream). Consumes randomness BEFORE the pool is
+ * filled, so the whole run stays a pure function of the input and replays
+ * exactly. Returns 0/-1.
  *
- * Why per-boot (vs the old fixed profile):
- *   - Timescale S is log-uniform ~8us..2.1s. The old profile pinned starvation
- *     at 50ms..1.5s, far coarser than an IPC race window, so a freeze only landed
- *     *around* a concurrent IPC call, never inside one. Sampling down to
- *     microseconds manufactures the fine interleavings too.
- *   - Victims are denser (1/2..1/6, not the old 1/8) and re-roll fast relative to
- *     the interval, so mptest's two-or-three critical threads are frequently the
- *     ones frozen, and a thread that is "high" this epoch becomes a victim a few
- *     epochs later instead of never being frozen.
- *   - The base timeslice is randomized (log-uniform ~8us..4ms), varying
- *     preemption granularity.
- * By construction the max single interval (~2.1s) stays well under run.sh's 30s
- * hang watchdog, so scheduler starvation alone cannot masquerade as the #35491
- * hang.
+ *   - Horizon (the emulated-TSC window the d-1 change points are scattered over)
+ *     is bounded by a log-uniform ~8us..2.1s ceiling with a floor at ceiling/16.
+ *     Sampling down to microseconds lets a change point land *inside* an IPC race
+ *     window, not just around it.
+ *   - The base timeslice is log-uniform ~8us..4ms, varying preemption
+ *     granularity for the strict-priority policy.
+ *   - max_demote_ns (how long a change-point demotion suppresses its victim) is
+ *     log-uniform ~1ms..2.1s -- well under run.sh's 30s hang watchdog, so PCT
+ *     starvation alone cannot masquerade as the #35491 hang.
+ *   - max_depth (the bug-depth ceiling; per-epoch depth is drawn in [2, max_depth]
+ *     inside the scheduler) is 3..6, and prio_spread (how finely base priorities
+ *     separate threads) is one of 32/64/128/256 -- >= mptest's live thread count,
+ *     so priorities are mostly distinct.
  */
-static int draw_profile(struct chaos_profile *pf)
+static int draw_profile(struct pct_profile *pf)
 {
-	static const uint64_t inv_choices[] = { 2, 2, 3, 3, 4, 6 };
-	uint64_t r[9];
+	static const uint32_t spread_choices[] = { 32, 64, 128, 256 };
+	uint64_t r[8];
 
 	if (get_random(r, sizeof(r)) != 0)
 		return -1;
 
-	uint64_t S = log_uniform(r[0], r[1], 13, 31);	/* [8.2us, 2.1s) */
+	uint64_t H = log_uniform(r[0], r[1], 13, 31);	/* [8.2us, 2.1s) */
 
-	pf->starve_max_ns = S;
-	pf->starve_min_ns = S >> (1 + (r[2] % 3));	/* S/2, S/4, or S/8 */
-	pf->gap_max_ns = S >> (r[3] % 3);		/* S, S/2, or S/4 */
-	pf->gap_min_ns = pf->gap_max_ns >> 2;
-	pf->prio_reroll_ns = S >> (r[4] % 2);		/* S or S/2 */
-	pf->slice_ns = log_uniform(r[5], r[6], 13, 22);	/* [8.2us, 4.2ms) */
-	pf->low_prob_inv =
-		inv_choices[r[7] % (sizeof(inv_choices) / sizeof(inv_choices[0]))];
-	pf->starve_cap_pct = 30 + r[8] % 46;		/* 30..75% */
+	pf->horizon_max_ns = H;
+	pf->horizon_min_ns = H >> 4;			/* H/16 */
+	if (pf->horizon_min_ns < 8192)
+		pf->horizon_min_ns = 8192;		/* keep min < max, > 0 */
+	if (pf->horizon_min_ns >= pf->horizon_max_ns)
+		pf->horizon_max_ns = pf->horizon_min_ns + 1;
+	pf->slice_ns = log_uniform(r[2], r[3], 13, 22);	/* [8.2us, 4.2ms) */
+	pf->max_demote_ns = log_uniform(r[4], r[5], 20, 31);	/* [1ms, 2.1s) */
+	pf->max_depth = 3 + (uint32_t)(r[6] % 4);	/* 3..6 (n_cp <= MAX_CP=5) */
+	pf->prio_spread =
+		spread_choices[r[7] % (sizeof(spread_choices) / sizeof(spread_choices[0]))];
 
 	return 0;
 }
@@ -216,20 +222,18 @@ int main(int argc, char **argv)
 	// scheduling regime, so the fuzzer explores timescales and victim densities
 	// rather than re-sampling one fixed profile; the choice is a pure function of
 	// the seed, so it replays exactly.
-	struct chaos_profile pf;
+	struct pct_profile pf;
 	if (draw_profile(&pf) != 0) {
-		fprintf(stderr, "failed to draw chaos profile\n");
+		fprintf(stderr, "failed to draw PCT profile\n");
 		err = 2;
 		goto cleanup_skel;
 	}
-	skel->rodata->starve_min_ns = pf.starve_min_ns;
-	skel->rodata->starve_max_ns = pf.starve_max_ns;
-	skel->rodata->gap_min_ns = pf.gap_min_ns;
-	skel->rodata->gap_max_ns = pf.gap_max_ns;
-	skel->rodata->prio_reroll_ns = pf.prio_reroll_ns;
-	skel->rodata->low_prob_inv = pf.low_prob_inv;
-	skel->rodata->starve_cap_pct = pf.starve_cap_pct;
 	skel->rodata->slice_ns = pf.slice_ns;
+	skel->rodata->horizon_min_ns = pf.horizon_min_ns;
+	skel->rodata->horizon_max_ns = pf.horizon_max_ns;
+	skel->rodata->max_demote_ns = pf.max_demote_ns;
+	skel->rodata->max_depth = pf.max_depth;
+	skel->rodata->prio_spread = pf.prio_spread;
 	skel->rodata->logging = true;
 	// Per-task diagnostics: prints each governed task once. Flip to false to
 	// quiet the log once the pipeline is confirmed working.
@@ -237,30 +241,23 @@ int main(int argc, char **argv)
 
 	// Log the drawn profile so every run's regime is visible on the console
 	// (fuzz.sh records both lines). The first line is human-readable (us,
-	// rounded); the second is byte-exact -- raw ns under the rodata field names --
-	// so a repro can be reconstructed exactly by hardcoding these values, even
-	// across a scx-init change that would otherwise re-map the seed.
-	printf("scx-fuzz profile: starve=%llu..%lluus gap=%llu..%lluus "
-	       "reroll=%lluus slice=%lluus low=1/%llu cap=%llu%%\n",
-	       (unsigned long long)(pf.starve_min_ns / 1000),
-	       (unsigned long long)(pf.starve_max_ns / 1000),
-	       (unsigned long long)(pf.gap_min_ns / 1000),
-	       (unsigned long long)(pf.gap_max_ns / 1000),
-	       (unsigned long long)(pf.prio_reroll_ns / 1000),
+	// rounded); the second is byte-exact -- raw ns/counts under the rodata field
+	// names -- so a repro can be reconstructed exactly by hardcoding these values,
+	// even across a scx-init change that would otherwise re-map the input.
+	printf("scx-fuzz profile: horizon=%llu..%lluus slice=%lluus "
+	       "demote<=%lluus depth<=%u spread=%u\n",
+	       (unsigned long long)(pf.horizon_min_ns / 1000),
+	       (unsigned long long)(pf.horizon_max_ns / 1000),
 	       (unsigned long long)(pf.slice_ns / 1000),
-	       (unsigned long long)pf.low_prob_inv,
-	       (unsigned long long)pf.starve_cap_pct);
-	printf("scx-fuzz profile-exact: starve_min_ns=%llu starve_max_ns=%llu "
-	       "gap_min_ns=%llu gap_max_ns=%llu prio_reroll_ns=%llu slice_ns=%llu "
-	       "low_prob_inv=%llu starve_cap_pct=%llu\n",
-	       (unsigned long long)pf.starve_min_ns,
-	       (unsigned long long)pf.starve_max_ns,
-	       (unsigned long long)pf.gap_min_ns,
-	       (unsigned long long)pf.gap_max_ns,
-	       (unsigned long long)pf.prio_reroll_ns,
+	       (unsigned long long)(pf.max_demote_ns / 1000),
+	       pf.max_depth, pf.prio_spread);
+	printf("scx-fuzz profile-exact: horizon_min_ns=%llu horizon_max_ns=%llu "
+	       "slice_ns=%llu max_demote_ns=%llu max_depth=%u prio_spread=%u\n",
+	       (unsigned long long)pf.horizon_min_ns,
+	       (unsigned long long)pf.horizon_max_ns,
 	       (unsigned long long)pf.slice_ns,
-	       (unsigned long long)pf.low_prob_inv,
-	       (unsigned long long)pf.starve_cap_pct);
+	       (unsigned long long)pf.max_demote_ns,
+	       pf.max_depth, pf.prio_spread);
 	fflush(stdout);
 
 	err = fuzz_bpf__load(skel);
@@ -269,9 +266,12 @@ int main(int argc, char **argv)
 		goto cleanup_skel;
 	}
 
-	// Fill both halves of the randomness pool from getrandom before attaching,
-	// so it is fully populated before the scheduler can consume any of it (no
-	// race). The poll loop below refreshes a half at a time from then on.
+	// Fill the whole randomness pool from getrandom before attaching, so it is
+	// fully populated before the scheduler can consume any of it. The pool is now
+	// read positionally, one fixed SLOTS_PER_EPOCH window per execution (see
+	// intf.h); with EPOCHS_MAX (512) windows and mptest's default 500 iterations,
+	// each execution gets a distinct window and no window is reused within a run,
+	// so there is nothing to refresh mid-run (unlike the old running-counter pool).
 	int rnd_fd = bpf_map__fd(skel->maps.rnd_pool);
 	if (refill_half(rnd_fd, 0) != 0 || refill_half(rnd_fd, 1) != 0) {
 		fprintf(stderr, "failed to fill randomness pool\n");
@@ -314,23 +314,11 @@ int main(int argc, char **argv)
 	// bpf_ringbuf_submit()'s adaptive wakeup does not reliably fire the epoll
 	// notification under bedrock's single-vCPU execution, so poll() would leave
 	// events unread. poll() here only paces the loop (~100ms); consume() then
-	// force-drains everything pending.
-	//
-	// Between drains, refresh the pool a half at a time (see intf.h for why).
-	// rnd_idx sweeps half 0, then half 1, then wraps; when it crosses into a half
-	// we refill the one it just left, so the slots being written are never the
-	// ones the scheduler is reading. At ~10 refills/s against a few draws/s the
-	// next half is always fresh before the scheduler reaches it.
-	int last_half = 0;
+	// force-drains everything pending. The pool is filled once up front and read
+	// positionally, so there is no mid-run refresh to do.
 	while (!stop) {
 		ring_buffer__poll(rb, 100 /* ms pacing */);
 		ring_buffer__consume(rb);
-
-		int half = (skel->bss->rnd_idx & (RND_POOL_N - 1)) >= RND_HALF ? 1 : 0;
-		if (half != last_half) {
-			refill_half(rnd_fd, last_half);
-			last_half = half;
-		}
 	}
 
 	err = 0;
