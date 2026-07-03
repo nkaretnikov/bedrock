@@ -1,4 +1,8 @@
 images.tar
+# Provenance sidecar written next to images.tar by build.sh.
+images.tar.meta
+# Fuzzer output (summaries, per-seed logs, per-worker dirs).
+fuzz-runs/
 
 # Staged by build.sh into the Docker build context and normally removed on exit;
 # ignored here in case a build is interrupted before cleanup.
