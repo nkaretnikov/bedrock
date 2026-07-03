@@ -36,12 +36,16 @@
 #                  normal run should finish well under this; hitting it means the
 #                  guest wedged (not just a hung mptest, which run.sh catches).
 #   STOP_ON_REPRO  1 (default) stop at the first FAILED seed; 0 keep fuzzing.
+#   OUT            output dir (default fuzz-runs). Give each parallel instance its
+#                  own dir so they do not clobber each other, e.g. OUT=fuzz-runs/w1.
 set -u
 
 DURATION=${DURATION:-$((24 * 3600))}
 RUN_TIMEOUT=${RUN_TIMEOUT:-3600}
 STOP_ON_REPRO=${STOP_ON_REPRO:-1}
-OUT=fuzz-runs
+# Output dir. Override so several fuzzers can run in parallel without clobbering
+# each other's summary.txt / logs, e.g. OUT=fuzz-runs/w1, OUT=fuzz-runs/w2, ...
+OUT=${OUT:-fuzz-runs}
 
 if [ ! -f workloads/mptest/images.tar ]; then
   echo "ERROR: workloads/mptest/images.tar not found (run from the repo root)." >&2
