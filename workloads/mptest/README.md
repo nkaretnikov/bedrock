@@ -135,6 +135,25 @@ COVERAGE=1 ./workloads/mptest/build.sh   # clang + trace-pc-guard + libfeedback
 tail -f fuzz-cov-runs/summary.txt        # columns include new=/total=/plateau=
 ```
 
+### In parallel (shared coverage)
+
+`COVERAGE=1 ./workloads/mptest/fuzz-parallel.sh N` runs N `fuzz-cov.sh` workers
+that share **one** global edge-coverage map, corpus, and plateau counter under
+`fuzz-cov-runs/coverage/`. Each worker still keeps its own per-seed
+`summary.txt`, but every coverage merge is serialized with `flock` against the
+shared map, so a seed counts as `new` only if it beats what *all* workers have
+covered so far, and `plateau` climbs only when *no* worker finds a new edge.
+That makes novelty and saturation fleet-wide instead of per-worker (independent
+workers would each re-discover the same edges and plateau on their own clocks).
+
+```bash
+COVERAGE=1 ./workloads/mptest/build.sh              # once: instrumented image
+nix run .#test-mptest-workload                      # warm the build
+COVERAGE=1 ./workloads/mptest/fuzz-parallel.sh 4    # 4 workers, shared map
+tail -f fuzz-cov-runs/coverage/corpus.txt           # shared corpus (new-edge seeds)
+grep -H FAILED fuzz-cov-runs/w*/summary.txt         # repros across all workers
+```
+
 Under the hood: `COVERAGE=1` links `guest/libpcguard.c` + `libfeedback.c` into
 `mptest`, which registers a `cov-<build>` feedback buffer; `bedrock-cli
 --coverage-out <file>` (wired through the `BEDROCK_COVERAGE_OUT` env of the nix
@@ -219,7 +238,7 @@ Workload (set in `compose.yaml`, no image rebuild needed except as noted):
 | `run.sh` | Container entrypoint: the mptest loop + result classification. |
 | `build.sh` | Builds `images.tar` (+ provenance sidecar). `COVERAGE=1` instruments mptest. |
 | `fuzz.sh` | Single-driver seed sweep. |
-| `fuzz-parallel.sh` | Runs N `fuzz.sh` workers in parallel. |
+| `fuzz-parallel.sh` | Runs N workers in parallel: `fuzz.sh`, or (with `COVERAGE=1`) `fuzz-cov.sh` sharing one global coverage map/corpus/plateau. |
 | `fuzz-cov.sh` | Coverage-guided seed sweep (needs `COVERAGE=1` image). |
 | `compose.yaml` | Compose service + runtime env knobs. |
 | `mptest/` | Dockerfile + sources for the image. |
