@@ -23,7 +23,8 @@
 #   tail -f fuzz-runs/summary.txt
 #
 # Outputs (created under ./fuzz-runs/):
-#   summary.txt     "# build:" header (commit + images.tar hash) then one line per
+#   summary.txt     "# build:" / "# mptest:" header (bedrock commit + images.tar
+#                   hash + the Bitcoin/libmultiprocess revision) then one line per
 #                   seed: "<seed> build=<commit> <result> [pool[0] | profile-exact]".
 #                   Each line is a self-contained repro recipe (seed + build +
 #                   byte-exact rodata ns). FAILED seeds also get a ">>> repro build:"
@@ -65,14 +66,34 @@ mkdir -p "$OUT"
 # so its content is not otherwise recorded).
 commit=$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
 [ -n "$(git status --porcelain 2>/dev/null)" ] && commit="$commit+dirty"
-img_sha=$(sha256sum workloads/mptest/images.tar 2>/dev/null | cut -c1-16)
+img_full=$(sha256sum workloads/mptest/images.tar 2>/dev/null | cut -d' ' -f1)
+img_sha=${img_full:0:16}
+
+# mptest provenance: which Bitcoin Core / libmultiprocess revision the image was
+# built from (written by build.sh into images.tar.meta). Names the exact mptest
+# code a repro needs. Flag if the sidecar is missing or stale vs the current tar.
+meta=workloads/mptest/images.tar.meta
+if [ -f "$meta" ]; then
+  btc=$(grep -E '^bitcoin_commit=' "$meta" | cut -d= -f2-)
+  lmp=$(grep -E '^libmultiprocess_commit=' "$meta" | cut -d= -f2-)
+  meta_sha=$(grep -E '^images_sha256=' "$meta" | cut -d= -f2-)
+  if [ "$meta_sha" = "$img_full" ]; then
+    mptest_prov="bitcoin=$btc libmultiprocess=$lmp"
+  else
+    mptest_prov="bitcoin=$btc libmultiprocess=$lmp (STALE: images.tar changed since build.sh)"
+  fi
+else
+  mptest_prov="unknown (rebuild with build.sh to record bitcoin provenance)"
+fi
 {
   echo "# build: commit=$commit images.tar=sha256:$img_sha"
+  echo "# mptest: $mptest_prov"
   echo "# started: $(date -Is)"
 } >> "$OUT/summary.txt"
 
 echo "Fuzzing for ${DURATION}s (until $(date -d "@$end" -Is 2>/dev/null || echo "+${DURATION}s")); stop-on-repro=$STOP_ON_REPRO"
 echo "Build: commit=$commit images.tar=sha256:$img_sha"
+echo "mptest: $mptest_prov"
 
 while [ "$(date +%s)" -lt "$end" ]; do
   # Fresh random 64-bit seed as 0x-hex (bedrock-cli -s accepts hex or decimal).

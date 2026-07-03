@@ -60,5 +60,24 @@ $DOCKER build -t bedrock/mptest:latest mptest/
 # is opaque to consumers.
 $DOCKER save bedrock/mptest:latest -o images.tar
 
+# Provenance sidecar: record which mptest source this image was built from, so a
+# fuzz repro can name the exact Bitcoin Core / libmultiprocess revision. fuzz.sh
+# reads this into summary.txt. The images.tar sha256 pins the content byte-exactly;
+# the commits make it human-meaningful. Written next to images.tar as key=value.
+btc_commit=$(git -C "$BITCOIN_SRC" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
+if [ -n "$(git -C "$BITCOIN_SRC" status --porcelain 2>/dev/null)" ]; then
+  btc_commit="$btc_commit+dirty"
+fi
+# Last commit that touched the vendored mptest source (most relevant to behavior).
+lmp_commit=$(git -C "$BITCOIN_SRC" log -1 --format=%h -- src/ipc/libmultiprocess 2>/dev/null || echo unknown)
+{
+  echo "built=$(date -Is)"
+  echo "bitcoin_src=$BITCOIN_SRC"
+  echo "bitcoin_commit=$btc_commit"
+  echo "libmultiprocess_commit=$lmp_commit"
+  echo "images_sha256=$(sha256sum images.tar | cut -d' ' -f1)"
+} > images.tar.meta
+
 echo
 echo "Wrote $(pwd)/images.tar ($(du -h images.tar | cut -f1))"
+echo "Provenance: bitcoin=$btc_commit libmultiprocess=$lmp_commit -> images.tar.meta"
