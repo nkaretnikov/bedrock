@@ -117,8 +117,12 @@ static void append_sanitized(char *path, size_t *p, size_t cap, const char *src,
 // "<hostname>-<id>", so its pages survive the process and its container; the
 // hostname is distinct per container and the id is distinct per build. Falls
 // back to an anonymous mapping if the tmpfs path is unavailable, losing only the
-// survive-death property.
-static void *map_coverage_buffer(size_t size, const char *id, size_t id_len) {
+// survive-death property. Sets *persistent to 1 only for the file-backed
+// mapping; the caller uses that to decide whether to register with the host
+// (see feedback_buffer_init).
+static void *map_coverage_buffer(size_t size, const char *id, size_t id_len,
+                                 int *persistent) {
+    *persistent = 0;
     char host[64];
     if (gethostname(host, sizeof(host)) != 0) {
         host[0] = '\0';
@@ -144,6 +148,7 @@ static void *map_coverage_buffer(size_t size, const char *id, size_t id_len) {
                     mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
                 close(fd);
                 if (buf != MAP_FAILED) {
+                    *persistent = 1;
                     return buf;
                 }
             } else {
@@ -177,15 +182,24 @@ uint8_t *feedback_buffer_init(size_t num_edges, const char *build_id) {
         size = MAX_COVERAGE_BYTES;
     }
 
-    void *buf = map_coverage_buffer(size, id, id_len);
+    int persistent = 0;
+    void *buf = map_coverage_buffer(size, id, id_len, &persistent);
     if (buf != NULL) {
         memset(buf, 0, size);
         // Publish size before the pointer: a reader that sees the pointer sees
         // the size too (x86 store ordering).
         coverage_size = size;
         coverage_buffer = (uint8_t *)buf;
-        vmcall_register_feedback_buffer(coverage_buffer, coverage_size, id,
-                                        id_len);
+        // Only announce the buffer to the hypervisor when it is file-backed on
+        // the guest's persistent tmpfs. That mapping is the only one the host
+        // can keep reading after we exit, and its absence (the anonymous
+        // fallback) means we are not running under bedrock at all -- e.g. the
+        // instrumented mpgen code generator running during `docker build`, where
+        // the VMCALL would fault (#UD/#GP -> SIGSEGV) and abort the build.
+        if (persistent) {
+            vmcall_register_feedback_buffer(coverage_buffer, coverage_size, id,
+                                            id_len);
+        }
     }
 
     return coverage_buffer;

@@ -30,9 +30,9 @@
  *   1. Per-execution epochs. mptest runs in a 500-iteration loop, each iteration
  *      a fresh `thread-fuzz mptest` process; textbook PCT assumes ONE bounded
  *      execution. So a fresh PCT schedule (base priorities + change points) is
- *      drawn every time the governed task set goes empty -> non-empty (see
- *      start_epoch / chaos_enable). One boot thus yields ~500 independent PCT
- *      samples instead of one.
+ *      drawn each time a new governed process leader appears (see chaos_enable:
+ *      a task with pid == tgid and a new tgid). One boot thus yields many
+ *      independent PCT samples instead of one.
  *   2. Change points are placed on the emulated-TSC clock, not on a count of
  *      "steps" (visible memory operations, which we cannot see at the sched_ext
  *      layer and whose total is unknown a priori). Time is the deterministic
@@ -120,8 +120,8 @@ const volatile bool debug;		/* emit per-task membership diagnostics */
  * target. Times are bpf_ktime_get_ns(), i.e. the deterministic emulated TSC.
  */
 static u64 epoch_no;		/* which execution this is; indexes the pool window */
-static bool epoch_active;	/* is a governed execution currently running */
-static u32 n_governed;		/* live SCHED_EXT tasks (epoch brackets its 0->…->0) */
+static bool started;		/* has the first governed execution begun */
+static u32 epoch_leader_tgid;	/* tgid of the current epoch's process leader */
 static u64 base_seed;		/* per-epoch key for the base-priority hash */
 static u32 depth;		/* bug depth d drawn this epoch */
 static u32 n_cp;		/* change points this epoch = depth - 1 */
@@ -333,7 +333,7 @@ static __always_inline void advance_schedule(u64 now)
 	u64 next_t = 0;
 	int i;
 
-	if (!epoch_active)
+	if (!started)
 		return;
 
 	for (i = 0; i < MAX_CP; i++) {
@@ -395,7 +395,7 @@ void BPF_STRUCT_OPS(chaos_enqueue, struct task_struct *p, u64 enq_flags)
 	 * task on the CPU, kick a preempt so it takes over at the next dispatch
 	 * rather than waiting out the running slice.
 	 */
-	if (epoch_active && prio > cur_prio)
+	if (started && prio > cur_prio)
 		scx_bpf_kick_cpu(0, SCX_KICK_PREEMPT);
 }
 
@@ -415,28 +415,26 @@ void BPF_STRUCT_OPS(chaos_running, struct task_struct *p)
 }
 
 /*
- * Per-execution epoch bracketing. n_governed counts live SCHED_EXT tasks; a new
- * PCT schedule is drawn when it rises from zero (a fresh `thread-fuzz mptest`
- * process starting) and the epoch closes when it falls back to zero (that
- * iteration's threads and its forked IPC server have all exited).
+ * Per-execution epoch bracketing. A fresh PCT schedule is drawn whenever a new
+ * governed *process leader* appears -- a task with pid == tgid (a process main,
+ * not a worker thread) whose tgid differs from the current epoch's. This fires
+ * for each fresh `thread-fuzz mptest` exec (a new tgid every run.sh iteration)
+ * and for the IPC server it forks, so one boot yields many independent PCT
+ * samples. It is deliberately NOT a "governed task count returned to zero"
+ * trigger: sched_ext's enable/disable are class-transition hooks, not a balanced
+ * task-lifetime bracket, so a counter drifts and never returns to zero -- which
+ * pinned the whole boot to a single schedule. tgids are monotonic within a
+ * deterministic boot, so each leader is seen once and never re-triggers.
  */
 void BPF_STRUCT_OPS(chaos_enable, struct task_struct *p)
 {
-	n_governed++;
-	if (n_governed == 1) {
-		epoch_active = true;
-		start_epoch(bpf_ktime_get_ns());
-	}
-}
+	u32 pid = BPF_CORE_READ(p, pid);
+	u32 tgid = BPF_CORE_READ(p, tgid);
 
-void BPF_STRUCT_OPS(chaos_disable, struct task_struct *p)
-{
-	if (n_governed > 0)
-		n_governed--;
-	if (n_governed == 0) {
-		epoch_active = false;
-		cur_pid = 0;
-		cur_prio = 0;
+	if (pid == tgid && tgid != epoch_leader_tgid) {
+		epoch_leader_tgid = tgid;
+		started = true;
+		start_epoch(bpf_ktime_get_ns());
 	}
 }
 
@@ -487,7 +485,6 @@ struct sched_ext_ops chaos_ops = {
 	.dispatch   = (void *)chaos_dispatch,
 	.running    = (void *)chaos_running,
 	.enable     = (void *)chaos_enable,
-	.disable    = (void *)chaos_disable,
 	.init       = (void *)chaos_init,
 	/*
 	 * SCX_OPS_SWITCH_PARTIAL: govern only tasks whose policy is SCHED_EXT

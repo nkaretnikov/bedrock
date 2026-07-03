@@ -52,26 +52,44 @@ RUN mkdir -p /cov \
  && if [ "$COVERAGE" = 1 ]; then \
       clang -O2 -fPIC -c libfeedback.c -o /cov/libfeedback.o && \
       clang -O2 -fPIC -c libpcguard.c  -o /cov/libpcguard.o  && \
-      ar rcs /cov/libcov.a /cov/libfeedback.o /cov/libpcguard.o; \
+      ar rcs /cov/libcov.a /cov/libfeedback.o /cov/libpcguard.o && \
+      : "compile-only instrumentation wrappers: add -fsanitize-coverage on a" \
+        "compile (-c present) but NOT on a link, so clang's driver never pulls" \
+        "the compiler-rt sanitizer runtime -- which Debian's clang omits and" \
+        "which we do not need, since libpcguard provides the trace-pc-guard" \
+        "callbacks. This is what makes the ABI check and final link succeed" \
+        "without libclang_rt; mptest's edge calls resolve from libcov.a." && \
+      printf '%s\n' '#!/bin/sh' \
+        'for a in "$@"; do [ "$a" = -c ] && exec clang   -fsanitize-coverage=trace-pc-guard "$@"; done' \
+        'exec clang   "$@"' > /usr/local/bin/covcc && \
+      printf '%s\n' '#!/bin/sh' \
+        'for a in "$@"; do [ "$a" = -c ] && exec clang++ -fsanitize-coverage=trace-pc-guard "$@"; done' \
+        'exec clang++ "$@"' > /usr/local/bin/covcxx && \
+      chmod +x /usr/local/bin/covcc /usr/local/bin/covcxx; \
     fi
 
 # Vendored libmultiprocess subtree (staged by build.sh). Build just the mptest
 # target; BUILD_TESTING is forced on so the test executable is configured even
-# if the standalone default differs. Under COVERAGE=1 the whole tree compiles
-# with clang + trace-pc-guard and links libcov.a (+ --build-id, which libfeedback
-# keys the buffer id on; + -ldl for dl_iterate_phdr in libfeedback).
+# if the standalone default differs. Under COVERAGE=1 every TU compiles through
+# the covcc/covcxx wrappers (trace-pc-guard at compile only) and links libcov.a
+# (+ --build-id, which libfeedback keys the buffer id on; + -ldl for
+# dl_iterate_phdr in libfeedback). The sancov flag is deliberately NOT in
+# CMAKE_*_FLAGS -- those reach the link line, which is exactly what dragged in
+# the missing compiler-rt runtime.
 COPY libmultiprocess ./libmultiprocess
 RUN set -e; \
     if [ "$COVERAGE" = 1 ]; then \
-      CC=clang; CXX=clang++; \
-      COV_C="-fsanitize-coverage=trace-pc-guard"; \
-      COV_LD="-Wl,--build-id -L/cov -lcov -ldl"; \
+      CC=/usr/local/bin/covcc; CXX=/usr/local/bin/covcxx; \
+      # --whole-archive forces every libcov member in regardless of link order,
+      # so the guard symbols are defined even in cmake's compiler-ABI check,
+      # whose minimal link applies EXE_LINKER_FLAGS but not STANDARD_LIBRARIES
+      # and places libs before the object (defeating normal archive resolution).
+      COV_LD="-Wl,--build-id -Wl,--whole-archive /cov/libcov.a -Wl,--no-whole-archive -ldl"; \
     else \
-      CC=cc; CXX=c++; COV_C=""; COV_LD=""; \
+      CC=cc; CXX=c++; COV_LD=""; \
     fi; \
     cmake -B build -S libmultiprocess -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX" \
-      -DCMAKE_C_FLAGS="$COV_C" -DCMAKE_CXX_FLAGS="$COV_C" \
       -DCMAKE_EXE_LINKER_FLAGS="$COV_LD" \
  && cmake --build build --target mptest -j"$(nproc)"
 # The mptest binary lands under build/ (typically build/test/mptest); locate it
