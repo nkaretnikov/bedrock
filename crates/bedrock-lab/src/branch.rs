@@ -7,7 +7,8 @@ use std::sync::Arc;
 use bedrock_vm::events::EventKind;
 use bedrock_vm::file_store::FileWriter;
 use bedrock_vm::{
-    EventCategories, EventConfig as VmEventConfig, EventStream, ExitKind, ExitTrigger, Vm, VmError,
+    EventCategories, EventConfig as VmEventConfig, EventStream, ExitKind, ExitTrigger,
+    RdrandConfig, Vm, VmError,
 };
 
 use crate::bash::{self, BashOutput, BashTarget};
@@ -296,6 +297,33 @@ impl Branch {
     pub fn set_event_config(&mut self, config: &EventConfig) -> Result<()> {
         self.event_config = *config;
         self.apply_event_config()
+    }
+
+    /// Re-seed this branch's kernel-side RNG so its `RDRAND`/`RDSEED`/`getrandom`
+    /// stream diverges from its siblings, deterministically.
+    ///
+    /// From this point every randomness draw on the branch is served host-side
+    /// from an xorshift64 PRNG keyed by `seed` (`RdrandConfig::seeded_rng`), with
+    /// no userspace round-trip. This is how a fuzzing loop gives each fork a
+    /// distinct, replayable input: fork a plain [`branch`](Checkpoint::branch),
+    /// `reseed` it with the iteration's seed, then run. The run is reproducible
+    /// from the pair `(the checkpoint's boot seed, this seed)` — re-boot to the
+    /// same checkpoint and `reseed` the same value.
+    ///
+    /// Because it serves randomness kernel-side (never exiting to userspace),
+    /// `reseed` is meant for branches from [`Checkpoint::branch`], not
+    /// [`Checkpoint::branch_with_input_source`]: on a source-backed branch the
+    /// seeded stream takes over and the `InputSource` is never consulted.
+    pub fn reseed(&mut self, seed: u64) -> Result<()> {
+        self.vm()
+            .set_rdrand_config(&RdrandConfig::seeded_rng(seed))
+            .map_err(|source| {
+                LabError::Vm(VmError::Ioctl {
+                    operation: "SET_RDRAND_CONFIG",
+                    source,
+                })
+            })?;
+        Ok(())
     }
 
     /// Lower [`self.event_config`](Self::event_config) to the kernel, forcing on

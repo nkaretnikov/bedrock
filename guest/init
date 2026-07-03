@@ -140,6 +140,14 @@ mkdir -p /bedrock
 # it before any container starts, for the same reason as the assertion sink.
 mkdir -p /bedrock/coverage
 
+# Fork-fuzz handshake dir: a host-namespace mount bind-mounted into every
+# container (see containers.conf volumes). run.sh drops a `refill` flag here
+# after the ready hypercall to ask the scx-init scheduler service (which shares
+# this dir, being in the initrd namespace) to redraw its PCT pool from getrandom,
+# and waits for `refill-done`. Pre-create it before any container starts so the
+# bind mount attaches to this dir, not an auto-created one.
+mkdir -p /bedrock/scx
+
 # Surface the assertion sink in the guest log: follow it and pipe each line
 # through `systemd-cat` into the journal under the `assertions` tag, so the
 # journalctl formatter below renders every assertion (host- or

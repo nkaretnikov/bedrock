@@ -46,6 +46,28 @@ BIN=/usr/local/bin/mptest
 
 bedrock-vmcall --ready
 
+# Fork-based fuzzing (bedrock-lab's mptest_fuzz): the lab checkpoints and forks
+# the VM at the ready hypercall above, then re-seeds each fork. Ask the in-kernel
+# scheduler (scx-init) to redraw its PCT pool from getrandom now: in a forked,
+# re-seeded branch that draws the branch's own randomness, so each fork explores
+# a distinct schedule. Wait for it to finish so mptest never starts on the
+# pre-fork pool. On the plain (non-fork) CLI path this just re-rolls the pool once
+# from the same seed stream -- same determinism, one extra step. The handshake
+# dir is shared with the initrd scx-init service via a bind mount (/bedrock/scx),
+# and the whole tmpfs is copy-on-write per fork, so each branch has its own flags.
+mkdir -p /bedrock/scx
+rm -f /bedrock/scx/refill-done
+: > /bedrock/scx/refill
+# Bounded spin: scx-init polls ~every 100ms. Cap it (~10s) so a missing/failed
+# scheduler cannot wedge the run; sleep is emulated-TSC driven, so both the wait
+# count and the pool it waits for are deterministic.
+w=0
+while [ ! -e /bedrock/scx/refill-done ] && [ "$w" -lt 200 ]; do
+	sleep 0.05
+	w=$((w + 1))
+done
+[ -e /bedrock/scx/refill-done ] || echo "WARN: scx pool re-roll timed out; running on boot pool" >&2
+
 result=""
 i=0
 while [ "$i" -lt "$MAX_ITERS" ]; do

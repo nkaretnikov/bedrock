@@ -326,6 +326,9 @@ let
     #   - the coverage dir, where each instrumented process keeps its feedback
     #     bitmap as a file (see guest/libfeedback.c), so the pages outlive the
     #     container that produced them; and
+    #   - the scx handshake dir (/bedrock/scx), where run.sh signals the initrd
+    #     scx-init service to redraw its PCT pool after the ready/fork point (see
+    #     run.sh and guest/scx-fuzz/scx-init.c); and
     #   - thread-fuzz, the manual-registration helper (read-only): a workload
     #     opts a process into the fuzzing scheduler by wrapping it, e.g.
     #     `thread-fuzz /usr/local/bin/queue`. Mounting it here (from the guest
@@ -337,6 +340,7 @@ let
     volumes = [
       "/bedrock/assertions.jsonl:/bedrock/assertions.jsonl",
       "/bedrock/coverage:/bedrock/coverage",
+      "/bedrock/scx:/bedrock/scx",
       "${threadFuzz}/bin/thread-fuzz:/usr/local/bin/thread-fuzz:ro",
     ]
 

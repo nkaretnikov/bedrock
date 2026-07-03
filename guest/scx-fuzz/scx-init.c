@@ -24,6 +24,7 @@
 // Usage: scx-init   (no arguments)
 
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -126,6 +127,51 @@ static int refill_half(int fd, int half)
 			return -1;
 	}
 	return 0;
+}
+
+// Post-ready pool re-roll for fork-based fuzzing (the lab's mptest_fuzz).
+//
+// The pool is filled once at boot (below), before any fork point exists, so all
+// forks of a booted VM would otherwise inherit the same pool and replay the same
+// schedule. To let each fork explore, the workload's run.sh touches
+// SCX_REFILL_REQ right after the ready hypercall (the point the lab checkpoints
+// and forks at); we then redraw the whole pool from getrandom. In a forked,
+// re-seeded branch that getrandom stream is the branch's own, so each fork gets
+// a distinct pool -> a distinct PCT schedule. We create SCX_REFILL_DONE when the
+// new pool is in place so run.sh starts mptest only after the re-roll, never on a
+// half-updated pool. One-shot per boot (guarded by *refilled). The request path
+// is a bind-mounted shared dir (/bedrock/scx) so the container's run.sh and this
+// initrd service see the same files; the whole tmpfs is copy-on-write per fork.
+//
+// The per-boot PCT *profile* (rodata: horizon/slice/depth/spread) is NOT
+// redrawn -- it is fixed at load time -- so a set of forks from one boot shares
+// one regime and varies only the pool. Vary the boot seed for regime diversity.
+#define SCX_REFILL_REQ "/bedrock/scx/refill"
+#define SCX_REFILL_DONE "/bedrock/scx/refill-done"
+
+static void maybe_refill_pool(int rnd_fd, int *refilled)
+{
+	if (*refilled || access(SCX_REFILL_REQ, F_OK) != 0)
+		return;
+
+	if (refill_half(rnd_fd, 0) != 0 || refill_half(rnd_fd, 1) != 0) {
+		// Leave *refilled clear and DONE absent: run.sh's wait times out
+		// rather than running mptest on a stale/partial pool.
+		fprintf(stderr, "scx-fuzz: post-ready pool refill failed\n");
+		return;
+	}
+
+	uint64_t first = 0;
+	uint32_t zero = 0;
+	bpf_map_lookup_elem(rnd_fd, &zero, &first);
+	printf("scx-fuzz pool refilled post-ready; pool[0] %#llx\n",
+	       (unsigned long long)first);
+	fflush(stdout);
+
+	*refilled = 1;
+	int fd = open(SCX_REFILL_DONE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd >= 0)
+		close(fd);
 }
 
 /*
@@ -314,11 +360,16 @@ int main(int argc, char **argv)
 	// bpf_ringbuf_submit()'s adaptive wakeup does not reliably fire the epoll
 	// notification under bedrock's single-vCPU execution, so poll() would leave
 	// events unread. poll() here only paces the loop (~100ms); consume() then
-	// force-drains everything pending. The pool is filled once up front and read
-	// positionally, so there is no mid-run refresh to do.
+	// force-drains everything pending. The pool is otherwise filled once up
+	// front and read positionally; the only refresh is the one-shot post-ready
+	// re-roll below (for fork-based fuzzing), never a mid-run one.
+	int refilled = 0;
 	while (!stop) {
 		ring_buffer__poll(rb, 100 /* ms pacing */);
 		ring_buffer__consume(rb);
+		// Redraw the pool once run.sh signals it is past the ready/fork
+		// point, so forked branches explore distinct schedules (see above).
+		maybe_refill_pool(rnd_fd, &refilled);
 	}
 
 	err = 0;
