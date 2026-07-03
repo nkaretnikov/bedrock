@@ -9,10 +9,11 @@
  * from the getrandom stream that drives it.
  *
  * Base policy: weighted virtual-time fair scheduling (à la scx_simple / CFS).
- * Non-frozen threads are scheduled fairly by accumulated, weight-scaled vtime,
- * so the only deliberate perturbation is the freezing below — not a custom
- * timeslice/ordering scheme. Each task's vtime is the kernel-provided
- * p->scx.dsq_vtime; the shared DSQ is ordered by it.
+ * Non-frozen threads are scheduled fairly by accumulated, weight-scaled vtime;
+ * the deliberate perturbations are the freezing below plus the base timeslice
+ * length (slice_ns), both drawn per boot by scx-init — not a custom ordering
+ * scheme. Each task's vtime is the kernel-provided p->scx.dsq_vtime; the shared
+ * DSQ is ordered by it.
  *
  * Chaos (after rr's "chaos mode", R. O'Callahan 2016): designate a few "victim"
  * threads and starve them in bursts.
@@ -70,10 +71,6 @@ char _license[] SEC("license") = "GPL";
 /* Bound for the kick loop in the timer callback. */
 #define MAX_CPUS 1024
 
-/* Base timeslice for the fair policy. Fixed (CFS-like), not randomized: the
- * only deliberate perturbation is the freezing, not the slice length. */
-#define SLICE_NS (5ULL * 1000000)	/* 5ms */
-
 /* Virtual-time comparison that is safe across u64 wraparound. */
 #define vtime_before(a, b) ((s64)((a) - (b)) < 0)
 
@@ -88,6 +85,7 @@ const volatile u64 gap_max_ns;		/* gap between intervals, high bound */
 const volatile u64 prio_reroll_ns;	/* how often priorities re-randomize */
 const volatile u64 low_prob_inv;	/* P(low) = 1/low_prob_inv */
 const volatile u64 starve_cap_pct;	/* max % of run time spent starving */
+const volatile u64 slice_ns;		/* base timeslice for the fair policy */
 const volatile bool logging;
 const volatile bool debug;		/* emit per-task membership diagnostics */
 
@@ -329,7 +327,7 @@ void BPF_STRUCT_OPS(chaos_enqueue, struct task_struct *p, u64 enq_flags)
 	if (task_is_low(p) && starve_until && now < starve_until) {
 		if (debug)
 			log_event(p, FUZZ_EVENT_LOW_PRIO, now, starve_until - now);
-		scx_bpf_dsq_insert(p, FROZEN_DSQ_ID, SLICE_NS, enq_flags);
+		scx_bpf_dsq_insert(p, FROZEN_DSQ_ID, slice_ns, enq_flags);
 		return;
 	}
 
@@ -338,9 +336,9 @@ void BPF_STRUCT_OPS(chaos_enqueue, struct task_struct *p, u64 enq_flags)
 	 * long sleeper gains at most one slice of credit, then queue it. dispatch
 	 * runs the lowest-vtime task in this DSQ.
 	 */
-	if (vtime_before(vtime, vtime_now - SLICE_NS))
-		vtime = vtime_now - SLICE_NS;
-	scx_bpf_dsq_insert_vtime(p, FAIR_DSQ_ID, SLICE_NS, vtime, enq_flags);
+	if (vtime_before(vtime, vtime_now - slice_ns))
+		vtime = vtime_now - slice_ns;
+	scx_bpf_dsq_insert_vtime(p, FAIR_DSQ_ID, slice_ns, vtime, enq_flags);
 }
 
 void BPF_STRUCT_OPS(chaos_dispatch, s32 cpu, struct task_struct *prev)
@@ -379,7 +377,7 @@ void BPF_STRUCT_OPS(chaos_stopping, struct task_struct *p, bool runnable)
 
 	if (!weight)
 		weight = 100;	/* nice-0 weight; guards a div-by-zero */
-	p->scx.dsq_vtime += (SLICE_NS - p->scx.slice) * 100 / weight;
+	p->scx.dsq_vtime += (slice_ns - p->scx.slice) * 100 / weight;
 }
 
 /* A task entering the scheduler starts at the current global vtime, so it

@@ -36,6 +36,12 @@ MAX_ITERS="${MPTEST_MAX_ITERS:-500}"
 # anything past HANG_SECS is the hang we are looking for. timeout's SIGALRM is
 # driven by the emulated TSC, so it fires at a deterministic guest-time point.
 HANG_SECS="${MPTEST_HANG_SECS:-30}"
+# Detection self-test (default 0 = off). When set to N>0, force a synthetic
+# "FAILED ... crash" result at iteration N instead of running mptest, so the
+# detect -> result-line -> fuzz.sh grep/classify -> keep-log pipeline can be
+# validated end-to-end without a known-bad binary. A clean fuzzer must produce a
+# repro when this is on; if it does not, detection is broken, not the search.
+SELFTEST="${MPTEST_SELFTEST:-0}"
 BIN=/usr/local/bin/mptest
 
 bedrock-vmcall --ready
@@ -44,6 +50,14 @@ result=""
 i=0
 while [ "$i" -lt "$MAX_ITERS" ]; do
 	i=$((i + 1))
+
+	# Self-test: synthesize a failure so the detection pipeline can be exercised
+	# without a real repro. Off unless MPTEST_SELFTEST > 0.
+	if [ "$SELFTEST" -gt 0 ] && [ "$i" -ge "$SELFTEST" ]; then
+		result="mptest FAILED at iteration $i: crash rc=134 | SELFTEST synthetic failure (MPTEST_SELFTEST=$SELFTEST)"
+		break
+	fi
+
 	rc=0
 	# Capture stderr (KJ prints failures / uncaught exceptions there) so we can
 	# quote the reason, e.g. "Promise already satisfied". `timeout -s KILL` turns

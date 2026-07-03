@@ -22,6 +22,9 @@ services:
     # Tune the search without an image rebuild:
     #   MPTEST_MAX_ITERS - loop bound before giving up on this seed (default 500)
     #   MPTEST_HANG_SECS - per-iteration hang watchdog in seconds (default 30)
+    #   MPTEST_SELFTEST  - force a synthetic FAILED at iteration N to validate the
+    #                      detection pipeline end-to-end (default 0 = off)
     # environment:
     #   MPTEST_MAX_ITERS: "500"
     #   MPTEST_HANG_SECS: "30"
+    #   MPTEST_SELFTEST: "1"

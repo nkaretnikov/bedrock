@@ -39,23 +39,12 @@
 #include "intf.h"
 #include "fuzz_bpf.skel.h"
 
-// Fixed chaos-mode parameters (after rr's chaos mode): the workload runs one
-// fixed configuration; the schedule is varied only through the randomness pool.
-// The base policy is weighted-vtime fair, so there is no timeslice to randomize
-// — only the starvation schedule below is tuned.
-//
-// "Smooth" profile: many short starvation intervals rather than a few multi-
-// second bursts. With a small STARVE_MAX the 35% budget is split into frequent
-// small freezes, so the cap-recovery gaps shrink and the perturbation is roughly
-// continuous; the occasional ~1.5s freeze still lets the concurrency-fuzz demo
-// crash. Faster re-rolls keep the victim set drifting between the closer intervals.
-#define STARVE_MIN_NS	(50ULL * 1000000)	// 50ms   starvation interval, low
-#define STARVE_MAX_NS	(1500ULL * 1000000)	// 1.5s   starvation interval, high
-#define GAP_MIN_NS	(100ULL * 1000000)	// 100ms  gap between intervals, low
-#define GAP_MAX_NS	(800ULL * 1000000)	// 800ms  gap between intervals, high
-#define PRIO_REROLL_NS	(500ULL * 1000000)	// 0.5s   priority re-randomization
-#define LOW_PROB_INV	8ULL			// P(low) = 1/8 = 0.125
-#define STARVE_CAP_PCT	35ULL			// <= 35% of run time spent starving
+// Chaos-mode parameters (after rr's chaos mode) are drawn fresh per boot from
+// the deterministic getrandom stream (see draw_profile below), not fixed here:
+// each run samples a different scheduling regime -- timescale, victim density,
+// timeslice -- so the fuzzer explores schedules broadly instead of re-sampling a
+// single fixed profile through the randomness pool alone. The draw is a pure
+// function of the seed, so a given seed replays the same profile exactly.
 
 static volatile sig_atomic_t stop;
 
@@ -139,10 +128,82 @@ static int refill_half(int fd, int half)
 	return 0;
 }
 
+/*
+ * Log-uniform draw: pick an exponent uniformly in [lo_bits, hi_bits), then a
+ * uniform mantissa within that octave, giving a value in [2^lo_bits, 2^hi_bits).
+ * Sampling per-octave weights every power-of-two band equally, so fine (us) and
+ * coarse (s) timescales are explored evenly; a plain uniform draw would sit
+ * almost entirely in the top octave.
+ */
+static uint64_t log_uniform(uint64_t r_oct, uint64_t r_mant,
+			    unsigned lo_bits, unsigned hi_bits)
+{
+	unsigned k = lo_bits + (unsigned)(r_oct % (hi_bits - lo_bits));
+	uint64_t base = 1ULL << k;
+
+	return base + (r_mant % base);
+}
+
+/* A chaos-mode configuration, drawn fresh per boot from the getrandom stream. */
+struct chaos_profile {
+	uint64_t starve_min_ns, starve_max_ns;
+	uint64_t gap_min_ns, gap_max_ns;
+	uint64_t prio_reroll_ns;
+	uint64_t low_prob_inv;
+	uint64_t starve_cap_pct;
+	uint64_t slice_ns;
+};
+
+/*
+ * Draw a chaos profile from getrandom (the guest kernel sources it from
+ * bedrock's deterministic, seed-driven stream). Consumes randomness BEFORE the
+ * pool is filled, so the whole run stays a pure function of BEDROCK_RDRAND_SEED
+ * and replays exactly. Returns 0/-1.
+ *
+ * Why per-boot (vs the old fixed profile):
+ *   - Timescale S is log-uniform ~8us..2.1s. The old profile pinned starvation
+ *     at 50ms..1.5s, far coarser than an IPC race window, so a freeze only landed
+ *     *around* a concurrent IPC call, never inside one. Sampling down to
+ *     microseconds manufactures the fine interleavings too.
+ *   - Victims are denser (1/2..1/6, not the old 1/8) and re-roll fast relative to
+ *     the interval, so mptest's two-or-three critical threads are frequently the
+ *     ones frozen, and a thread that is "high" this epoch becomes a victim a few
+ *     epochs later instead of never being frozen.
+ *   - The base timeslice is randomized (log-uniform ~8us..4ms), varying
+ *     preemption granularity.
+ * By construction the max single interval (~2.1s) stays well under run.sh's 30s
+ * hang watchdog, so scheduler starvation alone cannot masquerade as the #35491
+ * hang.
+ */
+static int draw_profile(struct chaos_profile *pf)
+{
+	static const uint64_t inv_choices[] = { 2, 2, 3, 3, 4, 6 };
+	uint64_t r[9];
+
+	if (get_random(r, sizeof(r)) != 0)
+		return -1;
+
+	uint64_t S = log_uniform(r[0], r[1], 13, 31);	/* [8.2us, 2.1s) */
+
+	pf->starve_max_ns = S;
+	pf->starve_min_ns = S >> (1 + (r[2] % 3));	/* S/2, S/4, or S/8 */
+	pf->gap_max_ns = S >> (r[3] % 3);		/* S, S/2, or S/4 */
+	pf->gap_min_ns = pf->gap_max_ns >> 2;
+	pf->prio_reroll_ns = S >> (r[4] % 2);		/* S or S/2 */
+	pf->slice_ns = log_uniform(r[5], r[6], 13, 22);	/* [8.2us, 4.2ms) */
+	pf->low_prob_inv =
+		inv_choices[r[7] % (sizeof(inv_choices) / sizeof(inv_choices[0]))];
+	pf->starve_cap_pct = 30 + r[8] % 46;		/* 30..75% */
+
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	(void)argc;
 	(void)argv;
+
+	int err;
 
 	struct fuzz_bpf *skel = fuzz_bpf__open();
 	if (!skel) {
@@ -150,20 +211,59 @@ int main(int argc, char **argv)
 		return 2;
 	}
 
-	// Read-only config must be set before load.
-	skel->rodata->starve_min_ns = STARVE_MIN_NS;
-	skel->rodata->starve_max_ns = STARVE_MAX_NS;
-	skel->rodata->gap_min_ns = GAP_MIN_NS;
-	skel->rodata->gap_max_ns = GAP_MAX_NS;
-	skel->rodata->prio_reroll_ns = PRIO_REROLL_NS;
-	skel->rodata->low_prob_inv = LOW_PROB_INV;
-	skel->rodata->starve_cap_pct = STARVE_CAP_PCT;
+	// Draw a fresh chaos profile from the deterministic getrandom stream, then
+	// write it into rodata (must happen before load). Each boot samples a new
+	// scheduling regime, so the fuzzer explores timescales and victim densities
+	// rather than re-sampling one fixed profile; the choice is a pure function of
+	// the seed, so it replays exactly.
+	struct chaos_profile pf;
+	if (draw_profile(&pf) != 0) {
+		fprintf(stderr, "failed to draw chaos profile\n");
+		err = 2;
+		goto cleanup_skel;
+	}
+	skel->rodata->starve_min_ns = pf.starve_min_ns;
+	skel->rodata->starve_max_ns = pf.starve_max_ns;
+	skel->rodata->gap_min_ns = pf.gap_min_ns;
+	skel->rodata->gap_max_ns = pf.gap_max_ns;
+	skel->rodata->prio_reroll_ns = pf.prio_reroll_ns;
+	skel->rodata->low_prob_inv = pf.low_prob_inv;
+	skel->rodata->starve_cap_pct = pf.starve_cap_pct;
+	skel->rodata->slice_ns = pf.slice_ns;
 	skel->rodata->logging = true;
 	// Per-task diagnostics: prints each governed task once. Flip to false to
 	// quiet the log once the pipeline is confirmed working.
 	skel->rodata->debug = true;
 
-	int err = fuzz_bpf__load(skel);
+	// Log the drawn profile so every run's regime is visible on the console
+	// (fuzz.sh records both lines). The first line is human-readable (us,
+	// rounded); the second is byte-exact -- raw ns under the rodata field names --
+	// so a repro can be reconstructed exactly by hardcoding these values, even
+	// across a scx-init change that would otherwise re-map the seed.
+	printf("scx-fuzz profile: starve=%llu..%lluus gap=%llu..%lluus "
+	       "reroll=%lluus slice=%lluus low=1/%llu cap=%llu%%\n",
+	       (unsigned long long)(pf.starve_min_ns / 1000),
+	       (unsigned long long)(pf.starve_max_ns / 1000),
+	       (unsigned long long)(pf.gap_min_ns / 1000),
+	       (unsigned long long)(pf.gap_max_ns / 1000),
+	       (unsigned long long)(pf.prio_reroll_ns / 1000),
+	       (unsigned long long)(pf.slice_ns / 1000),
+	       (unsigned long long)pf.low_prob_inv,
+	       (unsigned long long)pf.starve_cap_pct);
+	printf("scx-fuzz profile-exact: starve_min_ns=%llu starve_max_ns=%llu "
+	       "gap_min_ns=%llu gap_max_ns=%llu prio_reroll_ns=%llu slice_ns=%llu "
+	       "low_prob_inv=%llu starve_cap_pct=%llu\n",
+	       (unsigned long long)pf.starve_min_ns,
+	       (unsigned long long)pf.starve_max_ns,
+	       (unsigned long long)pf.gap_min_ns,
+	       (unsigned long long)pf.gap_max_ns,
+	       (unsigned long long)pf.prio_reroll_ns,
+	       (unsigned long long)pf.slice_ns,
+	       (unsigned long long)pf.low_prob_inv,
+	       (unsigned long long)pf.starve_cap_pct);
+	fflush(stdout);
+
+	err = fuzz_bpf__load(skel);
 	if (err) {
 		fprintf(stderr, "failed to load BPF skeleton: %d\n", err);
 		goto cleanup_skel;

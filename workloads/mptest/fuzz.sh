@@ -23,7 +23,11 @@
 #   tail -f fuzz-runs/summary.txt
 #
 # Outputs (created under ./fuzz-runs/):
-#   summary.txt     one line per seed: "<seed>  <result line>"
+#   summary.txt     "# build:" header (commit + images.tar hash) then one line per
+#                   seed: "<seed> build=<commit> <result> [pool[0] | profile-exact]".
+#                   Each line is a self-contained repro recipe (seed + build +
+#                   byte-exact rodata ns). FAILED seeds also get a ">>> repro build:"
+#                   line with the exact guest nix store hashes.
 #   run-<seed>.log  full guest console, KEPT only for seeds that FAILED
 #
 # Env knobs:
@@ -48,7 +52,23 @@ fi
 end=$(( $(date +%s) + DURATION ))
 mkdir -p "$OUT"
 : > "$OUT/summary.txt"
+
+# Build stamp: pin what this sweep ran against so any repro seed can be replayed
+# against the exact same scheduler + image. `commit` fixes the source tree;
+# `+dirty` warns of uncommitted changes (then trust the per-repro nix store hashes
+# below, which are content-exact regardless of git state). The images.tar hash
+# pins the mptest/libmultiprocess build (it is a local file, not a nix store path,
+# so its content is not otherwise recorded).
+commit=$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
+[ -n "$(git status --porcelain 2>/dev/null)" ] && commit="$commit+dirty"
+img_sha=$(sha256sum workloads/mptest/images.tar 2>/dev/null | cut -c1-16)
+{
+  echo "# build: commit=$commit images.tar=sha256:$img_sha"
+  echo "# started: $(date -Is)"
+} >> "$OUT/summary.txt"
+
 echo "Fuzzing for ${DURATION}s (until $(date -d "@$end" -Is 2>/dev/null || echo "+${DURATION}s")); stop-on-repro=$STOP_ON_REPRO"
+echo "Build: commit=$commit images.tar=sha256:$img_sha"
 
 while [ "$(date +%s)" -lt "$end" ]; do
   # Fresh random 64-bit seed as 0x-hex (bedrock-cli -s accepts hex or decimal).
@@ -72,11 +92,27 @@ while [ "$(date +%s)" -lt "$end" ]; do
       line="(no result line; rc=$rc)"
     fi
   fi
-  echo "$s  $line" | tee -a "$OUT/summary.txt"
+  # Record the schedule fingerprint for EVERY run (survivors included): the
+  # per-boot chaos profile and pool[0], both printed by scx-init. This is the
+  # audit trail that seeds actually produce distinct schedules -- if these ever
+  # stop varying run-to-run, the seed is not reaching bedrock and the sweep is
+  # testing one schedule. Survivor full logs are still deleted below to save disk;
+  # this one summary line preserves the evidence.
+  # Record the byte-exact profile (raw ns) + pool[0] + the build commit, so each
+  # line is a self-contained, losslessly-reproducible recipe: <seed> + <build> +
+  # exact rodata values.
+  prof=$(grep -oE 'scx-fuzz profile-exact:.*' "$log" | head -1)
+  fp=$(grep -oE 'pool\[0\] 0x[0-9a-f]+' "$log" | head -1)
+  printf '%s  build=%s  %s  [%s | %s]\n' "$s" "$commit" "$line" "$fp" "$prof" | tee -a "$OUT/summary.txt"
 
   case "$line" in
     *FAILED*)
+      # Stamp the exact guest build hashes from the kept log so this repro is
+      # anchored even if the tree was dirty: the initrd store path pins the
+      # scx-init/thread-fuzz/BPF build, vmlinux pins the guest kernel.
+      guest=$(grep -oE '/nix/store/[a-z0-9]{32}-[^ ]*(bedrock-podman-rootfs|vmlinux)' "$log" | sort -u | tr '\n' ' ')
       echo ">>> REPRO on seed $s -> $log"
+      echo ">>> repro build: $guest" | tee -a "$OUT/summary.txt"
       [ "$STOP_ON_REPRO" = 1 ] && break
       ;;
     *)
