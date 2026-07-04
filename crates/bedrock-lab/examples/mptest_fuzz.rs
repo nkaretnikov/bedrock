@@ -206,16 +206,34 @@ impl Outcome {
     }
 }
 
+/// Pull the human text out of a serial line. The guest routes console output
+/// through journald, so lines arrive as JSON like
+/// `{"SYSLOG_IDENTIFIER":"mptest","MESSAGE":"mptest survived ..."}`; return the
+/// `MESSAGE` field (trimmed) when the line parses as such, else the line as-is.
+fn message_text(line: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|v| {
+            v.get("MESSAGE")
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| line.to_string())
+        .trim()
+        .to_string()
+}
+
 /// Map a finished branch's serial output to a workload result. The result line
 /// is guest console output (`mptest FAILED ...` / `mptest survived ...`, run.sh),
 /// not anchored, so match on the FAILED/survived keyword.
 fn classify(lines: &[String], end: BranchEnd) -> Outcome {
     let hit = lines
         .iter()
-        .find(|l| l.contains("mptest FAILED") || l.contains("mptest survived"));
+        .map(|l| message_text(l))
+        .find(|m| m.contains("mptest FAILED") || m.contains("mptest survived"));
     match hit {
-        Some(l) if l.contains("mptest FAILED") => Outcome::Failed(l.trim().to_string()),
-        Some(l) => Outcome::Survived(l.trim().to_string()),
+        Some(m) if m.contains("mptest FAILED") => Outcome::Failed(m),
+        Some(m) => Outcome::Survived(m),
         None => Outcome::NoResult(match end {
             BranchEnd::Shutdown => "shutdown, no result line".to_string(),
             BranchEnd::Deadline => "hit run deadline (wedged?)".to_string(),
