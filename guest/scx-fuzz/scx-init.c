@@ -31,6 +31,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -38,6 +39,7 @@
 #include <bpf/bpf.h>
 
 #include "intf.h"
+#include "libvmcall.h"
 #include "fuzz_bpf.skel.h"
 
 // Per-boot PCT bounds (depth ceiling, horizon range, timeslice, demotion cap,
@@ -200,9 +202,10 @@ struct pct_profile {
 	uint64_t slice_ns;		/* base timeslice */
 	uint64_t horizon_min_ns;	/* change-point horizon, low bound */
 	uint64_t horizon_max_ns;	/* change-point horizon, high bound */
-	uint64_t max_demote_ns;		/* demotion lifetime = starvation cap */
+	uint64_t max_demote_ns;		/* demotion penalty magnitude + lifetime (starvation cap) */
 	uint32_t max_depth;		/* max bug depth d (>= 2) */
-	uint32_t prio_spread;		/* base-priority spread */
+	uint32_t prio_spread;		/* retained for ABI; unused by the vtime-fair base */
+	uint32_t cp_prob_pct;		/* realism knob: % of epochs perturbed by change points */
 };
 
 /*
@@ -221,14 +224,20 @@ struct pct_profile {
  *     log-uniform ~1ms..2.1s -- well under run.sh's 30s hang watchdog, so PCT
  *     starvation alone cannot masquerade as the #35491 hang.
  *   - max_depth (the bug-depth ceiling; per-epoch depth is drawn in [2, max_depth]
- *     inside the scheduler) is 3..6, and prio_spread (how finely base priorities
- *     separate threads) is one of 32/64/128/256 -- >= mptest's live thread count,
- *     so priorities are mostly distinct.
+ *     inside the scheduler) is 3..6, and prio_spread is retained only for rodata
+ *     ABI (the vtime-fair base does not use it).
+ *   - cp_prob_pct (the realism knob) is the % of epochs the scheduler perturbs
+ *     with change points; the rest run the pure vtime-fair base, staying close to
+ *     stock Linux scheduling -- the regime the CI repros lived in. Drawn from a
+ *     table weighted toward the low (near-default) end, with the occasional
+ *     aggressive regime, so boot_seed sweeps the whole fidelity axis.
  */
 static int draw_profile(struct pct_profile *pf)
 {
 	static const uint32_t spread_choices[] = { 32, 64, 128, 256 };
-	uint64_t r[8];
+	/* Weighted toward near-default (two 0s: pure-fair boots); 100 = full PCT. */
+	static const uint32_t cp_prob_choices[] = { 0, 0, 5, 10, 25, 50, 100 };
+	uint64_t r[9];
 
 	if (get_random(r, sizeof(r)) != 0)
 		return -1;
@@ -246,8 +255,49 @@ static int draw_profile(struct pct_profile *pf)
 	pf->max_depth = 3 + (uint32_t)(r[6] % 4);	/* 3..6 (n_cp <= MAX_CP=5) */
 	pf->prio_spread =
 		spread_choices[r[7] % (sizeof(spread_choices) / sizeof(spread_choices[0]))];
+	pf->cp_prob_pct =
+		cp_prob_choices[r[8] % (sizeof(cp_prob_choices) / sizeof(cp_prob_choices[0]))];
 
 	return 0;
+}
+
+// Map the BPF interleaving-coverage bitmap (signal A) and register it with the
+// host as a feedback buffer, so `bedrock-cli --sched-cov-out` reads back the
+// scheduler's edge coverage. The map is BPF_F_MMAPABLE, so its backing pages sit
+// in this process's address space; the host captures their guest-physical
+// addresses at registration and reads the very bytes the scheduler bumps --
+// zero-copy, out of band, invisible to the guest. Best-effort: on failure the
+// scheduler still runs, just uninstrumented. scx-init lives the whole boot, so
+// the mapping (hence the pages the host reads) stays valid; we never munmap.
+//
+// The id is SCHED_COV_ID ("schedcov"), which deliberately does NOT start with
+// "cov", so the host keeps this stream separate from libfeedback's code-coverage
+// buffers (whose dumper prefix-matches "cov").
+static void register_sched_coverage(struct fuzz_bpf *skel)
+{
+	int fd = bpf_map__fd(skel->maps.cov_map);
+	if (fd < 0) {
+		fprintf(stderr, "scx-fuzz: no cov_map fd; sched coverage off\n");
+		return;
+	}
+
+	// Single-entry array of struct cov_buf; the mmapable region is the value
+	// size, and SCHED_COV_N is already page-aligned.
+	size_t size = SCHED_COV_N;
+	void *buf = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (buf == MAP_FAILED) {
+		fprintf(stderr, "scx-fuzz: mmap cov_map: %s\n", strerror(errno));
+		return;
+	}
+	// Fault every page in before registration so the host's guest-page-table
+	// walk sees them all present (a fresh map is already zeroed).
+	memset(buf, 0, size);
+
+	vmcall_u64 slot = vmcall_register_feedback_buffer(
+		buf, size, SCHED_COV_ID, sizeof(SCHED_COV_ID) - 1);
+	printf("scx-fuzz sched-coverage: id=%s bytes=%zu slot=%llu\n",
+	       SCHED_COV_ID, size, (unsigned long long)slot);
+	fflush(stdout);
 }
 
 int main(int argc, char **argv)
@@ -280,6 +330,7 @@ int main(int argc, char **argv)
 	skel->rodata->max_demote_ns = pf.max_demote_ns;
 	skel->rodata->max_depth = pf.max_depth;
 	skel->rodata->prio_spread = pf.prio_spread;
+	skel->rodata->cp_prob_pct = pf.cp_prob_pct;
 	skel->rodata->logging = true;
 	// Per-task diagnostics: prints each governed task once. Flip to false to
 	// quiet the log once the pipeline is confirmed working.
@@ -291,19 +342,20 @@ int main(int argc, char **argv)
 	// names -- so a repro can be reconstructed exactly by hardcoding these values,
 	// even across a scx-init change that would otherwise re-map the input.
 	printf("scx-fuzz profile: horizon=%llu..%lluus slice=%lluus "
-	       "demote<=%lluus depth<=%u spread=%u\n",
+	       "demote<=%lluus depth<=%u spread=%u cp_prob=%u%%\n",
 	       (unsigned long long)(pf.horizon_min_ns / 1000),
 	       (unsigned long long)(pf.horizon_max_ns / 1000),
 	       (unsigned long long)(pf.slice_ns / 1000),
 	       (unsigned long long)(pf.max_demote_ns / 1000),
-	       pf.max_depth, pf.prio_spread);
+	       pf.max_depth, pf.prio_spread, pf.cp_prob_pct);
 	printf("scx-fuzz profile-exact: horizon_min_ns=%llu horizon_max_ns=%llu "
-	       "slice_ns=%llu max_demote_ns=%llu max_depth=%u prio_spread=%u\n",
+	       "slice_ns=%llu max_demote_ns=%llu max_depth=%u prio_spread=%u "
+	       "cp_prob_pct=%u\n",
 	       (unsigned long long)pf.horizon_min_ns,
 	       (unsigned long long)pf.horizon_max_ns,
 	       (unsigned long long)pf.slice_ns,
 	       (unsigned long long)pf.max_demote_ns,
-	       pf.max_depth, pf.prio_spread);
+	       pf.max_depth, pf.prio_spread, pf.cp_prob_pct);
 	fflush(stdout);
 
 	err = fuzz_bpf__load(skel);
@@ -325,6 +377,11 @@ int main(int argc, char **argv)
 		goto cleanup_skel;
 	}
 
+	// Register the interleaving-coverage bitmap with the host (signal A). Done
+	// after load (the map now exists) and before attach, so any early switch is
+	// already counted. Best-effort; never fatal.
+	register_sched_coverage(skel);
+
 	// Attaching the sched_ext struct_ops makes our policy the scheduler for
 	// SCHED_EXT tasks. Hold the link; dropping it detaches.
 	struct bpf_link *link =
@@ -335,6 +392,18 @@ int main(int argc, char **argv)
 		err = 2;
 		goto cleanup_skel;
 	}
+
+	// Attach the futex fentry probes for lock-ordering coverage (signal C).
+	// Best-effort: if the kernel lacks the symbols/BTF, the scheduler still runs
+	// without lock edges. Held for the whole boot; destroyed at cleanup.
+	struct bpf_link *link_fw = bpf_program__attach(skel->progs.on_futex_wait);
+	struct bpf_link *link_fk = bpf_program__attach(skel->progs.on_futex_wake);
+	if (!link_fw || !link_fk)
+		fprintf(stderr,
+			"scx-fuzz: futex probes not attached; lock coverage off\n");
+	else
+		printf("scx-fuzz lock-ordering coverage attached (futex probes)\n");
+	fflush(stdout);
 
 	struct ring_buffer *rb =
 		ring_buffer__new(bpf_map__fd(skel->maps.events), handle_event,
@@ -375,6 +444,10 @@ int main(int argc, char **argv)
 	err = 0;
 	ring_buffer__free(rb);
 cleanup_link:
+	// bpf_link__destroy is NULL/err-safe, so freeing the futex probes here is
+	// fine whether or not they attached, and covers the !rb error path too.
+	bpf_link__destroy(link_fw);
+	bpf_link__destroy(link_fk);
 	bpf_link__destroy(link);
 cleanup_skel:
 	fuzz_bpf__destroy(skel);

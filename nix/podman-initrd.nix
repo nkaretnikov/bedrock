@@ -125,8 +125,10 @@ let
       # Generate the libbpf skeleton the init service includes.
       bpftool gen skeleton main.bpf.o name fuzz_bpf > fuzz_bpf.skel.h
 
-      # Init service, dynamically linked against libbpf.
-      $CC -O2 -Ibpf -I. -o scx-init scx-init.c \
+      # Init service, dynamically linked against libbpf. -I${../guest} puts
+      # libvmcall.h on the include path (scx-init registers the interleaving-
+      # coverage buffer with the host over the hypercall; see register_sched_coverage).
+      $CC -O2 -Ibpf -I. -I${../guest} -o scx-init scx-init.c \
         $(pkg-config --cflags --libs libbpf)
 
       runHook postBuild

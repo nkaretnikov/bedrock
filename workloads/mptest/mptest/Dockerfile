@@ -100,6 +100,15 @@ RUN install -D "$(find build -type f -name mptest -perm -u+x | head -n1)" /out/m
 COPY vmcall.c libvmcall.h ./
 RUN gcc -O2 -static -o /out/bedrock-vmcall vmcall.c
 
+# Thread-naming LD_PRELOAD shim (libtag.so). Built here, in the image, so it
+# links against the SAME Debian glibc as mptest -- a nix-built .so bind-mounted
+# into this container could hit a glibc symbol-version mismatch. Dynamic (a
+# preload cannot be static); -ldl for dlsym(RTLD_NEXT)/dladdr, and backtrace()
+# comes from libc. run.sh LD_PRELOADs it onto the mptest invocation so each
+# thread names itself by spawn call-site for the fuzzing scheduler's coverage.
+COPY libtag.c ./
+RUN gcc -O2 -fPIC -shared -o /out/libtag.so libtag.c -ldl
+
 # Stage exactly the Cap'n Proto / KJ shared objects mptest links (libcapnp,
 # libcapnp-rpc, libkj, libkj-async, libkj-test), resolved via ldd so this stays
 # correct across capnp version bumps. glibc/libstdc++ come from the runtime base.
@@ -115,6 +124,7 @@ COPY --from=build /out/lib/ /usr/lib/x86_64-linux-gnu/
 RUN ldconfig
 COPY --from=build /out/mptest          /usr/local/bin/mptest
 COPY --from=build /out/bedrock-vmcall  /usr/local/bin/bedrock-vmcall
+COPY --from=build /out/libtag.so       /usr/local/lib/libtag.so
 COPY run.sh /usr/local/bin/run.sh
 # Fail the build now (not at guest runtime) if any runtime lib is missing.
 RUN chmod +x /usr/local/bin/run.sh && ldd /usr/local/bin/mptest

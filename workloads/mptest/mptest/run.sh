@@ -85,7 +85,14 @@ while [ "$i" -lt "$MAX_ITERS" ]; do
 	# quote the reason, e.g. "Promise already satisfied". `timeout -s KILL` turns
 	# a hang into rc=137 (128+SIGKILL); plain timeout would be 124. Keep stdout
 	# off the console (1>/dev/null) so only our result line is parsed downstream.
-	err="$(timeout -s KILL "$HANG_SECS" thread-fuzz "$BIN" 2>&1 1>/dev/null)" || rc=$?
+	#
+	# LD_PRELOAD=libtag.so names each mptest thread by its spawn call-site
+	# (see guest/scx-fuzz/libtag.c) so the in-kernel scheduler can key its
+	# interleaving-coverage edges on a stable per-thread identity via comm.
+	# thread-fuzz is static and ignores the preload; it only reaches mptest and
+	# the IPC server it spawns (env is inherited across the SCHED_EXT exec).
+	err="$(LD_PRELOAD=/usr/local/lib/libtag.so \
+		timeout -s KILL "$HANG_SECS" thread-fuzz "$BIN" 2>&1 1>/dev/null)" || rc=$?
 
 	if [ "$rc" -eq 0 ]; then
 		continue

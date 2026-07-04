@@ -108,6 +108,13 @@ pub struct Args {
     #[arg(long = "coverage-out")]
     pub coverage_out: Option<String>,
 
+    /// After the run, dump the in-kernel scheduler's interleaving-coverage
+    /// bitmap (signal A: an AFL-style edge per context switch) to this file.
+    /// Separate from `--coverage-out`: reads the `schedcov` feedback buffer
+    /// registered by scx-init. Empty file if the fuzzing scheduler is absent.
+    #[arg(long = "sched-cov-out")]
+    pub sched_cov_out: Option<String>,
+
     /// Emulated TSC frequency in Hz (defaults to the kernel's built-in default)
     #[arg(long = "virt-tsc-frequency", value_parser = parse_u64)]
     pub virt_tsc_frequency: Option<u64>,

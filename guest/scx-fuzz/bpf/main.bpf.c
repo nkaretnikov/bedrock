@@ -16,15 +16,24 @@
  * search where the bugs are, rather than spending budget on deep, unlikely
  * schedules the way uniform chaos does.
  *
- * Mechanism, textbook PCT:
- *   - Each thread gets a random, fixed base priority. The scheduler always runs
- *     the highest-priority *enabled* (runnable) thread -- a strict priority
- *     policy. A thread only yields the CPU when it blocks (leaves the runnable
- *     set) or when a higher-priority thread wakes.
- *   - d-1 "change points" are placed in the execution. When a change point is
- *     reached, the *currently running* thread's priority is lowered below every
- *     base priority, so a different thread takes over. Those d-1 forced
- *     preemptions, placed randomly, are what expose depth-d bugs.
+ * Mechanism -- a deterministic-fair base with PCT as a sparse overlay:
+ *   - Base policy: weighted virtual-time fairness (like scx_simple), driven by
+ *     each task's scx.dsq_vtime charged by the emulated-TSC runtime it consumes.
+ *     The lowest-vtime runnable task runs next, so the base distribution of
+ *     interleavings stays close to stock Linux (CFS/EEVDF) -- the regime the
+ *     libmultiprocess CI repros actually lived in. Under the single vCPU +
+ *     emulated TSC this fairness is fully deterministic (stock CFS's
+ *     nondeterminism comes from wall-clock + SMP load-balancing, neither of
+ *     which exists here).
+ *   - PCT overlay: in a perturbed epoch, d-1 "change points" are placed in the
+ *     execution. When one fires, the *currently running* thread's effective
+ *     vtime is pushed forward by a penalty (the fair analog of textbook PCT's
+ *     priority demotion), so the vtime-fair base runs a different thread. Those
+ *     forced preemptions, placed randomly, are what expose depth-d bugs.
+ *   - Realism knob (cp_prob_pct, per-boot rodata): only that fraction of epochs
+ *     are perturbed; the rest run the pure fair base. cp_prob_pct = 0 is
+ *     effectively stock-fair (maximum fidelity to the CI repro conditions), 100
+ *     is aggressive PCT. boot_seed thus sweeps the fidelity axis.
  *
  * Three adaptations to this platform, each noted at its site below:
  *   1. Per-execution epochs. mptest runs in a 500-iteration loop, each iteration
@@ -66,19 +75,19 @@
  *     fork/exec descendants inherit it. So every task we see was opted in
  *     explicitly: there is nothing to exclude.
  *
- * Mechanism (sched_ext): one vtime-ordered DSQ whose key encodes priority
- * (KEY_BASE - priority), so dispatch() -- which always pulls the lowest key --
- * runs the highest-priority runnable task. A thread that blocks leaves the DSQ;
- * on wake it is re-inserted at its current priority. Demotions take effect the
- * next time the demoted (running) thread is re-enqueued, hurried along by a
- * preempt kick.
+ * Mechanism (sched_ext): one vtime-ordered DSQ keyed by each task's effective
+ * vtime (fair dsq_vtime, floored to bound sleep credit, plus any live
+ * change-point penalty), so dispatch() -- which pulls the lowest vtime -- runs
+ * the task furthest behind. A thread that blocks leaves the DSQ; on wake it is
+ * re-inserted at its current vtime. A change-point penalty takes effect the next
+ * time the penalized thread is re-enqueued, hurried along by a preempt kick.
  */
 #include <scx/common.bpf.h>
 #include "intf.h"
 
 char _license[] SEC("license") = "GPL";
 
-/* Single dispatch queue, ordered by the priority-derived key below. */
+/* Single dispatch queue, ordered by effective vtime (see task_vtime). */
 #define FAIR_DSQ_ID 0
 
 /* Bound for the kick loop in the timer callback. */
@@ -92,25 +101,18 @@ char _license[] SEC("license") = "GPL";
 #define MAX_CP 5
 
 /*
- * Priority-to-DSQ-key base. A task's key is KEY_BASE - priority, and dispatch
- * pulls the lowest key, so a higher priority runs first. KEY_BASE is far above
- * any priority (base priorities are max_depth + [0, prio_spread), demotions are
- * [1, max_depth)), so the subtraction never underflows.
- */
-#define KEY_BASE (1ULL << 20)
-
-/*
  * Read-only configuration, set by scx-init before the program is loaded.
  * "const volatile" is how sched_ext schedulers expose rodata to user space.
  * These are per-boot bounds; the actual per-epoch values (depth, horizon,
- * change-point placement, base priorities) are drawn from the pool at runtime.
+ * change-point placement) are drawn from the pool at runtime.
  */
-const volatile u64 slice_ns;		/* base timeslice for the priority policy */
+const volatile u64 slice_ns;		/* base timeslice for the vtime-fair policy */
 const volatile u64 horizon_min_ns;	/* change-point horizon, low bound */
 const volatile u64 horizon_max_ns;	/* change-point horizon, high bound */
-const volatile u64 max_demote_ns;	/* how long a demotion lasts (starvation cap) */
+const volatile u64 max_demote_ns;	/* demotion penalty magnitude + lifetime (starvation cap) */
 const volatile u32 max_depth;		/* max bug depth d (>= 2); depth drawn in [2, max_depth] */
-const volatile u32 prio_spread;		/* base-priority spread (>= 1) */
+const volatile u32 prio_spread;		/* retained for ABI; unused by the vtime-fair base */
+const volatile u32 cp_prob_pct;		/* realism knob: % of epochs perturbed by change points */
 const volatile bool logging;
 const volatile bool debug;		/* emit per-task membership diagnostics */
 
@@ -122,20 +124,20 @@ const volatile bool debug;		/* emit per-task membership diagnostics */
 static u64 epoch_no;		/* which execution this is; indexes the pool window */
 static bool started;		/* has the first governed execution begun */
 static u32 epoch_leader_tgid;	/* tgid of the current epoch's process leader */
-static u64 base_seed;		/* per-epoch key for the base-priority hash */
+static u64 base_seed;		/* per-epoch key for the perturb gate / hashing */
 static u32 depth;		/* bug depth d drawn this epoch */
-static u32 n_cp;		/* change points this epoch = depth - 1 */
-static u32 cur_pid;		/* pid of the task currently running (for demotion) */
-static u32 cur_prio;		/* its priority (for wake-preemption) */
+static u32 n_cp;		/* change points this epoch (0 in an unperturbed epoch) */
+static u32 cur_pid;		/* pid of the task currently running */
+static u64 cur_run_start;	/* emulated-TSC time cur_pid began running (vtime charge) */
+static u64 cur_vtime;		/* cur_pid's effective vtime when it started (for preempt) */
+static u64 vtime_now;		/* global fair virtual clock: max dispatched dsq_vtime */
 
-/* The change-point schedule for this epoch, and the demotions it has produced. */
+/* The change-point schedule for this epoch, and the penalties it has produced. */
 static u64 cp_time[MAX_CP];	/* emulated-TSC time each change point fires */
-static u32 cp_prio[MAX_CP];	/* priority the demoted thread drops to */
 static bool cp_fired[MAX_CP];	/* whether it has fired yet */
-static u32 dem_pid[MAX_CP];	/* pid demoted by change point i */
-static u32 dem_prio[MAX_CP];	/* priority it was demoted to */
-static u64 dem_expire[MAX_CP];	/* when the demotion lifts (starvation cap) */
-static bool dem_active[MAX_CP];	/* whether this demotion is live */
+static u32 dem_pid[MAX_CP];	/* pid penalized by change point i */
+static u64 dem_expire[MAX_CP];	/* when the penalty lifts (starvation cap) */
+static bool dem_active[MAX_CP];	/* whether this penalty is live */
 
 /*
  * Membership-log throttle (gated by the "debug" rodata flag). enqueue() runs on
@@ -170,6 +172,67 @@ struct {
 	__type(value, u64);
 } rnd_pool SEC(".maps");
 
+#ifndef BPF_F_MMAPABLE
+#define BPF_F_MMAPABLE (1U << 10)
+#endif
+
+/*
+ * Interleaving-coverage bitmap (signal A). A single-entry array whose one value
+ * is SCHED_COV_N saturating byte counters. BPF_F_MMAPABLE lets scx-init mmap the
+ * map's backing pages and register them with the host as a feedback buffer, so
+ * the host reads the same physical bytes the scheduler bumps -- zero-copy, out
+ * of band, never visible to the guest.
+ */
+struct cov_buf {
+	u8 bytes[SCHED_COV_N];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__uint(map_flags, BPF_F_MMAPABLE);
+	__type(key, u32);
+	__type(value, struct cov_buf);
+} cov_map SEC(".maps");
+
+/* AFL-style hitcount bump: saturating-increment the counter for edge `h`. */
+static __always_inline void cov_record(u64 h)
+{
+	u32 zero = 0;
+	struct cov_buf *b = bpf_map_lookup_elem(&cov_map, &zero);
+	u8 *cell;
+
+	if (!b)
+		return;
+	cell = &b->bytes[h & (SCHED_COV_N - 1)];
+	if (*cell != 0xff)
+		(*cell)++;
+}
+
+#ifndef SCHED_EXT
+#define SCHED_EXT 7
+#endif
+
+/*
+ * Last thread to touch each lock, for lock-ordering coverage (signal C). Keyed
+ * by (futex uaddr, tgid) -- a uaddr is only meaningful within one address space,
+ * so the tgid keeps two governed processes (e.g. mptest and a separate IPC
+ * server) with a lock at the same virtual address from conflating -- valued by
+ * the toucher's comm tag. Sized for the handful of hot IPC locks with headroom.
+ */
+struct lock_key {
+	u64 uaddr;
+	u32 tgid;
+	u32 _pad;	/* zeroed so the raw-bytes hash-map key has no junk padding */
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 4096);
+	__type(key, struct lock_key);
+	__type(value, u64);
+} last_toucher SEC(".maps");
+
 /* Read pool[idx], masked into range (RND_POOL_N is a power of two). */
 static __always_inline u64 pool_at(u32 idx)
 {
@@ -194,6 +257,72 @@ static __always_inline u64 hash2(u64 a, u64 b)
 	h *= 0xFF51AFD7ED558CCDULL;
 	h ^= h >> 33;
 	return h;
+}
+
+/*
+ * Signal A interleaving-coverage state. prev_loc carries the previous handoff's
+ * tag so the next switch records the edge (prev, cur); pending_preempt marks
+ * that the next switch-in was forced by a change point, so a PCT-induced
+ * reordering hashes to a distinct edge from a natural block/wake. Touched only
+ * from the ops callbacks, serialized on the single vCPU like the epoch state.
+ */
+static u64 prev_loc;
+static bool pending_preempt;
+
+/*
+ * Per-thread identity for coverage: a hash of the kernel comm, which libtag.c
+ * (LD_PRELOAD) sets to the thread's spawn call-site ("mp:<offset>"), stable
+ * across schedules and fork siblings. The untagged initial thread keeps comm
+ * "mptest" -- a fine distinct "client" tag. FNV-1a over the 16-byte comm.
+ */
+static __always_inline u64 thread_tag(struct task_struct *p)
+{
+	char comm[FUZZ_COMM_LEN];
+	u64 h = 1469598103934665603ULL;
+	int i;
+
+	BPF_CORE_READ_STR_INTO(&comm, p, comm);
+	for (i = 0; i < FUZZ_COMM_LEN; i++) {
+		if (comm[i] == '\0')
+			break;
+		h ^= (u8)comm[i];
+		h *= 1099511628211ULL;
+	}
+	return h;
+}
+
+/*
+ * Lock/access-ordering coverage (signal C). On each futex wait/wake, record the
+ * ordered pair (previous toucher -> current toucher) on this lock as an edge,
+ * keyed by the lock's identity (the futex uaddr). Distinct mutexes/condvars sit
+ * at distinct addresses, so this captures the acquire/signal order per lock --
+ * exactly where the mptest IPC races live (#35491 missed-wakeup between the
+ * done-check and the post; #34014 fulfill racing a cancel). Folded into the same
+ * schedcov bitmap as signal A.
+ *
+ * Gated to SCHED_EXT tasks so host daemons' futexes neither pollute the signal
+ * nor leak nondeterminism. Guest-kernel reads only, no VM exits, and uaddr is a
+ * pure function of governed guest state, so a given input replays identical edges.
+ */
+static __always_inline void cov_record_lock(u64 uaddr)
+{
+	struct task_struct *p = bpf_get_current_task_btf();
+	struct lock_key k = {};
+	u64 cur, prev, *last;
+
+	if (BPF_CORE_READ(p, policy) != SCHED_EXT)
+		return;
+
+	k.uaddr = uaddr;
+	k.tgid = BPF_CORE_READ(p, tgid);
+
+	cur = thread_tag(p);
+	last = bpf_map_lookup_elem(&last_toucher, &k);
+	prev = last ? *last : 0;
+	/* Fold tgid into the edge too, so same-address locks in different governed
+	 * processes light distinct cells. */
+	cov_record(hash2(uaddr, prev) ^ cur ^ ((u64)k.tgid << 20));
+	bpf_map_update_elem(&last_toucher, &k, &cur, BPF_ANY);
 }
 
 static __always_inline void log_event(u32 pid, const char *comm, u32 type,
@@ -231,30 +360,36 @@ static __always_inline void arm_timer(u64 delay)
 }
 
 /*
- * Start a fresh PCT epoch for a new governed execution. Draws the whole schedule
- * from this epoch's pool window (positional; see intf.h): a base-priority seed, a
- * bug depth d, a horizon, and d-1 change-point times scattered across it. The
- * change points are laid down as cumulative gaps so cp_time[] is monotonic by
- * construction -- no sort -- and each is assigned a distinct demotion priority
- * d-1, d-2, …, 1 (earlier point -> higher residual priority, as textbook PCT).
+ * Start a fresh epoch for a new governed execution. Draws the whole schedule
+ * from this epoch's pool window (positional; see intf.h): a hash seed, a bug
+ * depth d, a horizon, and -- only if this epoch is perturbed -- d-1 change-point
+ * times scattered across it as cumulative gaps (so cp_time[] is monotonic by
+ * construction, no sort). Whether the epoch is perturbed is the realism knob:
+ * only a cp_prob_pct fraction of epochs carry change points, the rest run the
+ * pure vtime-fair base. The gate is derived from base_seed, so it consumes no
+ * extra pool slot and replays deterministically.
  */
 static __always_inline void start_epoch(u64 now)
 {
 	u32 base = (u32)((epoch_no % EPOCHS_MAX) * SLOTS_PER_EPOCH);
 	u64 horizon, span, t;
+	bool perturb;
 	u32 d;
 	int i;
 
 	base_seed = pool_at(base + 0);
 
-	/* Depth d in [2, max_depth]; n_cp = d-1 change points, capped at MAX_CP. */
+	/* Realism knob: is this epoch perturbed by change points at all? */
+	perturb = (u32)(hash2(base_seed, 0x50D1CEULL) % 100) < cp_prob_pct;
+
+	/* Depth d in [2, max_depth]; n_cp = d-1 change points (0 if unperturbed). */
 	d = 2 + (u32)(pool_at(base + 1) % (max_depth >= 2 ? max_depth - 1 : 1));
 	if (d < 2)
 		d = 2;
 	if (d > max_depth)
 		d = max_depth;
 	depth = d;
-	n_cp = d - 1;
+	n_cp = perturb ? d - 1 : 0;
 	if (n_cp > MAX_CP)
 		n_cp = MAX_CP;
 
@@ -275,16 +410,13 @@ static __always_inline void start_epoch(u64 now)
 
 			t += gap;
 			cp_time[i] = t;
-			cp_prio[i] = d - 1 - (u32)i;	/* d-1, d-2, …, 1 */
 			cp_fired[i] = false;
 		} else {
 			cp_time[i] = 0;
-			cp_prio[i] = 0;
 			cp_fired[i] = true;		/* inert */
 		}
 		dem_active[i] = false;
 		dem_pid[i] = 0;
-		dem_prio[i] = 0;
 		dem_expire[i] = 0;
 	}
 
@@ -296,36 +428,53 @@ static __always_inline void start_epoch(u64 now)
 	epoch_no++;
 }
 
-/* Base priority of a thread: high (>= max_depth), stable within an epoch. */
-static __always_inline u32 base_prio(u32 pid)
+/* Signed vtime comparison: true if `a` is before `b` (wraparound-safe). */
+static __always_inline bool vtime_before(u64 a, u64 b)
 {
-	return max_depth + (u32)(hash2(pid, base_seed) % prio_spread);
+	return (s64)(a - b) < 0;
 }
 
 /*
- * Current priority of a thread: its base priority, unless a live (unexpired)
- * change-point demotion has lowered it. Multiple change points can demote the
- * same thread; the lowest (most recent) demotion wins.
+ * Live change-point penalty on a thread: a virtual-time offset that pushes a
+ * penalized thread behind its fair peers until the penalty expires (the
+ * starvation cap). Uniform magnitude -- max_demote_ns of virtual time per live
+ * change point that hit this pid -- summed. This is the fair-scheduler analog of
+ * textbook PCT's priority demotion: rather than a strict-priority drop, the
+ * victim's effective vtime jumps forward so the vtime-fair base runs someone else.
  */
-static __always_inline u32 task_prio(u32 pid, u64 now)
+static __always_inline u64 task_penalty(u32 pid, u64 now)
 {
-	u32 prio = base_prio(pid);
+	u64 pen = 0;
 	int i;
 
 	for (i = 0; i < MAX_CP; i++) {
-		if (dem_active[i] && dem_pid[i] == pid && now < dem_expire[i] &&
-		    dem_prio[i] < prio)
-			prio = dem_prio[i];
+		if (dem_active[i] && dem_pid[i] == pid && now < dem_expire[i])
+			pen += max_demote_ns;
 	}
-	return prio;
+	return pen;
 }
 
 /*
- * Advance the change-point schedule: fire every change point now due, demoting
- * the currently-running thread, and re-arm the timer for the next one. Called
- * from the scheduling hooks and from the timer, all serialized on the single
- * vCPU. A preempt kick follows a firing so the just-demoted running thread is
- * re-enqueued (at its new low priority) promptly.
+ * Effective enqueue vtime for a task: its fair dsq_vtime, floored so a task that
+ * slept a long time cannot monopolize the CPU (bounded backward credit, like
+ * scx_simple), plus any live change-point penalty. Lowest effective vtime
+ * dispatches first.
+ */
+static __always_inline u64 task_vtime(struct task_struct *p, u32 pid, u64 now)
+{
+	u64 vt = p->scx.dsq_vtime;
+
+	if (vtime_before(vt, vtime_now - slice_ns))
+		vt = vtime_now - slice_ns;
+	return vt + task_penalty(pid, now);
+}
+
+/*
+ * Advance the change-point schedule: fire every change point now due, penalizing
+ * the currently-running thread's vtime, and re-arm the timer for the next one.
+ * Called from the scheduling hooks and from the timer, all serialized on the
+ * single vCPU. A preempt kick follows a firing so the just-penalized running
+ * thread is re-enqueued (behind its peers) promptly.
  */
 static __always_inline void advance_schedule(u64 now)
 {
@@ -343,10 +492,9 @@ static __always_inline void advance_schedule(u64 now)
 			cp_fired[i] = true;
 			dem_active[i] = true;
 			dem_pid[i] = cur_pid;
-			dem_prio[i] = cp_prio[i];
 			dem_expire[i] = now + max_demote_ns;
 			log_event(cur_pid, NULL, FUZZ_EVENT_DEMOTE, now,
-				  cp_prio[i]);
+				  max_demote_ns);
 			need_preempt = true;
 		} else if (next_t == 0 || cp_time[i] < next_t) {
 			next_t = cp_time[i];
@@ -355,8 +503,11 @@ static __always_inline void advance_schedule(u64 now)
 
 	if (next_t)
 		arm_timer(next_t - now);
-	if (need_preempt)
+	if (need_preempt) {
+		/* Tag the next switch-in as change-point-forced for signal A. */
+		pending_preempt = true;
 		scx_bpf_kick_cpu(0, SCX_KICK_PREEMPT);
+	}
 }
 
 s32 BPF_STRUCT_OPS(chaos_select_cpu, struct task_struct *p, s32 prev_cpu,
@@ -373,14 +524,12 @@ void BPF_STRUCT_OPS(chaos_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	u64 now = bpf_ktime_get_ns();
 	u32 pid = BPF_CORE_READ(p, pid);
-	u32 prio;
-	u64 key;
+	u64 vtime;
 
 	/* Fire any due change points before pricing this task. */
 	advance_schedule(now);
 
-	prio = task_prio(pid, now);
-	key = KEY_BASE - prio;	/* higher priority -> lower key -> runs first */
+	vtime = task_vtime(p, pid, now);
 
 	if (debug && dbg_logged < 64) {
 		dbg_logged++;
@@ -388,14 +537,16 @@ void BPF_STRUCT_OPS(chaos_enqueue, struct task_struct *p, u64 enq_flags)
 			  pid);
 	}
 
-	scx_bpf_dsq_insert_vtime(p, FAIR_DSQ_ID, slice_ns, key, enq_flags);
+	scx_bpf_dsq_insert_vtime(p, FAIR_DSQ_ID, slice_ns, vtime, enq_flags);
 
 	/*
-	 * PCT runs the highest-priority enabled thread: if this waker outranks the
-	 * task on the CPU, kick a preempt so it takes over at the next dispatch
-	 * rather than waiting out the running slice.
+	 * Fair preemption: if this waking task is further behind (earlier effective
+	 * vtime) than the one on the CPU, kick a preempt so ordering is honored at
+	 * the next dispatch rather than waiting out the running slice. This is also
+	 * how a change point's penalty lands promptly -- the penalized runner now
+	 * sorts after this waker.
 	 */
-	if (started && prio > cur_prio)
+	if (started && pid != cur_pid && vtime_before(vtime, cur_vtime))
 		scx_bpf_kick_cpu(0, SCX_KICK_PREEMPT);
 }
 
@@ -406,12 +557,55 @@ void BPF_STRUCT_OPS(chaos_dispatch, s32 cpu, struct task_struct *prev)
 	scx_bpf_dsq_move_to_local(FAIR_DSQ_ID);
 }
 
-/* Track the running task so a change point knows whom to demote and so
- * wake-preemption can compare priorities. */
+/* Track the running task so a change point knows whom to penalize, so fair
+ * preemption can compare vtimes, and so stopping() can charge the runtime. Also
+ * advance the global fair clock to this task's vtime. */
 void BPF_STRUCT_OPS(chaos_running, struct task_struct *p)
 {
+	u64 now = bpf_ktime_get_ns();
+	u64 loc;
+
 	cur_pid = BPF_CORE_READ(p, pid);
-	cur_prio = task_prio(cur_pid, bpf_ktime_get_ns());
+	cur_run_start = now;
+	cur_vtime = task_vtime(p, cur_pid, now);
+
+	/* Monotonically advance the fair clock toward the running task's vtime. */
+	if (vtime_before(vtime_now, p->scx.dsq_vtime))
+		vtime_now = p->scx.dsq_vtime;
+
+	/*
+	 * Interleaving coverage (signal A): record this context switch as an
+	 * AFL-style edge over consecutively-run threads, keyed by the stable
+	 * comm tag. If a change point forced this switch, perturb the tag so the
+	 * forced reordering lights a distinct edge from the same natural handoff.
+	 * Host-read out of band; adds no VM exits, so the emulated TSC and the
+	 * schedule are unchanged and a given input replays identical coverage.
+	 */
+	loc = thread_tag(p);
+	if (pending_preempt) {
+		loc ^= 0x9E3779B97F4A7C15ULL;
+		pending_preempt = false;
+	}
+	cov_record(prev_loc ^ loc);
+	prev_loc = loc >> 1;
+}
+
+/*
+ * Charge the vtime a task consumed while running, so the vtime-fair base slides
+ * it behind its peers in proportion to CPU time used -- the mechanism that makes
+ * the base policy fair. Equal weights (the deterministic single-vCPU target has
+ * no nice/cgroup weighting to track), so the vtime charge is just the emulated-
+ * TSC runtime. Guard on cur_pid in case stopping fires for a task we did not
+ * observe starting.
+ */
+void BPF_STRUCT_OPS(chaos_stopping, struct task_struct *p, bool runnable)
+{
+	u64 now = bpf_ktime_get_ns();
+
+	if (BPF_CORE_READ(p, pid) != cur_pid)
+		return;
+	p->scx.dsq_vtime += now - cur_run_start;
+	cur_run_start = now;
 }
 
 /*
@@ -430,6 +624,10 @@ void BPF_STRUCT_OPS(chaos_enable, struct task_struct *p)
 {
 	u32 pid = BPF_CORE_READ(p, pid);
 	u32 tgid = BPF_CORE_READ(p, tgid);
+
+	/* A newly-governed task starts at the current fair clock, so it neither
+	 * starves nor carries unbounded backward credit from a zero vtime. */
+	p->scx.dsq_vtime = vtime_now;
 
 	if (pid == tgid && tgid != epoch_leader_tgid) {
 		epoch_leader_tgid = tgid;
@@ -478,12 +676,37 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(chaos_init)
 	return 0;
 }
 
+/*
+ * Signal C probes. futex_wait / futex_wake are the contended-lock slow paths for
+ * glibc std::mutex and std::condition_variable -- the primitives mptest's
+ * cross-thread IPC handoff uses (EventLoop::post's m_mutex/m_cv, clientInvoke's
+ * Waiter). arg0 is the userspace futex address in both (kernel/futex/waitwake.c),
+ * i.e. the lock identity. Both symbols are global, so fentry attaches via BTF.
+ * Attached by scx-init; best-effort (the scheduler runs without them).
+ */
+SEC("fentry/futex_wait")
+int BPF_PROG(on_futex_wait, u32 *uaddr, unsigned int flags, u32 val,
+	     void *abs_time, u32 bitset)
+{
+	cov_record_lock((u64)uaddr);
+	return 0;
+}
+
+SEC("fentry/futex_wake")
+int BPF_PROG(on_futex_wake, u32 *uaddr, unsigned int flags, int nr_wake,
+	     u32 bitset)
+{
+	cov_record_lock((u64)uaddr);
+	return 0;
+}
+
 SEC(".struct_ops.link")
 struct sched_ext_ops chaos_ops = {
 	.select_cpu = (void *)chaos_select_cpu,
 	.enqueue    = (void *)chaos_enqueue,
 	.dispatch   = (void *)chaos_dispatch,
 	.running    = (void *)chaos_running,
+	.stopping   = (void *)chaos_stopping,
 	.enable     = (void *)chaos_enable,
 	.init       = (void *)chaos_init,
 	/*

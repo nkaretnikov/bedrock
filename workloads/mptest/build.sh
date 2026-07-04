@@ -45,12 +45,18 @@ fi
 #   - guest/libvmcall.h                       : shared header-only hypercall lib.
 #   - guest/libfeedback.{c,h}, libpcguard.c   : coverage-feedback runtime, linked
 #                                               into mptest only when COVERAGE=1.
+#   - guest/scx-fuzz/libtag.c                  : LD_PRELOAD thread-naming shim,
+#                                               compiled into the image against
+#                                               the target's own libc (ABI-safe)
+#                                               so the fuzzing scheduler can key
+#                                               interleaving coverage on comm.
 #   - libmultiprocess/                        : vendored mptest source.
-trap 'rm -rf mptest/libvmcall.h mptest/libfeedback.c mptest/libfeedback.h mptest/libpcguard.c mptest/libmultiprocess' EXIT
+trap 'rm -rf mptest/libvmcall.h mptest/libfeedback.c mptest/libfeedback.h mptest/libpcguard.c mptest/libtag.c mptest/libmultiprocess' EXIT
 cp ../../guest/libvmcall.h mptest/libvmcall.h
 cp ../../guest/libfeedback.c mptest/libfeedback.c
 cp ../../guest/libfeedback.h mptest/libfeedback.h
 cp ../../guest/libpcguard.c mptest/libpcguard.c
+cp ../../guest/scx-fuzz/libtag.c mptest/libtag.c
 rm -rf mptest/libmultiprocess
 # Copy the tree without its build artifacts / VCS metadata so the context stays
 # small and the build is not polluted by a prior host-side cmake build dir.

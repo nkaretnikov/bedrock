@@ -152,21 +152,23 @@ fn read_io_output(vm: &mut Vm, len: usize) -> io::Result<Vec<u8>> {
         .unwrap_or_default())
 }
 
-/// Dump the guest's coverage feedback buffer(s) to `path` as raw edge
-/// hitcounts. The guest registers coverage under an id of the form `cov-<build>`
-/// (or bare `cov`; see guest/libfeedback.c), and there may be several — one per
-/// instrumented process/build — so we enumerate registered buffers and
-/// prefix-match `cov` rather than look up a fixed id the way `read_io_output`
-/// does. All matches are merged byte-wise (saturating max) into one vector, the
-/// natural union of edge coverage. Writes an empty file if the guest registered
-/// no coverage buffer (e.g. an uninstrumented target). Returns the number of
-/// coverage buffers merged.
-fn dump_coverage(vm: &mut Vm, path: &str) -> io::Result<usize> {
+/// Dump the guest's coverage feedback buffer(s) whose id begins with `prefix`
+/// to `path` as raw edge hitcounts. Two disjoint streams use this: code coverage
+/// registers under `cov-<build>` (or bare `cov`; see guest/libfeedback.c), and
+/// the scheduler's interleaving coverage registers under `schedcov` (see
+/// guest/scx-fuzz; note it does NOT begin with `cov`, so the two never mix).
+/// There may be several buffers per prefix — one per instrumented process/build
+/// — so we enumerate registered buffers and prefix-match rather than look up a
+/// fixed id the way `read_io_output` does. All matches are merged byte-wise
+/// (saturating max) into one vector, the natural union of coverage. Writes an
+/// empty file if the guest registered no matching buffer. Returns the number of
+/// buffers merged.
+fn dump_coverage(vm: &mut Vm, path: &str, prefix: &[u8]) -> io::Result<usize> {
     let mut slots = Vec::new();
     let mut idx = 0usize;
     // Registration is contiguous, so the first unregistered slot ends the walk.
     while let Some(info) = vm.get_feedback_buffer_info_at(idx)? {
-        if info.id_bytes().starts_with(b"cov") {
+        if info.id_bytes().starts_with(prefix) {
             slots.push(idx);
         }
         idx += 1;
@@ -690,9 +692,19 @@ fn run() -> io::Result<()> {
     // driver reads back). Independent of exit stats; a failure here must not sink
     // the run, so it is logged, not propagated.
     if let Some(ref path) = args.coverage_out {
-        match dump_coverage(&mut vm, path) {
+        match dump_coverage(&mut vm, path, b"cov") {
             Ok(n) => debug!("Wrote coverage ({} buffer(s)) to {}", n, path),
             Err(e) => warn!("Failed to write coverage to {}: {}", path, e),
+        }
+    }
+
+    // Dump the scheduler's interleaving coverage (signal A) if requested. Same
+    // mechanism as code coverage but a separate `schedcov` stream, so a
+    // coverage-guided driver can steer on interleaving novelty independently.
+    if let Some(ref path) = args.sched_cov_out {
+        match dump_coverage(&mut vm, path, b"schedcov") {
+            Ok(n) => debug!("Wrote sched coverage ({} buffer(s)) to {}", n, path),
+            Err(e) => warn!("Failed to write sched coverage to {}: {}", path, e),
         }
     }
 

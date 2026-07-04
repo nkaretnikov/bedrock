@@ -267,6 +267,7 @@
             bedrock-cli -m 5120 \
               ''${BEDROCK_RDRAND_SEED:+-s "$BEDROCK_RDRAND_SEED"} \
               ''${BEDROCK_COVERAGE_OUT:+--coverage-out "$BEDROCK_COVERAGE_OUT"} \
+              ''${BEDROCK_SCHED_COV_OUT:+--sched-cov-out "$BEDROCK_SCHED_COV_OUT"} \
               -i ${podmanInitrd} \
               --file compose.yaml=workloads/mptest/compose.yaml \
               --file images.tar=workloads/mptest/images.tar \

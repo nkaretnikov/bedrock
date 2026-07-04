@@ -58,6 +58,20 @@ typedef unsigned long long u64;
 #define SLOTS_PER_EPOCH 8
 #define EPOCHS_MAX (RND_POOL_N / SLOTS_PER_EPOCH)
 
+/*
+ * Interleaving-coverage bitmap (signal A). The BPF scheduler records an
+ * AFL-style edge per context switch -- hash(prev_thread_tag, next_thread_tag) --
+ * into this many saturating byte counters, held in a single mmapable BPF array
+ * so scx-init can mmap it and register it with the host as a feedback buffer
+ * (SCHED_COV_ID). The host reads it back like code coverage but keeps it a
+ * SEPARATE stream: the id does NOT begin with "cov", so libfeedback's dumper
+ * (which prefix-matches "cov") never unions scheduling edges with code edges.
+ * Power of two so the BPF side can mask the index. 64 KiB is well under the
+ * host's 1 MiB feedback-buffer cap.
+ */
+#define SCHED_COV_N 65536
+#define SCHED_COV_ID "schedcov"
+
 enum fuzz_event_type {
 	/* A new per-execution PCT epoch began: pid = bug depth d for this epoch,
 	 * duration_ns = the change-point horizon (ns) it was drawn over. */
