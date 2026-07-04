@@ -117,8 +117,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         branch.reseed(child_seed)?;
 
         let outcome = run_branch(&mut branch, run_deadline)?;
-        let result = classify(&sink.lines(id), outcome);
+        let lines = sink.take(id);
+        let result = classify(&lines, outcome);
         drop(branch); // free the live-branch slot before the next fork
+
+        // Persist this branch's guest console (cleaned) so the `pool[0]` refill
+        // fingerprint and mptest output survive independent of --quiet / scrollback.
+        if let Some(dir) = &args.out {
+            let path = format!("{dir}/run-{child_seed:#018x}.log");
+            if let Err(e) = write_branch_log(&path, &lines) {
+                eprintln!("  warn: could not write {path}: {e}");
+            }
+        }
 
         let repro = matches!(result, Outcome::Failed(_));
         if repro {
@@ -242,6 +252,16 @@ fn classify(lines: &[String], end: BranchEnd) -> Outcome {
     }
 }
 
+/// Write one branch's captured serial to a log file, one cleaned line each, so
+/// the run is inspectable after the fact (e.g. `grep 'pool refilled' run-*.log`).
+fn write_branch_log(path: &str, lines: &[String]) -> std::io::Result<()> {
+    let mut f = fs::File::create(path)?;
+    for l in lines {
+        writeln!(f, "{}", message_text(l))?;
+    }
+    Ok(())
+}
+
 /// splitmix64: turn a counter into a well-spread 64-bit seed so consecutive
 /// `seed_base + i` do not give near-identical schedules. Deterministic, so the
 /// same `(seed_base, i)` always yields the same `child_seed` (replayable).
@@ -286,7 +306,8 @@ struct Args {
     #[arg(long, default_value_t = 1800.0)]
     run_deadline: f64,
 
-    /// If set, write `summary.txt` (per-seed results) under this directory.
+    /// If set, write `summary.txt` (per-seed results) and one
+    /// `run-<child_seed>.log` (cleaned guest console) per branch here.
     #[arg(long)]
     out: Option<String>,
 
@@ -311,12 +332,13 @@ impl CaptureSink {
         }
     }
 
-    fn lines(&self, branch: BranchId) -> Vec<String> {
+    /// Remove and return a finished branch's captured lines. Removing bounds the
+    /// map to only the in-flight branch's output rather than the whole run's.
+    fn take(&self, branch: BranchId) -> Vec<String> {
         self.serial
             .lock()
             .unwrap()
-            .get(&branch)
-            .cloned()
+            .remove(&branch)
             .unwrap_or_default()
     }
 }
