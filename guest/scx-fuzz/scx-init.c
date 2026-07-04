@@ -261,18 +261,28 @@ static int draw_profile(struct pct_profile *pf)
 	return 0;
 }
 
-// Map the BPF interleaving-coverage bitmap (signal A) and register it with the
-// host as a feedback buffer, so `bedrock-cli --sched-cov-out` reads back the
-// scheduler's edge coverage. The map is BPF_F_MMAPABLE, so its backing pages sit
-// in this process's address space; the host captures their guest-physical
-// addresses at registration and reads the very bytes the scheduler bumps --
-// zero-copy, out of band, invisible to the guest. Best-effort: on failure the
-// scheduler still runs, just uninstrumented. scx-init lives the whole boot, so
-// the mapping (hence the pages the host reads) stays valid; we never munmap.
+// Interleaving/lock coverage (signals A+C) readback. The BPF program bumps a
+// BPF_F_MMAPABLE array (cov_map); we mirror it to the host through a SEPARATE,
+// inode-backed buffer rather than registering the BPF map's pages directly.
+//
+// Why the indirection: registering the BPF map's own mmap pages produced a
+// non-reproducible readback -- the schedule (result, profile-exact, even the vt
+// timestamps) is bit-identical across runs, so the guest-side bitmap is
+// identical, yet the host read back different bytes. The host captures a
+// buffer's guest-physical addresses once at registration and re-reads those
+// GPAs; a BPF array map's pages were not a stable enough backing for that. So we
+// use the same stable-page approach libfeedback uses for code coverage: a
+// file/inode-backed mapping (here an anonymous memfd, since scx-init lives the
+// whole boot and needs no on-disk path), mlock-pinned so the pages cannot move
+// out from under the captured GPAs. scx-init snapshots the BPF map into it (see
+// sync_coverage); the host reads this buffer.
 //
 // The id is SCHED_COV_ID ("schedcov"), which deliberately does NOT start with
 // "cov", so the host keeps this stream separate from libfeedback's code-coverage
 // buffers (whose dumper prefix-matches "cov").
+static const uint8_t *g_bpf_cov;	// live view of the BPF cov_map (read side)
+static uint8_t *g_host_cov;		// memfd-backed buffer registered with the host
+
 static void register_sched_coverage(struct fuzz_bpf *skel)
 {
 	int fd = bpf_map__fd(skel->maps.cov_map);
@@ -281,23 +291,55 @@ static void register_sched_coverage(struct fuzz_bpf *skel)
 		return;
 	}
 
-	// Single-entry array of struct cov_buf; the mmapable region is the value
-	// size, and SCHED_COV_N is already page-aligned.
-	size_t size = SCHED_COV_N;
-	void *buf = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-	if (buf == MAP_FAILED) {
+	// Read side: a live, read-only view of the BPF map's bytes.
+	void *bpf = mmap(NULL, SCHED_COV_N, PROT_READ, MAP_SHARED, fd, 0);
+	if (bpf == MAP_FAILED) {
 		fprintf(stderr, "scx-fuzz: mmap cov_map: %s\n", strerror(errno));
 		return;
 	}
-	// Fault every page in before registration so the host's guest-page-table
-	// walk sees them all present (a fresh map is already zeroed).
-	memset(buf, 0, size);
+
+	// Host-read side: an anonymous memfd, mmap'd MAP_SHARED and mlock-pinned so
+	// its pages (and thus the GPAs the host captures) stay put.
+	int mfd = (int)syscall(SYS_memfd_create, "schedcov", 0);
+	if (mfd < 0 || ftruncate(mfd, SCHED_COV_N) != 0) {
+		fprintf(stderr, "scx-fuzz: memfd for coverage: %s\n",
+			strerror(errno));
+		munmap(bpf, SCHED_COV_N);
+		if (mfd >= 0)
+			close(mfd);
+		return;
+	}
+	void *host = mmap(NULL, SCHED_COV_N, PROT_READ | PROT_WRITE, MAP_SHARED,
+			  mfd, 0);
+	close(mfd);	// the mapping keeps the memfd inode (and its pages) alive
+	if (host == MAP_FAILED) {
+		fprintf(stderr, "scx-fuzz: mmap coverage memfd: %s\n",
+			strerror(errno));
+		munmap(bpf, SCHED_COV_N);
+		return;
+	}
+	memset(host, 0, SCHED_COV_N);	// fault every page in before registration
+	mlock(host, SCHED_COV_N);	// best-effort pin; keeps GPAs stable
+
+	g_bpf_cov = bpf;
+	g_host_cov = host;
 
 	vmcall_u64 slot = vmcall_register_feedback_buffer(
-		buf, size, SCHED_COV_ID, sizeof(SCHED_COV_ID) - 1);
-	printf("scx-fuzz sched-coverage: id=%s bytes=%zu slot=%llu\n",
-	       SCHED_COV_ID, size, (unsigned long long)slot);
+		host, SCHED_COV_N, SCHED_COV_ID, sizeof(SCHED_COV_ID) - 1);
+	printf("scx-fuzz sched-coverage: id=%s bytes=%d slot=%llu\n",
+	       SCHED_COV_ID, SCHED_COV_N, (unsigned long long)slot);
 	fflush(stdout);
+}
+
+// Snapshot the BPF coverage map into the host-registered buffer. Called from the
+// poll loop; the last snapshot before the VM halts is what the host reads. The
+// governed workload is idle by then (the final mptest iteration is done and
+// run.sh is sleeping before the shutdown vmcall), so no coverage is generated
+// during that window: the snapshot is stable and the readback is reproducible.
+static void sync_coverage(void)
+{
+	if (g_bpf_cov && g_host_cov)
+		memcpy(g_host_cov, g_bpf_cov, SCHED_COV_N);
 }
 
 int main(int argc, char **argv)
@@ -439,6 +481,9 @@ int main(int argc, char **argv)
 		// Redraw the pool once run.sh signals it is past the ready/fork
 		// point, so forked branches explore distinct schedules (see above).
 		maybe_refill_pool(rnd_fd, &refilled);
+		// Mirror the BPF coverage map into the host-registered buffer so the
+		// host reads a stable, inode-backed snapshot (see sync_coverage).
+		sync_coverage();
 	}
 
 	err = 0;
