@@ -29,7 +29,9 @@
 #include <errno.h>
 #include <sched.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/personality.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -45,6 +47,35 @@ int main(int argc, char **argv)
 		fprintf(stderr, "usage: %s <command> [args...]\n", argv[0]);
 		return 2;
 	}
+
+	// Disable ASLR for the fuzzed process tree. The guest's address-space
+	// randomization is NOT seeded from bedrock's deterministic getrandom stream,
+	// so with it on the schedule replays identically but absolute addresses --
+	// e.g. the futex/lock addresses the scheduler's lock-ordering coverage keys
+	// on -- shift run to run, making coverage non-reproducible. Turning it off
+	// makes those addresses deterministic. Personality is preserved across
+	// execve and inherited by children (mptest + its IPC server), like the
+	// SCHED_EXT policy below. Best-effort: warn but continue if it is refused.
+	int persona = personality(0xffffffff); // query current without changing it
+	if (persona == -1 ||
+	    personality((unsigned int)persona | ADDR_NO_RANDOMIZE) == -1)
+		fprintf(stderr, "thread-fuzz: personality(ADDR_NO_RANDOMIZE): %s\n",
+			strerror(errno));
+
+	// Force a single malloc arena. With ASLR off the address-space base is
+	// fixed, but glibc still spreads allocations across per-thread arenas, and
+	// arena assignment can place the same logical allocation at a different
+	// address run to run -- residual non-determinism in the lock addresses the
+	// coverage keys on. One arena serializes allocation into a fixed layout, so
+	// addresses replay exactly. Inherited across execve and by children.
+	setenv("MALLOC_ARENA_MAX", "1", 1);
+
+	// Disable glibc's thread-stack cache. Freed thread stacks are otherwise
+	// cached and reused, and the reuse can place a new thread's stack (and the
+	// condvar/Waiter objects living on it, which signal C keys on) at a
+	// different address run to run. With the cache off each stack is mmap'd
+	// fresh into the fixed (ASLR-off) layout, so those addresses replay.
+	setenv("GLIBC_TUNABLES", "glibc.pthread.stack_cache_size=0", 1);
 
 	// Raw syscall, not the glibc wrapper: some libc versions reject an
 	// unknown policy value (SCHED_EXT == 7) before the syscall.

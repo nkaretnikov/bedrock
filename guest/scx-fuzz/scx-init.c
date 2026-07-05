@@ -199,10 +199,10 @@ static uint64_t log_uniform(uint64_t r_oct, uint64_t r_mant,
  * each boot a distinct regime that is logged (profile-exact) for reproducibility.
  */
 struct pct_profile {
-	uint64_t slice_ns;		/* base timeslice */
-	uint64_t horizon_min_ns;	/* change-point horizon, low bound */
-	uint64_t horizon_max_ns;	/* change-point horizon, high bound */
-	uint64_t max_demote_ns;		/* demotion penalty magnitude + lifetime (starvation cap) */
+	uint64_t slice_ns;		/* fixed vtime quantum charged per turn */
+	uint64_t horizon_min_sw;	/* change-point horizon, low bound (context switches) */
+	uint64_t horizon_max_sw;	/* change-point horizon, high bound (context switches) */
+	uint64_t max_demote_sw;		/* demotion lifetime in context switches (starvation cap) */
 	uint32_t max_depth;		/* max bug depth d (>= 2) */
 	uint32_t prio_spread;		/* retained for ABI; unused by the vtime-fair base */
 	uint32_t cp_prob_pct;		/* realism knob: % of epochs perturbed by change points */
@@ -214,15 +214,16 @@ struct pct_profile {
  * filled, so the whole run stays a pure function of the input and replays
  * exactly. Returns 0/-1.
  *
- *   - Horizon (the emulated-TSC window the d-1 change points are scattered over)
- *     is bounded by a log-uniform ~8us..2.1s ceiling with a floor at ceiling/16.
- *     Sampling down to microseconds lets a change point land *inside* an IPC race
- *     window, not just around it.
- *   - The base timeslice is log-uniform ~8us..4ms, varying preemption
- *     granularity for the strict-priority policy.
- *   - max_demote_ns (how long a change-point demotion suppresses its victim) is
- *     log-uniform ~1ms..2.1s -- well under run.sh's 30s hang watchdog, so PCT
- *     starvation alone cannot masquerade as the #35491 hang.
+ *   - Horizon (the window the d-1 change points are scattered over) is measured
+ *     in CONTEXT SWITCHES, not time: a switch is the deterministic PCT "step".
+ *     Log-uniform ~2..2048 switches ceiling with a floor at ceiling/16, so a
+ *     change point can land after just a couple of switches (inside a tight IPC
+ *     handoff) or spread across a long execution.
+ *   - slice_ns is the fixed vtime quantum charged per turn (the round-robin
+ *     granularity of the vtime-fair base); log-uniform ~8us..4ms.
+ *   - max_demote_sw (how long a change-point demotion suppresses its victim) is
+ *     log-uniform ~4..1024 switches -- a bounded starvation cap so PCT demotion
+ *     alone cannot masquerade as the #35491 hang.
  *   - max_depth (the bug-depth ceiling; per-epoch depth is drawn in [2, max_depth]
  *     inside the scheduler) is 3..6, and prio_spread is retained only for rodata
  *     ABI (the vtime-fair base does not use it).
@@ -242,16 +243,16 @@ static int draw_profile(struct pct_profile *pf)
 	if (get_random(r, sizeof(r)) != 0)
 		return -1;
 
-	uint64_t H = log_uniform(r[0], r[1], 13, 31);	/* [8.2us, 2.1s) */
+	uint64_t H = log_uniform(r[0], r[1], 1, 11);	/* [2, 2048) switches */
 
-	pf->horizon_max_ns = H;
-	pf->horizon_min_ns = H >> 4;			/* H/16 */
-	if (pf->horizon_min_ns < 8192)
-		pf->horizon_min_ns = 8192;		/* keep min < max, > 0 */
-	if (pf->horizon_min_ns >= pf->horizon_max_ns)
-		pf->horizon_max_ns = pf->horizon_min_ns + 1;
+	pf->horizon_max_sw = H;
+	pf->horizon_min_sw = H >> 4;			/* H/16 */
+	if (pf->horizon_min_sw < 1)
+		pf->horizon_min_sw = 1;			/* keep min < max, > 0 */
+	if (pf->horizon_min_sw >= pf->horizon_max_sw)
+		pf->horizon_max_sw = pf->horizon_min_sw + 1;
 	pf->slice_ns = log_uniform(r[2], r[3], 13, 22);	/* [8.2us, 4.2ms) */
-	pf->max_demote_ns = log_uniform(r[4], r[5], 20, 31);	/* [1ms, 2.1s) */
+	pf->max_demote_sw = log_uniform(r[4], r[5], 2, 10);	/* [4, 1024) switches */
 	pf->max_depth = 3 + (uint32_t)(r[6] % 4);	/* 3..6 (n_cp <= MAX_CP=5) */
 	pf->prio_spread =
 		spread_choices[r[7] % (sizeof(spread_choices) / sizeof(spread_choices[0]))];
@@ -367,9 +368,9 @@ int main(int argc, char **argv)
 		goto cleanup_skel;
 	}
 	skel->rodata->slice_ns = pf.slice_ns;
-	skel->rodata->horizon_min_ns = pf.horizon_min_ns;
-	skel->rodata->horizon_max_ns = pf.horizon_max_ns;
-	skel->rodata->max_demote_ns = pf.max_demote_ns;
+	skel->rodata->horizon_min_sw = pf.horizon_min_sw;
+	skel->rodata->horizon_max_sw = pf.horizon_max_sw;
+	skel->rodata->max_demote_sw = pf.max_demote_sw;
 	skel->rodata->max_depth = pf.max_depth;
 	skel->rodata->prio_spread = pf.prio_spread;
 	skel->rodata->cp_prob_pct = pf.cp_prob_pct;
@@ -379,24 +380,24 @@ int main(int argc, char **argv)
 	skel->rodata->debug = true;
 
 	// Log the drawn profile so every run's regime is visible on the console
-	// (fuzz.sh records both lines). The first line is human-readable (us,
-	// rounded); the second is byte-exact -- raw ns/counts under the rodata field
-	// names -- so a repro can be reconstructed exactly by hardcoding these values,
-	// even across a scx-init change that would otherwise re-map the input.
-	printf("scx-fuzz profile: horizon=%llu..%lluus slice=%lluus "
-	       "demote<=%lluus depth<=%u spread=%u cp_prob=%u%%\n",
-	       (unsigned long long)(pf.horizon_min_ns / 1000),
-	       (unsigned long long)(pf.horizon_max_ns / 1000),
+	// (fuzz.sh records both lines). The first line is human-readable; the second
+	// is byte-exact -- raw switch counts/values under the rodata field names --
+	// so a repro can be reconstructed exactly by hardcoding these values, even
+	// across a scx-init change that would otherwise re-map the input.
+	printf("scx-fuzz profile: horizon=%llu..%llusw slice=%lluus "
+	       "demote<=%llusw depth<=%u spread=%u cp_prob=%u%%\n",
+	       (unsigned long long)pf.horizon_min_sw,
+	       (unsigned long long)pf.horizon_max_sw,
 	       (unsigned long long)(pf.slice_ns / 1000),
-	       (unsigned long long)(pf.max_demote_ns / 1000),
+	       (unsigned long long)pf.max_demote_sw,
 	       pf.max_depth, pf.prio_spread, pf.cp_prob_pct);
-	printf("scx-fuzz profile-exact: horizon_min_ns=%llu horizon_max_ns=%llu "
-	       "slice_ns=%llu max_demote_ns=%llu max_depth=%u prio_spread=%u "
+	printf("scx-fuzz profile-exact: horizon_min_sw=%llu horizon_max_sw=%llu "
+	       "slice_ns=%llu max_demote_sw=%llu max_depth=%u prio_spread=%u "
 	       "cp_prob_pct=%u\n",
-	       (unsigned long long)pf.horizon_min_ns,
-	       (unsigned long long)pf.horizon_max_ns,
+	       (unsigned long long)pf.horizon_min_sw,
+	       (unsigned long long)pf.horizon_max_sw,
 	       (unsigned long long)pf.slice_ns,
-	       (unsigned long long)pf.max_demote_ns,
+	       (unsigned long long)pf.max_demote_sw,
 	       pf.max_depth, pf.prio_spread, pf.cp_prob_pct);
 	fflush(stdout);
 
@@ -438,13 +439,15 @@ int main(int argc, char **argv)
 	// Attach the futex fentry probes for lock-ordering coverage (signal C).
 	// Best-effort: if the kernel lacks the symbols/BTF, the scheduler still runs
 	// without lock edges. Held for the whole boot; destroyed at cleanup.
-	struct bpf_link *link_fw = bpf_program__attach(skel->progs.on_futex_wait);
-	struct bpf_link *link_fk = bpf_program__attach(skel->progs.on_futex_wake);
-	if (!link_fw || !link_fk)
+	errno = 0;
+	struct bpf_link *link_ft = bpf_program__attach(skel->progs.on_sys_enter);
+	if (!link_ft)
 		fprintf(stderr,
-			"scx-fuzz: futex probes not attached; lock coverage off\n");
+			"scx-fuzz: sys_enter raw tracepoint not attached (%s); "
+			"lock coverage off\n",
+			strerror(errno));
 	else
-		printf("scx-fuzz lock-ordering coverage attached (futex probes)\n");
+		printf("scx-fuzz lock-ordering coverage attached (sys_enter raw tp)\n");
 	fflush(stdout);
 
 	struct ring_buffer *rb =
@@ -475,6 +478,7 @@ int main(int argc, char **argv)
 	// front and read positionally; the only refresh is the one-shot post-ready
 	// re-roll below (for fork-based fuzzing), never a mid-run one.
 	int refilled = 0;
+	unsigned long tick = 0;
 	while (!stop) {
 		ring_buffer__poll(rb, 100 /* ms pacing */);
 		ring_buffer__consume(rb);
@@ -484,15 +488,23 @@ int main(int argc, char **argv)
 		// Mirror the BPF coverage map into the host-registered buffer so the
 		// host reads a stable, inode-backed snapshot (see sync_coverage).
 		sync_coverage();
+		// Signal C health: print the futex/recorded counts ~every second so the
+		// final line before shutdown shows whether the lock probes are firing
+		// and passing the SCHED_EXT gate (see main.bpf.c cov_record_lock).
+		if (++tick % 10 == 0) {
+			printf("scx-fuzz lock coverage: futex_events=%llu recorded=%llu\n",
+			       (unsigned long long)skel->bss->futex_events,
+			       (unsigned long long)skel->bss->lock_events);
+			fflush(stdout);
+		}
 	}
 
 	err = 0;
 	ring_buffer__free(rb);
 cleanup_link:
-	// bpf_link__destroy is NULL/err-safe, so freeing the futex probes here is
-	// fine whether or not they attached, and covers the !rb error path too.
-	bpf_link__destroy(link_fw);
-	bpf_link__destroy(link_fk);
+	// bpf_link__destroy is NULL/err-safe, so freeing the futex tracepoint here
+	// is fine whether or not it attached, and covers the !rb error path too.
+	bpf_link__destroy(link_ft);
 	bpf_link__destroy(link);
 cleanup_skel:
 	fuzz_bpf__destroy(skel);

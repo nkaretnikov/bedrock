@@ -275,8 +275,12 @@ fn margin_for_host_cpu() -> u64 {
     // child VM). See `intel-family.h` in Linux for the model numbers.
     match (family, model) {
         (0x6, 0x8F) => 3, // Sapphire Rapids-SP (ex: Xeon Gold 5412U)
-        (0x6, 0x6A) => 8, // Ice Lake-SP (ex: Xeon Silver 4310)
-        _ => 8,           // default for untested models
+        // Ice Lake-SP (ex: Xeon Silver 4310): the mptest concurrency-fuzz
+        // workload skids to 9 (Bitcoin, which this was first tuned on, stayed
+        // <=8), so 8 left precise exits 1 instruction late -> non-deterministic
+        // emulated TSC -> guest clock reads diverged. 16 gives headroom.
+        (0x6, 0x6A) => 16, // Ice Lake-SP (ex: Xeon Silver 4310)
+        _ => 16,           // default for untested models
     }
 }
 
