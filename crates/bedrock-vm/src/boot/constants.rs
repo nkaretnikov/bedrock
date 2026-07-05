@@ -86,7 +86,12 @@ pub mod defaults {
     // path so guest time is the deterministic emulated TSC, not a raw userspace
     // TSC read. Without this, libkj-async's event loop reads a non-deterministic
     // vDSO clock and the guest schedule diverges under fuzzing perturbation.
+    // clocksource=jiffies: force a tick-driven clocksource so guest clock reads
+    // (clock_gettime/gettimeofday) come from the jiffies counter (incremented by
+    // the deterministically-injected timer tick) instead of RDTSC. RDTSC's value
+    // is INST_RETIRED-derived and carries PMU skid, so any userspace clock read
+    // off the TSC is non-deterministic; jiffies is coarse but reproducible.
     pub const CMDLINE: &str =
-        "console=hvc0 nopti nokaslr mitigations=off break audit=0 vdso=0";
+        "console=hvc0 nopti nokaslr mitigations=off break audit=0 vdso=0 clocksource=jiffies";
     pub const RDRAND_SEED: u64 = 0x12345678_deadbeef;
 }
