@@ -220,6 +220,46 @@
           program = "${script}";
         };
 
+        # Boot the RaceBench workload guest directly on the host:
+        #   nix run .#test-racebench-workload
+        # Requires the bedrock module loaded, /dev/bedrock present, and the
+        # workload image built (./workloads/racebench/build.sh). The guest kernel
+        # must have sched_ext + BTF (see nix/guest-kernel.nix). Boot it twice and
+        # diff the output to check determinism.
+        test-racebench-workload = let
+          script = pkgs.writeShellScript "bedrock-test-racebench-workload" ''
+            set -e
+            export PATH=${pkgs.lib.makeBinPath [ userland.bedrock-cli pkgs.coreutils ]}:$PATH
+
+            echo "=== Bedrock RaceBench workload ==="
+
+            if ! lsmod | grep -q bedrock; then
+              echo "ERROR: bedrock module not loaded. Run: insmod bedrock.ko"
+              exit 1
+            fi
+            if [ ! -c /dev/bedrock ]; then
+              echo "ERROR: /dev/bedrock not found"
+              exit 1
+            fi
+            if [ ! -f workloads/racebench/images.tar ]; then
+              echo "ERROR: workloads/racebench/images.tar not found." >&2
+              echo "Build it first: ./workloads/racebench/build.sh" >&2
+              exit 1
+            fi
+
+            echo "--- Booting racebench podman guest ---"
+            bedrock-cli -m 5120 \
+              -i ${podmanInitrd} \
+              --file compose.yaml=workloads/racebench/compose.yaml \
+              --file images.tar=workloads/racebench/images.tar \
+              ${guestKernel}/vmlinux
+            echo "=== RaceBench workload: OK ==="
+          '';
+        in {
+          type = "app";
+          program = "${script}";
+        };
+
         # bedrock-lab integration tests: nix run .#integration-tests
         #
         # The test binary is compiled hermetically by nix (cargo runs inside

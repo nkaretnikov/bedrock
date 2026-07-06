@@ -1,0 +1,16 @@
+images.tar
+
+# Staged by build.sh from guest/libvmcall.h into the Docker build context
+# (single source of truth lives at guest/libvmcall.h). Normally removed on
+# exit; ignored here in case a build is interrupted before cleanup.
+fuzz/libvmcall.h
+
+# Build outputs. Every target is compiled from source in fuzz/Dockerfile
+# (make && make install), so these are never needed and must never be
+# committed - the prebuilt RaceBench binaries are explicitly untrusted (README).
+# A local build-sanity check leaves them behind; keep them out of git.
+*.o
+fuzz/targets/*/code/racebench/
+fuzz/targets/*/code/src/blackscholes
+fuzz/targets/*/code/src/fluidanimate
+fuzz/targets/*/code/src/streamcluster
