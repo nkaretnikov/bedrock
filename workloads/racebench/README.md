@@ -43,6 +43,39 @@ need K&R compiler flags, were excluded on purpose). Each target's binary is
 compiled **from source** by `fuzz/Dockerfile`; the prebuilt binaries shipped by
 RaceBench are never used.
 
+Bug count (`RACEBENCH_BUG_0`..`RACEBENCH_BUG_19` in each `racebench_bugs.h`):
+
+| Target          | Injected bugs |
+| --------------- | ------------- |
+| `blackscholes`  | 20            |
+| `streamcluster` | 20            |
+| `fluidanimate`  | 20            |
+| **Total**       | **60**        |
+
+Any single boot fires at most a handful (each needs its own interleaving), so 60
+is the full ground-truth space the scheduler tries to reach across seeds, not
+what one run hits.
+
+Only variant `.1` of each target is vendored. Upstream ships five variants per
+program (`blackscholes.1`..`blackscholes.5`); a variant is a different random
+injection instance of the *same* program (a different set of 20 bugs at
+different sites), so `.2`..`.5` would add bug diversity in code we already build,
+while a new program name (e.g. `pigz`) adds new concurrency structure.
+
+### Bug types
+
+We do **not** have a per-bug type label: upstream RaceBench does not tag bugs by
+category, and nothing in the vendored files does either. All 20 bugs per target
+are the same fundamental kind: a hidden state machine (the `rb_stateN` struct of
+counters plus a mutex) whose code is spliced into the real program across
+threads. It reads the input file (`rb_input`) and shared racing variables, and
+calls `racebench_trigger(id)` when a data invariant breaks under a specific
+interleaving (see the `if (!(x == y)) racebench_trigger(N)` checks in each
+target's instrumented source). So every bug is an interleaving-dependent
+invariant violation (data-race / atomicity- / order-violation style) that aborts
+via SIGABRT: there are no deadlock or livelock bugs, and `trigger_num[i]` records
+only *which* id fired, not a type.
+
 To add more later: vendor another target's `code/` (instrumented source +
 `racebench*.{c,h}` + its Makefile) and a few `input/` files under
 `fuzz/targets/<name>/`, add its name to the loops in `fuzz/Dockerfile` and
