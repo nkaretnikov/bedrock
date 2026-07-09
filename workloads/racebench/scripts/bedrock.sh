@@ -39,10 +39,18 @@ PLATEAU="${PLATEAU:-500}"           # stop a target after this many boots add no
 MAX="${MAX:-20000}"                 # hard cap on boots
 TARGETS=(blackscholes streamcluster fluidanimate)
 
-if ! lsmod 2>/dev/null | grep -q bedrock; then
-  echo "ERROR: bedrock module not loaded (lsmod | grep bedrock). Run this on the host where bedrock is loaded." >&2
-  exit 1
-fi
+# Capture lsmod and string-match it, rather than `lsmod | grep -q`: under
+# `set -o pipefail`, grep -q exits at the first match and SIGPIPEs lsmod (whose
+# freshly-insmod'd bedrock line is at the top), and pipefail then propagates that
+# non-zero status - so the check spuriously fails even when the module IS loaded.
+lsmod_out=$(lsmod 2>/dev/null || true)
+case "$lsmod_out" in
+  *bedrock*) : ;;
+  *)
+    echo "ERROR: bedrock module not loaded (lsmod | grep bedrock). Run this on the host where bedrock is loaded." >&2
+    exit 1
+    ;;
+esac
 if [ ! -f "$REPO_ROOT/workloads/racebench/images.tar" ]; then
   echo "ERROR: images.tar not found. Build it first: cd .. && ./build.sh" >&2
   exit 1
@@ -73,9 +81,12 @@ while [ "$boots" -lt "$MAX" ]; do
 
   # Sanity: if a boot did not reach the OK marker it likely failed (module
   # unloaded, image missing). Warn so a broken sweep is not mistaken for 0/60.
-  if ! printf '%s\n' "$out" | grep -q "RaceBench workload: OK"; then
-    echo "boot $boots seed $seed: WARNING boot did not complete cleanly (no OK marker)" >&2
-  fi
+  # Match with `case`, not `printf | grep -q`, to avoid the same pipefail/SIGPIPE
+  # trap as the module check above.
+  case "$out" in
+    *"RaceBench workload: OK"*) : ;;
+    *) echo "boot $boots seed $seed: WARNING boot did not complete cleanly (no OK marker)" >&2 ;;
+  esac
 
   # Parse "<name>: BUG TRIGGERED (rc=...) bug_ids: 3 7" lines; update per-target
   # union and plateau counters. Targets with no trigger this boot just increment.
