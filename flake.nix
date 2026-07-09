@@ -247,8 +247,19 @@
               exit 1
             fi
 
+            # Optional deterministic schedule seed. The getrandom stream bedrock
+            # serves (which drives the fuzzing scheduler) is a pure function of
+            # this seed, so each seed is one deterministic schedule: sweep
+            # RDRAND_SEED across boots to explore interleavings. Unset => leave
+            # bedrock-cli's default seed, so a plain `nix run` is unchanged.
+            seed_args=()
+            if [ -n "''${RDRAND_SEED:-}" ]; then
+              echo "--- rdrand seed: $RDRAND_SEED ---"
+              seed_args=(-s "$RDRAND_SEED")
+            fi
+
             echo "--- Booting racebench podman guest ---"
-            bedrock-cli -m 5120 \
+            bedrock-cli -m 5120 "''${seed_args[@]}" \
               -i ${podmanInitrd} \
               --file compose.yaml=workloads/racebench/compose.yaml \
               --file images.tar=workloads/racebench/images.tar \
