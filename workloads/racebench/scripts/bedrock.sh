@@ -71,19 +71,44 @@ while [ "$boots" -lt "$MAX" ]; do
   # so `nix run` still exits 0. Guard with || true regardless.
   out=$(cd "$REPO_ROOT" && RDRAND_SEED="$seed" nix run .#test-racebench-workload 2>&1 || true)
 
+  # Sanity: if a boot did not reach the OK marker it likely failed (module
+  # unloaded, image missing). Warn so a broken sweep is not mistaken for 0/60.
+  if ! printf '%s\n' "$out" | grep -q "RaceBench workload: OK"; then
+    echo "boot $boots seed $seed: WARNING boot did not complete cleanly (no OK marker)" >&2
+  fi
+
   # Parse "<name>: BUG TRIGGERED (rc=...) bug_ids: 3 7" lines; update per-target
   # union and plateau counters. Targets with no trigger this boot just increment.
+  # The guest lines reach us with a console prefix, e.g.
+  #   "[vt   28.79] [fuzz] | streamcluster: BUG TRIGGERED (rc=134) bug_ids: 3 7"
+  # so match the target name ANYWHERE on the line, not anchored at column 0.
+  newmsg=""
   for t in "${TARGETS[@]}"; do
-    ids=$(printf '%s\n' "$out" | sed -n "s/^$t: BUG TRIGGERED[^:]*bug_ids:\(.*\)$/\1/p" | tr -s ' \n' ' ')
-    new=0
+    ids=$(printf '%s\n' "$out" | sed -n "s/.*$t: BUG TRIGGERED[^:]*bug_ids:\(.*\)$/\1/p" | tr -s ' \n' ' ')
+    newthis=""
     for id in $ids; do
       case " ${reached[$t]} " in
         *" $id "*) : ;;
-        *) reached[$t]="${reached[$t]} $id"; new=1 ;;
+        *) reached[$t]="${reached[$t]} $id"; newthis="$newthis $id" ;;
       esac
     done
-    if [ "$new" -eq 1 ]; then noNew[$t]=0; else noNew[$t]=$((noNew[$t] + 1)); fi
+    if [ -n "$newthis" ]; then
+      noNew[$t]=0; newmsg="$newmsg ${t}+{${newthis# }}"
+    else
+      noNew[$t]=$((noNew[$t] + 1))
+    fi
   done
+
+  # Per-boot progress to stderr (kept off the stdout summary). `slowest-plateau`
+  # is min(noNew) across targets: the sweep ends when it reaches PLATEAU, and it
+  # resets to 0 whenever any target finds a new bug. `tail -f` the tee'd log.
+  total_now=0; minplat="$PLATEAU"
+  for t in "${TARGETS[@]}"; do
+    c=$(echo "${reached[$t]}" | wc -w); total_now=$((total_now + c))
+    [ "${noNew[$t]}" -lt "$minplat" ] && minplat="${noNew[$t]}"
+  done
+  [ -n "$newmsg" ] && newmsg=" NEW:$newmsg"
+  echo "boot $boots seed $seed: coverage ${total_now}/60; slowest-plateau ${minplat}/${PLATEAU}${newmsg}" >&2
 done
 
 total=0

@@ -222,3 +222,38 @@ REPS=5 PLATEAU=100 ./bedrock_reps.sh
 Each rep's `TOTAL` is a coverage sample from an independent seed budget; a tight
 cluster across reps means the number is seed-robust, a wide spread means coverage
 is still climbing and you want a larger `PLATEAU` (or to union the reps).
+
+## Monitoring progress
+
+`bedrock.sh` emits **one progress line per boot to stderr**, so a long sweep is
+never silent. The final `reached .../TOTAL` summary goes to stdout; only the
+`BUG TRIGGERED` / `no trigger` lines are parsed, not the per-boot `bedrock-cli`
+exit-stats block (that is captured only to grep, then discarded). A progress line
+looks like:
+
+```
+boot 42 seed 42: coverage 8/60; slowest-plateau 137/500 NEW: blackscholes+{5 11}
+```
+
+- `coverage N/60` - running union across all targets so far.
+- `slowest-plateau M/PLATEAU` - `min(noNew)` across targets; the sweep ends when
+  it reaches `PLATEAU`. It **resets to 0** whenever any target finds a new bug
+  (a new bug restarts the "no-new streak"), so watching it climb toward `PLATEAU`
+  is the ETA signal.
+- `NEW: <target>+{ids}` - only present on boots that found a new bug.
+- `WARNING ... no OK marker` - a boot that did not finish cleanly (e.g. module
+  unloaded); investigate rather than let it silently pad the plateau.
+
+Since the documented invocation redirects `2>&1 | tee <file>`, both streams land
+in the log, so monitor a live run with:
+
+```bash
+tail -f bedrock-<host>-<date>.txt              # single sweep
+tail -f bedrock-<host>-<date>-run<NN>.txt      # the active rep (files appear per rep)
+tmux attach -t bedrock-reps                    # or watch the whole batch
+```
+
+**Estimating runtime.** A boot is ~10-15s wall clock (it boots a podman guest,
+then runs all three targets), so `PLATEAU=500` is a floor of ~500 boots even for
+a zero-coverage target: on the order of ~2h **per rep**, and 10 reps is most of a
+day. Use a smaller `PLATEAU` (and the `-smoke` run) to size it on your host first.
