@@ -32,6 +32,11 @@ pub const EXIT_REASON_CHECKPOINT: u32 = 0xFFFFFFFF;
 pub const EXIT_FLAG_NO_MEMORY_HASH: u32 = 1 << 0;
 /// Bit flag: intercept guest #PF exceptions for determinism analysis.
 pub const EXIT_FLAG_INTERCEPT_PF: u32 = 1 << 1;
+/// Bit flag: tolerate a PEBS skid larger than the host margin instead of
+/// aborting the run. Absent (the default) means a skid past the margin is
+/// fatal, since the armed deadline would be delivered late and break
+/// determinism.
+pub const EXIT_FLAG_IGNORE_PEBS_MARGIN: u32 = 1 << 2;
 
 /// Unified event-stream configuration passed to the kernel via ioctl.
 ///
@@ -108,6 +113,13 @@ impl EventConfig {
     /// Intercept guest #PF exceptions for determinism analysis.
     pub fn with_intercept_pf(mut self) -> Self {
         self.exit_flags |= EXIT_FLAG_INTERCEPT_PF;
+        self
+    }
+
+    /// Tolerate a PEBS skid larger than the host margin (the old best-effort
+    /// behavior). Without this, such a skid aborts the run immediately.
+    pub fn with_ignore_pebs_margin(mut self) -> Self {
+        self.exit_flags |= EXIT_FLAG_IGNORE_PEBS_MARGIN;
         self
     }
 

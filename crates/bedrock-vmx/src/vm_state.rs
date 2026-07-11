@@ -776,6 +776,18 @@ pub struct AllExitStats {
     /// minimum safe `margin_for_host_cpu()` for the host CPU. 0 if no skid was
     /// ever positive. See `exits::pebs::margin_for_host_cpu`.
     pub max_pebs_skid: i64,
+    /// Skid that tripped the strict PEBS-margin abort (`> margin`), or 0 if the
+    /// run never aborted for this reason. Written only on the abort path in
+    /// `handle_pebs_precise_exit`, so a non-zero value is an unambiguous record
+    /// that the run was terminated because a skid overshot the margin -- as
+    /// opposed to any other `VmRunError`, which the kernel otherwise collapses
+    /// to a bare EIO. Always positive when set.
+    pub pebs_margin_abort_skid: i64,
+    /// Host `margin_for_host_cpu()` in effect when the strict PEBS-margin abort
+    /// fired, or 0 if no abort occurred. Pairs with `pebs_margin_abort_skid` so
+    /// userspace can render "skid N exceeded margin M" without knowing the
+    /// CPU-model margin itself.
+    pub pebs_margin_abort_margin: i64,
 }
 
 impl AllExitStats {
@@ -1094,6 +1106,13 @@ pub struct VmState<V: VirtualMachineControlStructure, I: InstructionCounter> {
     /// The #PF is logged and reinjected so the guest handles it normally.
     /// Used for determinism analysis to observe spurious page faults.
     pub intercept_pf: bool,
+    /// When true, a PEBS skid that exceeds `get_pebs_margin()` is tolerated:
+    /// the handler records `max_pebs_skid` and continues (the old best-effort
+    /// behavior). When false (the default), such a skid aborts the run
+    /// immediately because the armed deadline would be delivered late and
+    /// break determinism. Set from `EXIT_FLAG_IGNORE_PEBS_MARGIN` (userspace
+    /// `BEDROCK_IGNORE_PEBS_MARGIN`); inherited by forked VMs.
+    pub ignore_pebs_margin: bool,
     /// Per-VM PEBS state for precise VM exits. None when the host CPU does not
     /// support EPT-friendly PEBS or when the feature has not been initialized
     /// for this VM. Boxed to avoid bloating the stack-resident `VmState`.
@@ -1379,6 +1398,7 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             feedback_buffers: feedback_buffers_new(),
             vpid,
             intercept_pf: false,
+            ignore_pebs_margin: false,
             pebs_state: None,
             pebs_supported,
             io_channel: IoChannelState::new(),
@@ -2290,6 +2310,7 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             feedback_buffers: feedback_buffers_new(),
             vpid: 0, // Tests don't use VPID
             intercept_pf: false,
+            ignore_pebs_margin: false,
             pebs_state: None,
             pebs_supported: false,
             io_channel: IoChannelState::new(),
@@ -2558,6 +2579,9 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             feedback_buffers: feedback_buffers_from(&parent_state.feedback_buffers), // Deep-copy parent's feedback buffers
             vpid: allocated_vpid,
             intercept_pf: false,
+            // Inherit the strict/ignore policy so forked children enforce the
+            // same PEBS-margin invariant as their parent run.
+            ignore_pebs_margin: parent_state.ignore_pebs_margin,
             // Inherit PEBS registration from the parent — the forked guest is
             // at the parent's snapshot point and will never re-issue
             // `HYPERCALL_REGISTER_PEBS_PAGE`, so without this the child runs

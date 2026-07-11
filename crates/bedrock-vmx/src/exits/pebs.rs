@@ -17,7 +17,7 @@
 //!   qualification, bit 16 = "asynchronous to instruction execution")
 
 use super::ept::translate_gva_to_gpa;
-use super::helpers::ExitHandlerResult;
+use super::helpers::{ExitError, ExitHandlerResult};
 use super::qualifications::EptViolationQualification;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -1137,6 +1137,30 @@ pub fn handle_pebs_precise_exit<C: VmContext>(ctx: &mut C) -> ExitHandlerResult 
         state.last_pebs_tsc_offset_delta = (tsc_offset_now as i64) - (armed_offset as i64);
         state.last_pebs_iters_since_arm = iters;
         state.last_pebs_arm_delta = arm_delta;
+
+        // Invariant: the PEBS record write must land within `get_pebs_margin()`
+        // instructions of the armed firing point (`target - margin`) so MTF can
+        // single-step the remaining margin onto the exact target. A skid larger
+        // than the margin means PEBS overshot past the target: the armed
+        // deadline (timer / I/O channel / stop_at_tsc) is delivered late and
+        // guest execution diverges. This is the mid-run manifestation of
+        // `max_pebs_skid` exceeding the host's `margin_for_host_cpu`. Abort
+        // immediately at the source of the divergence, unless the run opted
+        // back into the old best-effort behavior (BEDROCK_IGNORE_PEBS_MARGIN /
+        // EXIT_FLAG_IGNORE_PEBS_MARGIN), which keeps only the diagnostic stat.
+        let margin = get_pebs_margin();
+        if skid > margin as i64 && !state.ignore_pebs_margin {
+            // Record why the run is being torn down. handle_run collapses every
+            // VmRunError to EIO, so this stat is the reliable channel: userspace
+            // reads it back over GET_EXIT_STATS on the failure path and renders
+            // the message there (the single source of truth). Set only here, so
+            // a non-zero value uniquely identifies this abort.
+            state.exit_stats.pebs_margin_abort_skid = skid;
+            state.exit_stats.pebs_margin_abort_margin = margin as i64;
+            return ExitHandlerResult::Error(ExitError::Fatal(
+                "PEBS skid exceeded host margin (set BEDROCK_IGNORE_PEBS_MARGIN to bypass)",
+            ));
+        }
     }
 
     // `take()` consumes the armed action *and* clears it, so the disarm step

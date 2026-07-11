@@ -225,6 +225,12 @@ fn build_event_config(args: &Args) -> EventConfig {
     if args.intercept_pf {
         config = config.with_intercept_pf();
     }
+    // Opt out of the strict PEBS-margin abort: with this set, a skid past the
+    // host margin is only recorded (`max_pebs_skid`) instead of aborting the
+    // run mid-flight. Any non-empty value enables the old best-effort behavior.
+    if std::env::var_os("BEDROCK_IGNORE_PEBS_MARGIN").is_some_and(|v| !v.is_empty()) {
+        config = config.with_ignore_pebs_margin();
+    }
     config
 }
 
@@ -608,6 +614,15 @@ fn run() -> io::Result<()> {
                 log::error!("VM run failed: {}", e);
                 if let Ok(regs) = vm.get_regs() {
                     log::error!("  RIP: {:#018x}, RFLAGS: {:#018x}", regs.rip, regs.rflags);
+                }
+                if let Ok(stats) = vm.get_exit_stats() {
+                    if stats.pebs_margin_abort_skid != 0 {
+                        log::error!(
+                            "  PEBS-margin abort: skid {} exceeded host margin {} (set BEDROCK_IGNORE_PEBS_MARGIN to bypass)",
+                            stats.pebs_margin_abort_skid,
+                            stats.pebs_margin_abort_margin,
+                        );
+                    }
                 }
                 return Err(io::Error::other(e.to_string()));
             }

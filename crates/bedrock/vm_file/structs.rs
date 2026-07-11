@@ -297,6 +297,10 @@ pub(crate) struct BedrockExitStats {
     pub apic_timer_late_inject: u64,
     /// Largest PEBS skid this run; minimum safe `margin_for_host_cpu()` value.
     pub max_pebs_skid: i64,
+    /// Skid that tripped the strict PEBS-margin abort, or 0 if no abort.
+    pub pebs_margin_abort_skid: i64,
+    /// Host margin in effect at the strict PEBS-margin abort, or 0 if no abort.
+    pub pebs_margin_abort_margin: i64,
 }
 
 /// VM exit information returned to userspace from RUN ioctl.
