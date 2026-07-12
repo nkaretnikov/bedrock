@@ -87,7 +87,6 @@ pub mod defaults {
     // TSC read. Without this, userspace clock reads (the fuzzing scheduler's log
     // stamps, the workloads' own timing) see a non-deterministic host TSC and the
     // guest schedule diverges under fuzzing perturbation.
-    pub const CMDLINE: &str =
-        "console=hvc0 nopti nokaslr mitigations=off break audit=0 vdso=0";
+    pub const CMDLINE: &str = "console=hvc0 nopti nokaslr mitigations=off break audit=0 vdso=0";
     pub const RDRAND_SEED: u64 = 0x12345678_deadbeef;
 }
