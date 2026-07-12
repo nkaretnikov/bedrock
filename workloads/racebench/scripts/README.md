@@ -88,18 +88,24 @@ scheduler reaches **under bedrock** (single vCPU, emulated TSC, `thread-fuzz`
 SCHED_EXT). Run both and compare `TOTAL`s: bugs bedrock reaches that the native
 baseline never does are the scheduler's payoff.
 
-Under bedrock each boot is one **deterministic** schedule - the getrandom stream
-that drives the fuzzing scheduler is a pure function of the rdrand seed. So
-coverage comes from **sweeping the seed** across boots, not from re-running one
-seed. `bedrock.sh` drives the flake app `test-racebench-workload`, which passes
-`RDRAND_SEED` to `bedrock-cli -s` (boot `i` uses seed `SEED_BASE + (i-1)`), and
+Under bedrock each schedule is **deterministic** - the getrandom stream that
+drives the fuzzing scheduler is a pure function of the rdrand seed. So coverage
+comes from **sweeping the seed**, not from re-running one seed. Runs are now
+**fork-based**: `bedrock.sh` boots ONE parent guest to the ready checkpoint
+(`test-racebench-fork-parent`, holding at `--wait`) and forks a re-seeded child
+off it per seed (`test-racebench-fork-child`, child `i` uses `SEED_BASE + (i-1)`).
+Cold-booting a fresh guest per seed is gone: the strict late-inject abort fires
+during early boot, so the throwaway parent boot tolerates it
+(`BEDROCK_IGNORE_LATE_INJECT`) while scored children run strict and a late inject
+inside a real schedule aborts (surfaced as a `LATE-INJECT ABORT`). The driver
 unions the triggered `bug_ids` per target with the same `PLATEAU`/`MAX` plateau
 semantics as `baseline.sh` so the two numbers are directly comparable.
 
 Because it is deterministic, this sweep needs **no reps**: re-running the same
-seed range reproduces byte-identical coverage (that is the whole point). The
-baseline needs reps only because the host scheduler is nondeterministic. The
-repro of any triggered bug is `(target, input file, seed)`.
+`(BOOT_SEED, child-seed range)` reproduces byte-identical coverage (that is the
+whole point). The baseline needs reps only because the host scheduler is
+nondeterministic. The repro of any triggered bug is
+`(target, input file, boot_seed, child_seed)`.
 
 ### 1. Prerequisites
 
@@ -126,9 +132,10 @@ without VMX. Both `bedrock.sh` and `bedrock_reps.sh` share these prerequisites.
    workflow, out of scope for these scripts; do that first if the checks above
    fail.
 
-2. **`nix` on `PATH`** - the scripts wrap the flake app
-   `nix run .#test-racebench-workload`, run from the repo root (the scripts `cd`
-   there for you). The guest kernel it boots already has sched_ext + BTF baked in.
+2. **`nix` on `PATH`** - the scripts wrap the flake apps
+   `nix run .#test-racebench-fork-parent` / `.#test-racebench-fork-child`, run
+   from the repo root (the scripts `cd` there for you). The guest kernel it boots
+   already has sched_ext + BTF baked in.
 
 3. **Workload image built** - same `images.tar` the baseline uses:
 
@@ -136,14 +143,15 @@ without VMX. Both `bedrock.sh` and `bedrock_reps.sh` share these prerequisites.
    cd .. && ./build.sh        # -> workloads/racebench/images.tar (needs docker + network)
    ```
 
-Sanity-check one deterministic boot before launching a long sweep:
+Sanity-check one parent boot + one fork before launching a long sweep:
 
 ```bash
-( cd ../../.. && nix run .#test-racebench-workload )   # one boot, default seed
+PLATEAU=1 MAX=1 ./bedrock.sh    # boot the parent, fork one child, score it
 ```
 
-You should see a `<target>: BUG TRIGGERED ...` or `<target>: no trigger this seed`
-line per target. A clean run means the prerequisites are satisfied.
+You should see the parent reach `vm_id=N`, then a `<target>: BUG TRIGGERED ...`
+or `<target>: no trigger this seed` line per target. A clean run means the
+prerequisites are satisfied.
 
 ### 2. Run it
 

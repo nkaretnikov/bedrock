@@ -4,7 +4,7 @@
 # compose.yaml are served to the guest at runtime over the file-transmission
 # hypercall (the guest's generic initrd downloads them at boot), e.g. via
 # `bedrock-cli --file compose.yaml=... --file images.tar=...`, or `nix run
-# .#test-racebench-workload`. See nix/podman-initrd.nix.
+# .#test-racebench-fork-parent`. See nix/podman-initrd.nix.
 #
 # The image builds a small corpus of RaceBench targets FROM SOURCE (never their
 # prebuilt binaries; see fuzz/Dockerfile) plus the VMCALL helper. The fuzzing

@@ -24,14 +24,21 @@ each target in `thread-fuzz`, which switches it into SCHED_EXT so the fuzzing
 scheduler governs it. Nothing scheduler-specific is baked into this image.
 
 ```bash
-./build.sh                          # build image -> images.tar (needs docker)
-nix run .#test-racebench-workload   # boot it on the host
+./build.sh                                # build image -> images.tar (needs docker)
+nix run .#test-racebench-fork-parent      # boot a held "parent" on the host
+# then, in another shell, fork a re-seeded child off its printed vm_id:
+BEDROCK_PARENT_ID=<vm_id> RDRAND_SEED=1 nix run .#test-racebench-fork-child
 ```
 
-A single boot runs the corpus once under one schedule. Most seeds will NOT
-trigger (a bug needs its specific interleaving); a clean `rc=0` is the expected
-"no bug this seed" outcome. `rc=134` (SIGABRT) means a bug fired; the
-`RACEBENCH_STAT` file records which of the target's 20 injected bugs.
+Runs are **fork-based**: one parent boots to the ready checkpoint and is held
+there, then each child forks off it (copy-on-write) and re-seeds. Cold-booting a
+fresh guest per seed is gone - the strict late-inject abort fires during early
+boot, so the throwaway parent boot tolerates it (`BEDROCK_IGNORE_LATE_INJECT`)
+while scored children run strict. See `scripts/` for the coverage driver; a child
+runs the corpus once under one schedule. Most seeds will NOT trigger (a bug needs
+its specific interleaving); a clean `rc=0` is the expected "no bug this seed"
+outcome. `rc=134` (SIGABRT) means a bug fired; the `RACEBENCH_STAT` file records
+which of the target's 20 injected bugs.
 
 ## Corpus
 

@@ -572,7 +572,22 @@ fn run() -> io::Result<()> {
                         continue;
                     }
                     ExitKind::VmcallReady => {
-                        info!("VM ready (VMCALL hypercall) at tsc {}", exit.emulated_tsc);
+                        let vm_id = vm.get_vm_id().unwrap_or(0);
+                        info!(
+                            "VM ready (VMCALL hypercall) at tsc {}, vm_id={}",
+                            exit.emulated_tsc, vm_id
+                        );
+                        // With `--wait`, hold the VM alive at this post-boot
+                        // checkpoint so forked children (`--parent-id <vm_id>`,
+                        // each re-seeded) can branch from here and run the
+                        // workload under their own schedule. The boot is paid
+                        // once and shared via copy-on-write. Without `--wait`
+                        // (the plain cold-boot path) just continue into the
+                        // workload as before.
+                        if args.wait {
+                            maybe_wait_for_ctrl_c(true);
+                            break;
+                        }
                         continue;
                     }
                     ExitKind::FileFetch => {

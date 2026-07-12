@@ -220,18 +220,24 @@
           program = "${script}";
         };
 
-        # Boot the RaceBench workload guest directly on the host:
-        #   nix run .#test-racebench-workload
-        # Requires the bedrock module loaded, /dev/bedrock present, and the
-        # workload image built (./workloads/racebench/build.sh). The guest kernel
-        # must have sched_ext + BTF (see nix/guest-kernel.nix). Boot it twice and
-        # diff the output to check determinism.
-        test-racebench-workload = let
-          script = pkgs.writeShellScript "bedrock-test-racebench-workload" ''
+        # Boot a LONG-LIVED racebench "parent" VM to the post-boot ready
+        # checkpoint and HOLD it there so re-seeded children can fork off it:
+        #   nix run .#test-racebench-fork-parent            # holds until Ctrl-C
+        #   BOOT_SEED=0x1 nix run .#test-racebench-fork-parent
+        # Counterpart to test-racebench-fork-child. The parent's one-time boot is
+        # throwaway (its schedule is never scored), so it runs with
+        # BEDROCK_IGNORE_LATE_INJECT=1 to tolerate the early-boot late injects
+        # that would otherwise abort the run. It logs its vm_id at the ready
+        # checkpoint ("vm_id=N"); a driver (bedrock.sh) captures that and forks
+        # children, which run STRICT so a late inject inside a scored schedule is
+        # caught. The VM stays alive until SIGINT/Ctrl-C; the driver kills it when
+        # the sweep is done.
+        test-racebench-fork-parent = let
+          script = pkgs.writeShellScript "bedrock-test-racebench-fork-parent" ''
             set -e
             export PATH=${pkgs.lib.makeBinPath [ userland.bedrock-cli pkgs.coreutils ]}:$PATH
 
-            echo "=== Bedrock RaceBench workload ==="
+            echo "=== Bedrock RaceBench fork parent ==="
 
             if ! lsmod | grep -q bedrock; then
               echo "ERROR: bedrock module not loaded. Run: insmod bedrock.ko"
@@ -247,23 +253,70 @@
               exit 1
             fi
 
-            # Optional deterministic schedule seed. The getrandom stream bedrock
-            # serves (which drives the fuzzing scheduler) is a pure function of
-            # this seed, so each seed is one deterministic schedule: sweep
-            # RDRAND_SEED across boots to explore interleavings. Unset => leave
-            # bedrock-cli's default seed, so a plain `nix run` is unchanged.
+            # Optional boot-seed for the parent. Children re-seed after the fork,
+            # so this only fixes the one-time throwaway boot; the scored schedules
+            # vary their OWN child seed. Unset => bedrock-cli's default seed.
             seed_args=()
-            if [ -n "''${RDRAND_SEED:-}" ]; then
-              echo "--- rdrand seed: $RDRAND_SEED ---"
-              seed_args=(-s "$RDRAND_SEED")
+            if [ -n "''${BOOT_SEED:-}" ]; then
+              echo "--- boot seed: $BOOT_SEED ---"
+              seed_args=(-s "$BOOT_SEED")
             fi
 
-            echo "--- Booting racebench podman guest ---"
-            bedrock-cli -m 5120 "''${seed_args[@]}" \
+            echo "--- Booting racebench parent; holding at ready checkpoint ---"
+            # BEDROCK_IGNORE_LATE_INJECT: the throwaway boot tolerates early-boot
+            # late injects (they would otherwise abort the run). --wait holds the
+            # VM at the ready checkpoint so children can fork from it.
+            BEDROCK_IGNORE_LATE_INJECT=1 bedrock-cli -m 5120 "''${seed_args[@]}" \
               -i ${podmanInitrd} \
               --file compose.yaml=workloads/racebench/compose.yaml \
               --file images.tar=workloads/racebench/images.tar \
+              --wait \
               ${guestKernel}/vmlinux
+            echo "=== RaceBench fork parent: exited ==="
+          '';
+        in {
+          type = "app";
+          program = "${script}";
+        };
+
+        # Fork a re-seeded racebench "child" off a held parent (see
+        # test-racebench-fork-parent) and run the full corpus under the child's
+        # own schedule:
+        #   BEDROCK_PARENT_ID=<N> RDRAND_SEED=<child_seed> \
+        #     nix run .#test-racebench-fork-child
+        # The child inherits the parent's booted memory via copy-on-write (no
+        # kernel/initrd/image re-load) and re-seeds RDRAND to <child_seed>, so
+        # each child explores a distinct interleaving. It runs STRICT: a late
+        # inject inside the scored schedule aborts (BEDROCK_IGNORE_LATE_INJECT is
+        # deliberately NOT set here). Prints the per-target trigger lines and, on
+        # a clean guest shutdown, "RaceBench workload: OK".
+        test-racebench-fork-child = let
+          script = pkgs.writeShellScript "bedrock-test-racebench-fork-child" ''
+            set -e
+            export PATH=${pkgs.lib.makeBinPath [ userland.bedrock-cli pkgs.coreutils ]}:$PATH
+
+            if ! lsmod | grep -q bedrock; then
+              echo "ERROR: bedrock module not loaded. Run: insmod bedrock.ko"
+              exit 1
+            fi
+            if [ -z "''${BEDROCK_PARENT_ID:-}" ]; then
+              echo "ERROR: BEDROCK_PARENT_ID not set (the held parent's vm_id)." >&2
+              echo "Boot a parent first: nix run .#test-racebench-fork-parent" >&2
+              exit 1
+            fi
+
+            # Child seed: the getrandom stream that drives this schedule. Unset =>
+            # bedrock-cli default (all children would then share one schedule).
+            seed_args=()
+            if [ -n "''${RDRAND_SEED:-}" ]; then
+              echo "--- child seed: $RDRAND_SEED (parent $BEDROCK_PARENT_ID) ---"
+              seed_args=(-s "$RDRAND_SEED")
+            fi
+
+            # Forked VM: inherits parent memory, so no -m/-i/--file/vmlinux. Strict
+            # late-inject (env deliberately unset) so a late inject in a scored
+            # schedule aborts and surfaces instead of silently diverging.
+            bedrock-cli --parent-id "$BEDROCK_PARENT_ID" "''${seed_args[@]}"
             echo "=== RaceBench workload: OK ==="
           '';
         in {
