@@ -168,6 +168,11 @@
             fi
 
             echo "--- Booting bitcoin podman guest ---"
+            # Tolerate late APIC-timer injections so the guest boots past the
+            # early-boot phase instead of aborting (bedrock-cli reads this). This
+            # is a single cold boot with no fork, so it covers the whole run;
+            # override to "" for a strict determinism check ("boot twice, diff").
+            export BEDROCK_IGNORE_LATE_INJECT="''${BEDROCK_IGNORE_LATE_INJECT:-1}"
             bedrock-cli -m 5120 \
               -i ${podmanInitrd} \
               --file compose.yaml=workloads/bitcoin/compose.yaml \
@@ -208,6 +213,11 @@
             fi
 
             echo "--- Booting concurrency-fuzz podman guest ---"
+            # Tolerate late APIC-timer injections so the guest boots past the
+            # early-boot phase instead of aborting (bedrock-cli reads this). This
+            # is a single cold boot with no fork, so it covers the whole run;
+            # override to "" for a strict determinism check ("boot twice, diff").
+            export BEDROCK_IGNORE_LATE_INJECT="''${BEDROCK_IGNORE_LATE_INJECT:-1}"
             bedrock-cli -m 5120 \
               -i ${podmanInitrd} \
               --file compose.yaml=workloads/concurrency-fuzz/compose.yaml \
@@ -377,6 +387,11 @@
             export BEDROCK_INITRAMFS="''${BEDROCK_INITRAMFS:-${podmanInitrd}}"
             export BEDROCK_COMPOSE="''${BEDROCK_COMPOSE:-workloads/integration-tests/compose.yaml}"
             export BEDROCK_IMAGES="''${BEDROCK_IMAGES:-workloads/integration-tests/images.tar}"
+            # The boot to the ready checkpoint tolerates early-boot late injects
+            # (the lab boot honors this the same way bedrock-cli does). Default on
+            # since this one-time setup boot is throwaway; override to "" for a
+            # strict boot.
+            export BEDROCK_IGNORE_LATE_INJECT="''${BEDROCK_IGNORE_LATE_INJECT:-1}"
             if [ ! -f "$BEDROCK_IMAGES" ]; then
               echo "ERROR: $BEDROCK_IMAGES not found." >&2
               echo "Build it first: ./workloads/integration-tests/build.sh" >&2
