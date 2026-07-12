@@ -77,6 +77,24 @@ if [ ! -f "$REPO_ROOT/workloads/racebench/images.tar" ]; then
   exit 1
 fi
 
+# --- Build fingerprint ------------------------------------------------------
+# A repro is (guest build, boot_seed, child_seed), not just the seeds. The guest
+# kernel + initrd are byte-reproducible (nix), but a change under crates/
+# legitimately produces a different guest, so record what this sweep ran against:
+# the resolved store paths (content-exact even on a dirty tree), the workload
+# image hash, and the bedrock commit. A later repro asserts these match; a
+# mismatch means "different guest," not "flaky." `nix eval` resolves the paths
+# without building (they were already built to run). Printed to stdout so it
+# lands in the tee'd result file as a self-contained header.
+commit=$(cd "$REPO_ROOT" && git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
+[ -n "$(cd "$REPO_ROOT" && git status --porcelain 2>/dev/null)" ] && commit="$commit+dirty"
+guest_kernel=$(cd "$REPO_ROOT" && nix eval --raw .#guestKernel.outPath 2>/dev/null || echo unknown)
+guest_initrd=$(cd "$REPO_ROOT" && nix eval --raw .#podmanInitrd.outPath 2>/dev/null || echo unknown)
+img_sha=$(sha256sum "$REPO_ROOT/workloads/racebench/images.tar" 2>/dev/null | cut -c1-16)
+echo "--- guest-build: commit=$commit images.tar=sha256:$img_sha ---"
+echo "--- guest-build: kernel=$guest_kernel ---"
+echo "--- guest-build: initrd=$guest_initrd ---"
+
 # --- Boot the fork parent once and capture its vm_id ------------------------
 # The parent app boots to the ready checkpoint and HOLDS there (bedrock-cli
 # --wait) tolerating early-boot late injects; children fork off its frozen,
