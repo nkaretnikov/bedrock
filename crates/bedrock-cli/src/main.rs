@@ -231,6 +231,14 @@ fn build_event_config(args: &Args) -> EventConfig {
     if std::env::var_os("BEDROCK_IGNORE_PEBS_MARGIN").is_some_and(|v| !v.is_empty()) {
         config = config.with_ignore_pebs_margin();
     }
+    // Opt out of the strict late-inject abort: with this set, an APIC timer
+    // delivered past its deadline is only recorded (`apic_timer_late_inject`)
+    // instead of aborting the run. Separate knob from the PEBS-margin one, since
+    // a late inject can arise without a skid past the margin. Any non-empty
+    // value enables the old best-effort behavior.
+    if std::env::var_os("BEDROCK_IGNORE_LATE_INJECT").is_some_and(|v| !v.is_empty()) {
+        config = config.with_ignore_late_inject();
+    }
     config
 }
 
@@ -621,6 +629,13 @@ fn run() -> io::Result<()> {
                             "  PEBS-margin abort: skid {} exceeded host margin {} (set BEDROCK_IGNORE_PEBS_MARGIN to bypass)",
                             stats.pebs_margin_abort_skid,
                             stats.pebs_margin_abort_margin,
+                        );
+                    }
+                    if stats.late_inject_abort_lateness != 0 {
+                        log::error!(
+                            "  Late-inject abort: APIC timer fired {} past deadline {} (set BEDROCK_IGNORE_LATE_INJECT to bypass)",
+                            stats.late_inject_abort_lateness,
+                            stats.late_inject_abort_deadline,
                         );
                     }
                 }

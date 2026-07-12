@@ -539,6 +539,10 @@ pub(crate) fn handle_set_event_config<F: VmFileOps>(vm_file: &mut F, arg: usize)
     // of aborting the run. Absent (the default) means strict: a skid past the
     // margin is fatal.
     state.ignore_pebs_margin = (config.exit_flags & 4) != 0;
+    // Bit 3 (EXIT_FLAG_IGNORE_LATE_INJECT): tolerate a late APIC-timer inject
+    // instead of aborting the run. Absent (the default) means strict: a timer
+    // delivered past its deadline is fatal.
+    state.ignore_late_inject = (config.exit_flags & 8) != 0;
 
     log_info!(
         "SET_EVENT_CONFIG: enabled={}, categories={:#x}, exit_trigger={:?}, exit_flags={:#x} for VM {}\n",
@@ -594,6 +598,8 @@ pub(crate) fn handle_get_exit_stats<F: VmFileOps>(vm_file: &F, arg: usize) -> is
         max_pebs_skid: stats.max_pebs_skid,
         pebs_margin_abort_skid: stats.pebs_margin_abort_skid,
         pebs_margin_abort_margin: stats.pebs_margin_abort_margin,
+        late_inject_abort_lateness: stats.late_inject_abort_lateness,
+        late_inject_abort_deadline: stats.late_inject_abort_deadline,
     };
 
     // SAFETY: `arg` is a user-provided pointer from the ioctl syscall, and `exit_stats`

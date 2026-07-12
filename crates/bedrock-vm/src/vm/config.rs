@@ -37,6 +37,13 @@ pub const EXIT_FLAG_INTERCEPT_PF: u32 = 1 << 1;
 /// fatal, since the armed deadline would be delivered late and break
 /// determinism.
 pub const EXIT_FLAG_IGNORE_PEBS_MARGIN: u32 = 1 << 2;
+/// Bit flag: tolerate a late APIC-timer injection (the interrupt delivered on
+/// an exit past its deadline) instead of aborting the run. Absent (the default)
+/// means a late inject is fatal, since it means the timer landed at a different
+/// instruction than the deadline and guest execution diverges. Separate from
+/// [`EXIT_FLAG_IGNORE_PEBS_MARGIN`]: a skid past the margin is one cause of a
+/// late inject, but the timer can also arrive late through other misses.
+pub const EXIT_FLAG_IGNORE_LATE_INJECT: u32 = 1 << 3;
 
 /// Unified event-stream configuration passed to the kernel via ioctl.
 ///
@@ -120,6 +127,14 @@ impl EventConfig {
     /// behavior). Without this, such a skid aborts the run immediately.
     pub fn with_ignore_pebs_margin(mut self) -> Self {
         self.exit_flags |= EXIT_FLAG_IGNORE_PEBS_MARGIN;
+        self
+    }
+
+    /// Tolerate a late APIC-timer injection (the old best-effort behavior).
+    /// Without this, a timer delivered past its deadline aborts the run
+    /// immediately.
+    pub fn with_ignore_late_inject(mut self) -> Self {
+        self.exit_flags |= EXIT_FLAG_IGNORE_LATE_INJECT;
         self
     }
 

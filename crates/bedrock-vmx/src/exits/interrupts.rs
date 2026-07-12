@@ -54,8 +54,25 @@ pub fn check_apic_timer<C: VmContext>(ctx: &mut C) {
     // anything strictly greater means PEBS didn't fire at the
     // `target - PEBS_MARGIN` point and the timer is being delivered late
     // on whatever deterministic exit happened past the deadline.
+    //
+    // A late inject breaks determinism: the timer lands at a different
+    // instruction than the deadline, so the guest sees the interrupt at the
+    // wrong point. Unless the run opted into tolerating it
+    // (BEDROCK_IGNORE_LATE_INJECT / EXIT_FLAG_IGNORE_LATE_INJECT), record the
+    // abort figures and return without setting IRR: `inject_pending_interrupt`
+    // reads the recorded lateness and tears the run down. This mirrors the
+    // strict PEBS-margin abort in `handle_pebs_precise_exit`, but catches the
+    // late delivery at the injection point even when the skid path didn't fire.
     if current_tsc > timer_deadline {
         ctx.state_mut().exit_stats.apic_timer_late_inject += 1;
+        if !ctx.state().ignore_late_inject {
+            let lateness = (current_tsc as i64) - (timer_deadline as i64);
+            let stats = &mut ctx.state_mut().exit_stats;
+            // Set only here, so a non-zero value uniquely identifies this abort.
+            stats.late_inject_abort_lateness = lateness;
+            stats.late_inject_abort_deadline = timer_deadline as i64;
+            return;
+        }
     }
 
     let apic = &mut ctx.state_mut().devices.apic;
@@ -347,6 +364,19 @@ pub fn inject_pending_interrupt<C: VmContext>(ctx: &mut C) -> Result<(), ExitErr
     // every VM-exit, unlike `emulated_tsc` which only updates on deterministic
     // exits) and keeps the precise emulated_tsc landing point intact.
     arm_for_next_iteration(ctx);
+
+    // A late APIC-timer injection (recorded by `check_apic_timer` above) means
+    // the timer was delivered past its deadline and the run has diverged. Tear
+    // it down here so the failure surfaces at the source. handle_run collapses
+    // every VmRunError to EIO, so the `late_inject_abort_*` stats are the
+    // reliable channel: userspace reads them back over GET_EXIT_STATS on the
+    // failure path and renders the message there. Only reachable in strict
+    // mode: `check_apic_timer` leaves the stat at 0 when `ignore_late_inject`.
+    if ctx.state().exit_stats.late_inject_abort_lateness != 0 {
+        return Err(ExitError::Fatal(
+            "APIC timer injected late (set BEDROCK_IGNORE_LATE_INJECT to bypass)",
+        ));
+    }
 
     if !inject_eligible {
         return Ok(());

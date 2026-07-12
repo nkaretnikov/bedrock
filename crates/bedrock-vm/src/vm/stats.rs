@@ -143,6 +143,15 @@ pub struct ExitStats {
     /// abort occurred. Renders "skid N exceeded margin M" without the client
     /// needing to know the CPU-model margin.
     pub pebs_margin_abort_margin: i64,
+    /// TSC counts past the deadline the APIC timer fired at the strict
+    /// late-inject abort, or 0 if the run never aborted for this reason. Set
+    /// only on the abort path in the hypervisor, so a non-zero value is an
+    /// unambiguous record that this run was torn down because a timer was
+    /// delivered late. Pairs with `late_inject_abort_deadline`.
+    pub late_inject_abort_lateness: i64,
+    /// The `timer_deadline` missed at the strict late-inject abort, or 0 if no
+    /// abort occurred. Renders "timer fired N past deadline D".
+    pub late_inject_abort_deadline: i64,
 }
 
 impl ExitStats {

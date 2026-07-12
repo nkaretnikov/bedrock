@@ -301,6 +301,11 @@ pub(crate) struct BedrockExitStats {
     pub pebs_margin_abort_skid: i64,
     /// Host margin in effect at the strict PEBS-margin abort, or 0 if no abort.
     pub pebs_margin_abort_margin: i64,
+    /// TSC counts past the deadline that tripped the late-inject abort, or 0 if
+    /// no abort.
+    pub late_inject_abort_lateness: i64,
+    /// The deadline missed by the late-inject abort, or 0 if no abort.
+    pub late_inject_abort_deadline: i64,
 }
 
 /// VM exit information returned to userspace from RUN ioctl.
