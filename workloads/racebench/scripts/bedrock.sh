@@ -58,6 +58,7 @@ BOOT_SEED="${BOOT_SEED:-0}"         # parent boot seed (one-time throwaway boot)
 PLATEAU="${PLATEAU:-500}"           # stop a target after this many forks add no new bug
 MAX="${MAX:-20000}"                 # hard cap on forks
 PARENT_READY_TIMEOUT="${PARENT_READY_TIMEOUT:-300}"
+PREEMPT_PERIOD="${BEDROCK_PREEMPT_PERIOD:-0}"   # forced-preempt period per child (retired instrs); 0=off
 TARGETS=(blackscholes streamcluster fluidanimate)
 
 # Capture lsmod and string-match it, rather than `lsmod | grep -q`: under
@@ -144,7 +145,7 @@ declare -A reached                  # target -> space-separated union of bug ids
 declare -A noNew                    # target -> consecutive forks with no new bug
 for t in "${TARGETS[@]}"; do reached[$t]=""; noNew[$t]=0; done
 
-echo "--- bedrock coverage (fork): boot_seed=$BOOT_SEED seed_base=$SEED_BASE plateau=$PLATEAU max=$MAX ---"
+echo "--- bedrock coverage (fork): boot_seed=$BOOT_SEED seed_base=$SEED_BASE plateau=$PLATEAU max=$MAX preempt_period=$PREEMPT_PERIOD ---"
 
 forks=0
 aborts=0
@@ -165,6 +166,7 @@ while [ "$forks" -lt "$MAX" ]; do
   # non-zero; capture rc without tripping `set -e`.
   child_rc=0
   out=$(cd "$REPO_ROOT" && BEDROCK_PARENT_ID="$PARENT_ID" RDRAND_SEED="$seed" \
+        BEDROCK_PREEMPT_PERIOD="$PREEMPT_PERIOD" \
         nix run .#test-racebench-fork-child 2>&1) || child_rc=$?
 
   # Classify the fork. `case` (not `printf | grep -q`) avoids the pipefail/SIGPIPE
