@@ -123,24 +123,24 @@ pub fn check_apic_timer<C: VmContext>(ctx: &mut C) {
 /// conflicting accesses have no scheduler entry between them is therefore never
 /// interleaved -- the racing thread runs that stretch to completion on every
 /// run and every seed, so sweeping the seed cannot expose the bug. This injects
-/// an *extra* interrupt at a seed-chosen retired-instruction count, handing the
-/// guest scheduler a preemption point at an arbitrary instruction. The count is
-/// landed precisely by the same PEBS+MTF machinery as the APIC timer (armed via
-/// `next_preempt_target_tsc` in `arm_for_next_iteration`, single-stepped onto
-/// the boundary in `update_mtf_state`), so the schedule stays a pure function
-/// of the seed and reproduces exactly.
+/// an *extra* interrupt roughly every `preempt_period` retired instructions,
+/// handing the guest scheduler a preemption point it would not otherwise have.
+///
+/// It fires on the first deterministic exit at or after `preempt_deadline`.
+/// Because this runs only on the `last_exit_deterministic` path, that firing
+/// point is reproducible across runs -- a pure function of the seed -- so
+/// determinism holds WITHOUT arming the single per-CPU PEBS counter. Keeping
+/// preemption out of the PEBS/MTF precise-landing machinery is deliberate: an
+/// earlier version armed PEBS for the preempt deadline too, which stole the
+/// counter from the real APIC timer (usually the farther target) and made the
+/// timer deliver late -- fatal under a strict scored run, where every RaceBench
+/// fork aborted. The tradeoff is coarser placement: preemption lands at the next
+/// deterministic-exit boundary, not an exact instruction, so it cannot switch
+/// inside a long exit-free stretch.
 ///
 /// Disabled unless `apic.preempt_period != 0`. Reuses the guest's LVT timer
-/// vector, i.e. a forced preemption looks to the guest like an extra timer
-/// tick; whether that reliably drives a reschedule under the guest's scheduler
-/// is the one thing that needs on-box validation (a dedicated reschedule vector
-/// is the alternative if not).
-///
-/// Note: like a late APIC-timer inject, a preemption delivered past its
-/// deadline (`emulated_tsc > preempt_deadline`) would land at the wrong
-/// instruction and break determinism. In the normal case PEBS+MTF lands us
-/// exactly on the boundary; hardening this to the timer's strict late-inject
-/// abort is a follow-up before the feature is trusted for scored runs.
+/// vector, i.e. a forced preemption looks to the guest like an extra timer tick
+/// (empirically this does drive reschedules under the sched_ext workload).
 fn check_preempt<C: VmContext>(ctx: &mut C) {
     let apic = &ctx.state().devices.apic;
     if apic.preempt_period == 0 {

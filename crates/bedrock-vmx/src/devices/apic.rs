@@ -83,8 +83,10 @@ pub struct ApicState {
     /// randomness the guest observes. Internal state, not an APIC register.
     pub preempt_seed: u64,
     /// Emulated-TSC (retired-instruction) count of the next forced preemption
-    /// (0 = not yet armed). Landed precisely by the same PEBS+MTF machinery as
-    /// `timer_deadline`. Internal state, not an APIC register.
+    /// (0 = not yet armed). Fired on the first deterministic exit at or after
+    /// this count (see `check_preempt`); unlike `timer_deadline` it is NOT armed
+    /// on the per-CPU PEBS counter, so it never competes with the APIC timer's
+    /// precise landing. Internal state, not an APIC register.
     pub preempt_deadline: u64,
 }
 
