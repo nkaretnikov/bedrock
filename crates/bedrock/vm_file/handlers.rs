@@ -543,6 +543,15 @@ pub(crate) fn handle_set_event_config<F: VmFileOps>(vm_file: &mut F, arg: usize)
     // instead of aborting the run. Absent (the default) means strict: a timer
     // delivered past its deadline is fatal.
     state.ignore_late_inject = (config.exit_flags & 8) != 0;
+    // Instruction-granular preemption: inject an extra interrupt every
+    // ~preempt_period retired instructions (0 = disabled) so the guest scheduler
+    // gets a preemption point at an arbitrary instruction, not only at its
+    // natural entries. Applied to the (possibly fork-inherited) APIC; period 0
+    // disables it on this VM.
+    state
+        .devices
+        .apic
+        .configure_preempt(config.preempt_period, config.preempt_seed);
 
     log_info!(
         "SET_EVENT_CONFIG: enabled={}, categories={:#x}, exit_trigger={:?}, exit_flags={:#x} for VM {}\n",

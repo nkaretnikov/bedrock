@@ -221,6 +221,11 @@ pub(crate) struct BedrockEventConfig {
     /// Universal start threshold — no `Exit` records until TSC reaches this
     /// value. 0 = capture from the start.
     pub exit_start_tsc: u64,
+    /// Instruction-granular preemption period: retired instructions between
+    /// deterministic forced preemptions. 0 = disabled.
+    pub preempt_period: u64,
+    /// Seed for the preemption-interval jitter PRNG.
+    pub preempt_seed: u64,
 }
 
 /// Per-exit-type statistics for userspace.

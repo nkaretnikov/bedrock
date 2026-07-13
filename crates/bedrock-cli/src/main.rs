@@ -239,7 +239,39 @@ fn build_event_config(args: &Args) -> EventConfig {
     if std::env::var_os("BEDROCK_IGNORE_LATE_INJECT").is_some_and(|v| !v.is_empty()) {
         config = config.with_ignore_late_inject();
     }
+    // Instruction-granular preemption (determinism-preserving): inject an extra
+    // interrupt every ~BEDROCK_PREEMPT_PERIOD retired instructions so the guest
+    // scheduler gets a preemption point at an arbitrary instruction, not only at
+    // its natural entries (tick/syscall/yield). Unset or 0 leaves the feature
+    // off, so guests are unaffected. The interval seed defaults to the RDRAND
+    // seed so a per-fork seed sweep also sweeps preemption placement; set
+    // BEDROCK_PREEMPT_SEED to decouple the two.
+    if let Some(period) = env_u64("BEDROCK_PREEMPT_PERIOD").filter(|&p| p != 0) {
+        let seed = env_u64("BEDROCK_PREEMPT_SEED").unwrap_or(args.rdrand_seed);
+        config = config.with_preempt(period, seed);
+    }
     config
+}
+
+/// Parse a `BEDROCK_*` env var as a u64 (decimal, or hex with a `0x` prefix).
+/// Returns `None` when unset/empty; logs and returns `None` on a parse error.
+fn env_u64(name: &str) -> Option<u64> {
+    let raw = std::env::var(name).ok()?;
+    let v = raw.trim();
+    if v.is_empty() {
+        return None;
+    }
+    let parsed = match v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+        Some(hex) => u64::from_str_radix(hex, 16),
+        None => v.parse::<u64>(),
+    };
+    match parsed {
+        Ok(n) => Some(n),
+        Err(_) => {
+            warn!("ignoring {}: not a valid u64 ('{}')", name, v);
+            None
+        }
+    }
 }
 
 /// Parse a comma-separated list of event categories into a mask.

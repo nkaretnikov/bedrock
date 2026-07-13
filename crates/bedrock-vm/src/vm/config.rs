@@ -78,6 +78,13 @@ pub struct EventConfig {
     /// Universal start threshold — no `Exit` records until emulated_tsc reaches
     /// this value. 0 = capture from the start.
     pub exit_start_tsc: u64,
+    /// Instruction-granular preemption period: retired instructions between
+    /// deterministic forced preemptions. 0 (the default) disables the feature.
+    /// See `ApicState::configure_preempt` in bedrock-vmx.
+    pub preempt_period: u64,
+    /// Seed for the preemption-interval jitter PRNG (only meaningful when
+    /// `preempt_period != 0`). A dedicated stream, separate from RDRAND.
+    pub preempt_seed: u64,
 }
 
 impl EventConfig {
@@ -135,6 +142,16 @@ impl EventConfig {
     /// immediately.
     pub fn with_ignore_late_inject(mut self) -> Self {
         self.exit_flags |= EXIT_FLAG_IGNORE_LATE_INJECT;
+        self
+    }
+
+    /// Enable deterministic instruction-granular preemption: inject an extra
+    /// interrupt roughly every `period` retired instructions (0 = disabled),
+    /// with per-interval jitter drawn from `seed`. See
+    /// `ApicState::configure_preempt` in bedrock-vmx.
+    pub fn with_preempt(mut self, period: u64, seed: u64) -> Self {
+        self.preempt_period = period;
+        self.preempt_seed = seed;
         self
     }
 

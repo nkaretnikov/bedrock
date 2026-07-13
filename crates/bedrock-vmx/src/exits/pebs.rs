@@ -456,11 +456,18 @@ pub fn arm_for_next_iteration<C: VmContext>(ctx: &mut C) {
     // actual injection on PEBS fire is done by the normal pre-entry path's
     // `check_apic_timer` / `check_io_channel`), so it's fine to reuse the
     // APIC vector for all event types.
+    // The forced-preemption deadline is armed exactly like the APIC timer: a
+    // TSC-space target that PEBS+MTF lands precisely, with the IRR set on the
+    // boundary step by `check_preempt`. `None` unless preemption is configured
+    // and its LVT vector is usable.
+    let preempt_deadline = super::next_preempt_target_tsc(ctx);
+
     let chosen_target = [
         Some(apic_deadline).filter(|&t| t != 0),
         io_channel_deadline,
         stop_deadline,
         single_step_start,
+        preempt_deadline,
     ]
     .into_iter()
     .flatten()

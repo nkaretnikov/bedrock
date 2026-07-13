@@ -134,6 +134,35 @@ pub(super) fn next_io_channel_exit_count<C: VmContext>(ctx: &C) -> Option<u64> {
     next_io_channel_target_tsc(ctx).map(|t| t.saturating_sub(ctx.state().tsc_offset))
 }
 
+/// Emulated-TSC target of the next deterministic forced preemption, or `None`
+/// when instruction-granular preemption is disabled, not yet armed, or the
+/// guest's LVT timer vector isn't usable yet (so an injected interrupt would be
+/// dropped and the deadline would never advance). Mirrors
+/// `next_io_channel_target_tsc`: the TSC-space definition consumed by
+/// `arm_for_next_iteration`, with `next_preempt_exit_count` its
+/// instruction-count counterpart for the MTF-margin path. The usability gate
+/// matches `check_preempt`'s, so PEBS never arms for a preemption we would
+/// refuse to fire.
+pub(super) fn next_preempt_target_tsc<C: VmContext>(ctx: &C) -> Option<u64> {
+    let apic = &ctx.state().devices.apic;
+    if apic.preempt_period == 0 || apic.preempt_deadline == 0 {
+        return None;
+    }
+    if (apic.svr & (1 << 8)) == 0
+        || (apic.lvt_timer & (1 << 16)) != 0
+        || (apic.lvt_timer & 0xFF) < 16
+    {
+        return None;
+    }
+    Some(apic.preempt_deadline)
+}
+
+/// Instruction-count counterpart of `next_preempt_target_tsc` for the MTF
+/// margin / boundary checks (which work in count space).
+fn next_preempt_exit_count<C: VmContext>(ctx: &C) -> Option<u64> {
+    next_preempt_target_tsc(ctx).map(|t| t.saturating_sub(ctx.state().tsc_offset))
+}
+
 /// Emulated-TSC target at which single-stepping should *begin* for the
 /// configured single-step TSC range, or `None` if no range is configured
 /// or the window has already been entered.
@@ -243,7 +272,8 @@ pub fn update_mtf_state<C: VmContext>(ctx: &mut C) -> Result<(), ExitError> {
         && (in_margin(next_timer_exit_count(ctx))
             || in_margin(next_io_channel_exit_count(ctx))
             || in_margin(stop_at_count)
-            || in_margin(next_single_step_start_count(ctx)));
+            || in_margin(next_single_step_start_count(ctx))
+            || in_margin(next_preempt_exit_count(ctx)));
 
     let should_enable = in_single_step || in_pebs_margin;
 
