@@ -250,6 +250,15 @@ fn build_event_config(args: &Args) -> EventConfig {
         let seed = env_u64("BEDROCK_PREEMPT_SEED").unwrap_or(args.rdrand_seed);
         config = config.with_preempt(period, seed);
     }
+    // EPT write-watchpoint directed preemption: force a reschedule at watched
+    // shared-memory writes with probability BEDROCK_WATCHPOINT_PCT percent
+    // (unset or 0 leaves the feature off). The decision seed defaults to the
+    // RDRAND seed so a per-fork seed sweep also sweeps the watchpoint schedule;
+    // set BEDROCK_WATCHPOINT_SEED to decouple the two.
+    if let Some(pct) = env_u64("BEDROCK_WATCHPOINT_PCT").filter(|&p| p != 0) {
+        let seed = env_u64("BEDROCK_WATCHPOINT_SEED").unwrap_or(args.rdrand_seed);
+        config = config.with_watchpoints(pct as u32, seed);
+    }
     config
 }
 

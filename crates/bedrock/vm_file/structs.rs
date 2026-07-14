@@ -226,6 +226,11 @@ pub(crate) struct BedrockEventConfig {
     pub preempt_period: u64,
     /// Seed for the preemption-interval jitter PRNG.
     pub preempt_seed: u64,
+    /// EPT write-watchpoint directed preemption: percent chance [0, 100) of
+    /// forcing a preemption at each watched shared-memory write. 0 = disabled.
+    pub watchpoint_pct: u32,
+    /// Seed for the per-hit watchpoint decision PRNG.
+    pub watchpoint_seed: u64,
 }
 
 /// Per-exit-type statistics for userspace.

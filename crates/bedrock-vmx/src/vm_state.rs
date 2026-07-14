@@ -1067,6 +1067,12 @@ pub struct VmState<V: VirtualMachineControlStructure, I: InstructionCounter> {
     pub single_step_tsc_range: Option<(u64, u64)>,
     /// Whether MTF is currently enabled in VMCS.
     pub mtf_enabled: bool,
+    /// GPA of the EPT write-watchpoint page whose faulting write is currently
+    /// being single-stepped (MTF) before re-protection, or None. Transient: set
+    /// when a watchpoint hit lets a write through, cleared when that step's MTF
+    /// exit re-protects the page. Only ever Some while write-watchpoints are
+    /// enabled (`apic.watchpoint_pct != 0`), so it is inert by default.
+    pub watchpoint_stepping: Option<u64>,
     /// Stop VM when emulated_tsc reaches this value. None means disabled.
     pub stop_at_tsc: Option<u64>,
     /// Exit handler performance statistics.
@@ -1407,6 +1413,7 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             skip_memory_hash: false,
             single_step_tsc_range: None,
             mtf_enabled: false,
+            watchpoint_stepping: None,
             stop_at_tsc: None,
             exit_stats: heap_box(AllExitStats::default()),
             last_checkpoint_idx: 0,
@@ -2320,6 +2327,7 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             skip_memory_hash: false,
             single_step_tsc_range: None,
             mtf_enabled: false,
+            watchpoint_stepping: None,
             stop_at_tsc: None,
             exit_stats: heap_box(AllExitStats::default()),
             last_checkpoint_idx: 0,
@@ -2590,6 +2598,7 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             skip_memory_hash: false,
             single_step_tsc_range: None,
             mtf_enabled: false,
+            watchpoint_stepping: None,
             stop_at_tsc: None,
             exit_stats: heap_box(AllExitStats::default()), // Forked VMs start with fresh stats
             last_checkpoint_idx: 0, // Forked VMs start checkpoint tracking fresh

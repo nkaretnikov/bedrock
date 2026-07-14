@@ -85,6 +85,14 @@ pub struct EventConfig {
     /// Seed for the preemption-interval jitter PRNG (only meaningful when
     /// `preempt_period != 0`). A dedicated stream, separate from RDRAND.
     pub preempt_seed: u64,
+    /// EPT write-watchpoint directed preemption: percent chance [0, 100) of
+    /// forcing a preemption at each watched shared-memory write. 0 (the default)
+    /// disables the feature. See `ApicState::configure_watchpoints` in
+    /// bedrock-vmx.
+    pub watchpoint_pct: u32,
+    /// Seed for the per-hit watchpoint decision PRNG (only meaningful when
+    /// `watchpoint_pct != 0`). A dedicated stream, separate from RDRAND.
+    pub watchpoint_seed: u64,
 }
 
 impl EventConfig {
@@ -152,6 +160,16 @@ impl EventConfig {
     pub fn with_preempt(mut self, period: u64, seed: u64) -> Self {
         self.preempt_period = period;
         self.preempt_seed = seed;
+        self
+    }
+
+    /// Enable EPT write-watchpoint directed preemption: force a preemption at
+    /// each watched shared-memory write with probability `pct` percent (0 =
+    /// disabled), using `seed` for the per-hit decision PRNG. See
+    /// `ApicState::configure_watchpoints` in bedrock-vmx.
+    pub fn with_watchpoints(mut self, pct: u32, seed: u64) -> Self {
+        self.watchpoint_pct = pct;
+        self.watchpoint_seed = seed;
         self
     }
 

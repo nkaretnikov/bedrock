@@ -171,9 +171,9 @@ pub use crate::hypercalls::{
 // COW (Copy-on-Write) memory management
 // =============================================================================
 #[cfg(not(feature = "cargo"))]
-pub use super::cow::CowPageMap;
+pub use super::cow::{CowPageMap, WatchpointClassMap, WpClass};
 #[cfg(feature = "cargo")]
-pub use crate::cow::CowPageMap;
+pub use crate::cow::{CowPageMap, WatchpointClassMap, WpClass};
 
 // =============================================================================
 // VM state

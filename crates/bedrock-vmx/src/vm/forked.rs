@@ -13,7 +13,28 @@ use crate::prelude::*;
 use super::{ForkableVm, ParentVm};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+#[cfg(not(feature = "cargo"))]
+use super::super::exits::raise_preempt_vector;
+#[cfg(feature = "cargo")]
+use crate::exits::raise_preempt_vector;
+
 const PAGE_SIZE: usize = 4096;
+
+/// Arm-then-cull tuning for EPT write-watchpoints. On a single vCPU one thread
+/// runs a whole quantum, so a genuinely-shared page looks single-writer for many
+/// faults before another thread is scheduled. Culling on a raw fault count would
+/// prematurely release shared pages (e.g. fluidanimate bug 7's spin-loop page,
+/// written many times per quantum). So the PRIMARY cull signal is surviving
+/// `WP_CULL_EPOCHS` observed userspace thread switches still single-writer.
+///
+/// `WP_CULL_FAULT_CAP` is only a runaway backstop for a page that never spans a
+/// switch (e.g. a single-threaded phase): it must sit well ABOVE a scheduler
+/// quantum's worth of writes to one page, or it culls shared spin-loop pages
+/// before a second thread writes them -- turning bug 7 into a false negative.
+/// These two values are the primary on-box tuning knobs; bias high until the
+/// sweep is confirmed to find bugs, then lower for speed.
+const WP_CULL_EPOCHS: u32 = 2;
+const WP_CULL_FAULT_CAP: u32 = 65536;
 
 /// Error type for ForkedVm creation.
 #[derive(Debug)]
@@ -57,6 +78,17 @@ pub struct ForkedVm<V: VirtualMachineControlStructure, P: Page, I: InstructionCo
 
     /// Copy-on-write pages owned by this VM.
     pub cow_pages: CowPageMap<P>,
+
+    /// Per-page EPT write-watchpoint classification (arm-then-cull). Populated
+    /// only when watchpoints are enabled; empty and unused otherwise.
+    pub watchpoint_class: WatchpointClassMap,
+
+    /// Last userspace thread id (guest FS_BASE) seen at a watchpoint fault.
+    wp_last_tid: u64,
+
+    /// Count of observed userspace thread switches (bumped when the FS_BASE at a
+    /// CPL 3 watchpoint fault differs from `wp_last_tid`). Drives the cull epoch.
+    wp_switch_epoch: u32,
 
     /// Parent VM for reading non-COW pages (type-erased trait object).
     parent: *const dyn ParentVm,
@@ -213,6 +245,9 @@ impl<V: VirtualMachineControlStructure, P: Page, I: InstructionCounter> ForkedVm
         let mut forked_vm = Self {
             state: box_vm_state(state),
             cow_pages: CowPageMap::<P>::new(),
+            watchpoint_class: WatchpointClassMap::new(),
+            wp_last_tid: 0,
+            wp_switch_epoch: 0,
             parent: parent_ptr,
             children_count: AtomicUsize::new(0),
         };
@@ -240,6 +275,76 @@ impl<V: VirtualMachineControlStructure, P: Page, I: InstructionCounter> ForkedVm
     /// Get a mutable reference to the COW pages.
     pub fn cow_pages_mut(&mut self) -> &mut CowPageMap<P> {
         &mut self.cow_pages
+    }
+
+    /// Remap a watched page to RWX and flush the affected EPT mapping so the
+    /// pending write can proceed. Shared by the let-through-and-step and cull
+    /// paths. Returns false (with a log) if the remap fails.
+    fn wp_remap_rwx<A: CowAllocator<P>>(
+        &mut self,
+        page_gpa: GuestPhysAddr,
+        hpa: HostPhysAddr,
+        allocator: &mut A,
+    ) -> bool
+    where
+        V::M: Machine,
+    {
+        if let Err(_e) = self.state.ept.remap_4k(
+            allocator,
+            page_gpa,
+            hpa,
+            EptPermissions::READ_WRITE_EXECUTE,
+            EptMemoryType::WriteBack,
+        ) {
+            log_err!(
+                "watchpoint: failed to grant write for GPA {:#x}\n",
+                page_gpa.as_u64()
+            );
+            return false;
+        }
+        let _ = <<V::M as Machine>::V as Vmx>::invept_single_context(self.state.ept.eptp());
+        true
+    }
+
+    /// Let a watched write through and single-step it: grant write, then arm MTF
+    /// via `watchpoint_stepping` so `reprotect_watchpoint` restores R+E after the
+    /// one instruction, keeping the page armed for its next write.
+    fn wp_grant_and_step<A: CowAllocator<P>>(
+        &mut self,
+        page_gpa: GuestPhysAddr,
+        hpa: HostPhysAddr,
+        allocator: &mut A,
+    ) -> Option<ExitHandlerResult>
+    where
+        V::M: Machine,
+    {
+        if !self.wp_remap_rwx(page_gpa, hpa, allocator) {
+            return None;
+        }
+        if self.state.watchpoint_stepping.is_some() {
+            log_debug!("watchpoint: overwriting in-flight single-step\n");
+        }
+        self.state.watchpoint_stepping = Some(page_gpa.as_u64());
+        Some(ExitHandlerResult::Continue)
+    }
+
+    /// Cull a single-writer watched page: grant write permanently (no
+    /// re-protection), so it stops faulting. The stale classification record is
+    /// left in place and harmless: the page is now RWX, so the perm check on any
+    /// future fault excludes it from the watchpoint path.
+    fn wp_cull<A: CowAllocator<P>>(
+        &mut self,
+        page_gpa: GuestPhysAddr,
+        hpa: HostPhysAddr,
+        allocator: &mut A,
+    ) -> Option<ExitHandlerResult>
+    where
+        V::M: Machine,
+    {
+        if !self.wp_remap_rwx(page_gpa, hpa, allocator) {
+            return None;
+        }
+        Some(ExitHandlerResult::Continue)
     }
 
     /// Get the parent's memory size.
@@ -394,6 +499,101 @@ impl<V: VirtualMachineControlStructure, P: Page, I: InstructionCounter> VmContex
 
         // Check if we already have a COW page for this address
         if self.cow_pages.contains(page_gpa) {
+            // EPT write-watchpoint hit: an already-COW'd page that was
+            // deliberately left R+E (armed) is faulting on a write. It is told
+            // apart from an ordinary (RWX) COW'd page by its EPT permissions.
+            if self.state.devices.apic.watchpoint_pct != 0 {
+                if let Some((hpa, perms)) = self.state.ept.lookup(allocator, page_gpa) {
+                    if perms == EptPermissions::READ_EXECUTE {
+                        // Armed watchpoint hit. Thread id = guest FS_BASE (the
+                        // per-thread TLS base); CPL from the CS selector's low 2
+                        // bits. Both are deterministic VMCS reads at a
+                        // deterministic EPT fault.
+                        let cpl = self
+                            .state
+                            .vmcs
+                            .read16(VmcsField16::GuestCsSelector)
+                            .unwrap_or(0)
+                            & 3;
+                        let tid = self
+                            .state
+                            .vmcs
+                            .read_natural(VmcsFieldNatural::GuestFsBase)
+                            .unwrap_or(0);
+
+                        // Track userspace thread switches to drive the cull
+                        // epoch: a new tid at CPL 3 means the guest scheduler
+                        // switched threads since the last watchpoint fault.
+                        if cpl == 3 && tid != self.wp_last_tid {
+                            self.wp_last_tid = tid;
+                            self.wp_switch_epoch = self.wp_switch_epoch.wrapping_add(1);
+                        }
+
+                        // Snapshot the classification (ends the map borrow). A
+                        // missing record for an armed page is not expected; fail
+                        // safe by treating it as confirmed (keep watching).
+                        let rec = self.watchpoint_class.get_mut(page_gpa).map(|c| *c);
+                        let confirmed = rec.map(|r| r.confirmed).unwrap_or(true);
+
+                        // A confirmed-shared page behaves like B1: preempt at
+                        // this access with probability watchpoint_pct, else let
+                        // the write through and single-step it. The no-grant-W
+                        // preempt path is taken only when the vector could
+                        // actually be raised (else fall through so the guest
+                        // always makes progress); watchpoint_should_preempt still
+                        // advances its PRNG on every CPL 3 confirmed hit.
+                        if confirmed {
+                            if cpl == 3
+                                && self.state.devices.apic.watchpoint_should_preempt()
+                                && raise_preempt_vector(&mut self.state.devices.apic)
+                            {
+                                return Some(ExitHandlerResult::Continue);
+                            }
+                            return self.wp_grant_and_step(page_gpa, hpa, allocator);
+                        }
+
+                        // Classifying: record present and not yet confirmed.
+                        let rec = match rec {
+                            Some(r) => r,
+                            // Unreachable given the `confirmed` handling above,
+                            // but avoid a panic: just let the write through.
+                            None => return self.wp_grant_and_step(page_gpa, hpa, allocator),
+                        };
+                        if cpl != 3 {
+                            // Do not classify on kernel faults: FS_BASE at CPL 0
+                            // is not the userspace thread id. Just let it through.
+                            return self.wp_grant_and_step(page_gpa, hpa, allocator);
+                        }
+                        if tid != rec.first_tid {
+                            // A second distinct thread wrote this page: confirm it
+                            // shared, then act shared for this very fault.
+                            if let Some(c) = self.watchpoint_class.get_mut(page_gpa) {
+                                c.confirmed = true;
+                            }
+                            if self.state.devices.apic.watchpoint_should_preempt()
+                                && raise_preempt_vector(&mut self.state.devices.apic)
+                            {
+                                return Some(ExitHandlerResult::Continue);
+                            }
+                            return self.wp_grant_and_step(page_gpa, hpa, allocator);
+                        }
+                        // Same thread as the first writer. Count the fault, and
+                        // cull the page (grant W permanently) once it has survived
+                        // WP_CULL_EPOCHS observed thread switches or hit the fault
+                        // cap: it is thread-local, not shared.
+                        let new_count = rec.fault_count.saturating_add(1);
+                        if let Some(c) = self.watchpoint_class.get_mut(page_gpa) {
+                            c.fault_count = new_count;
+                        }
+                        if self.wp_switch_epoch.wrapping_sub(rec.arm_epoch) >= WP_CULL_EPOCHS
+                            || new_count >= WP_CULL_FAULT_CAP
+                        {
+                            return self.wp_cull(page_gpa, hpa, allocator);
+                        }
+                        return self.wp_grant_and_step(page_gpa, hpa, allocator);
+                    }
+                }
+            }
             // Already copied - this means the EPT was already remapped to RWX but
             // the TLB still had a stale R+X entry. The EPT violation auto-invalidates
             // the stale entry, so the retry will use the correct mapping.
@@ -447,12 +647,31 @@ impl<V: VirtualMachineControlStructure, P: Page, I: InstructionCounter> VmContex
             return None;
         }
 
-        // Remap EPT entry to point to the new page with RWX permissions
+        // Remap EPT entry to point to the new page. Normally RWX; but if EPT
+        // write-watchpoints are enabled and this first write came from userspace
+        // (CPL 3), leave the page R+E so every later write to it faults back out
+        // (an armed watchpoint). The faulting instruction then retries,
+        // re-faults, and lands in the cow_pages branch above. Kernel-written
+        // pages (CPL 0) get plain RWX and are never watched, which keeps boot
+        // and kernel writes fast.
+        let arm_watchpoint = self.state.devices.apic.watchpoint_pct != 0
+            && (self
+                .state
+                .vmcs
+                .read16(VmcsField16::GuestCsSelector)
+                .unwrap_or(0)
+                & 3)
+                == 3;
+        let new_perms = if arm_watchpoint {
+            EptPermissions::READ_EXECUTE
+        } else {
+            EptPermissions::READ_WRITE_EXECUTE
+        };
         if let Err(_e) = self.state.ept.remap_4k(
             allocator,
             page_gpa,
             new_page_phys,
-            EptPermissions::READ_WRITE_EXECUTE,
+            new_perms,
             EptMemoryType::WriteBack,
         ) {
             log_err!(
@@ -471,6 +690,36 @@ impl<V: VirtualMachineControlStructure, P: Page, I: InstructionCounter> VmContex
         // HPA and read pre-COW data.
         let _ = <<V::M as Machine>::V as Vmx>::invept_single_context(self.state.ept.eptp());
 
+        // If this page armed as a watchpoint, record its classification: the
+        // first writer thread (guest FS_BASE) and the current switch epoch, so
+        // the arm-then-cull logic in the cow_pages branch can later cull it
+        // (single-writer) or confirm it shared (multiple distinct writers).
+        if arm_watchpoint {
+            let tid = self
+                .state
+                .vmcs
+                .read_natural(VmcsFieldNatural::GuestFsBase)
+                .unwrap_or(0);
+            if self
+                .watchpoint_class
+                .insert(
+                    page_gpa,
+                    WpClass {
+                        first_tid: tid,
+                        arm_epoch: self.wp_switch_epoch,
+                        fault_count: 0,
+                        confirmed: false,
+                    },
+                )
+                .is_err()
+            {
+                log_err!(
+                    "watchpoint: failed to record classification for GPA {:#x}\n",
+                    page_gpa.as_u64()
+                );
+            }
+        }
+
         log_debug!(
             "COW: Copied page at GPA {:#x} -> HPA {:#x}\n",
             page_gpa.as_u64(),
@@ -483,6 +732,28 @@ impl<V: VirtualMachineControlStructure, P: Page, I: InstructionCounter> VmContex
 
     fn is_forked(&self) -> bool {
         true
+    }
+
+    fn reprotect_watchpoint<A: CowAllocator<Self::CowPage>>(&mut self, allocator: &mut A) {
+        let gpa_u64 = match self.state.watchpoint_stepping {
+            Some(g) => g,
+            None => return,
+        };
+        let page_gpa = GuestPhysAddr::new(gpa_u64);
+        // Re-protect the just-stepped watchpoint page back to R+E so its next
+        // write faults again. Keep the same host page (the COW copy); only the
+        // permissions change.
+        if let Some((hpa, _)) = self.state.ept.lookup(allocator, page_gpa) {
+            let _ = self.state.ept.remap_4k(
+                allocator,
+                page_gpa,
+                hpa,
+                EptPermissions::READ_EXECUTE,
+                EptMemoryType::WriteBack,
+            );
+            let _ = <<V::M as Machine>::V as Vmx>::invept_single_context(self.state.ept.eptp());
+        }
+        self.state.watchpoint_stepping = None;
     }
 
     fn cow_feedback_buffer_for_mapping<A: CowAllocator<Self::CowPage>>(

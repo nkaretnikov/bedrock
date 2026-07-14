@@ -117,3 +117,47 @@ fn check_preempt_holds_off_until_vector_usable() {
     check_preempt(&mut ctx);
     assert_ne!(ctx.state().devices.apic.preempt_deadline, 0);
 }
+
+#[test]
+fn watchpoint_decision_is_deterministic_and_respects_pct() {
+    // Same seed -> identical decision stream (reproducible schedule).
+    let mut a = crate::prelude::ApicState::default();
+    a.configure_watchpoints(50, 0x1234_5678);
+    let mut b = crate::prelude::ApicState::default();
+    b.configure_watchpoints(50, 0x1234_5678);
+    for _ in 0..64 {
+        assert_eq!(a.watchpoint_should_preempt(), b.watchpoint_should_preempt());
+    }
+
+    // pct 0 (via a live pct field) never preempts; pct 100 always does.
+    let mut never = crate::prelude::ApicState::default();
+    never.configure_watchpoints(100, 0x1);
+    never.watchpoint_pct = 0;
+    let mut always = crate::prelude::ApicState::default();
+    always.configure_watchpoints(100, 0xdead_beef);
+    for _ in 0..256 {
+        assert!(!never.watchpoint_should_preempt());
+        assert!(always.watchpoint_should_preempt());
+    }
+}
+
+#[test]
+fn configure_watchpoints_forces_nonzero_seed() {
+    let mut a = crate::prelude::ApicState::default();
+    a.configure_watchpoints(10, 0); // 0 is a xorshift fixed point; must be bumped
+    assert_ne!(a.watchpoint_seed, 0);
+    assert_eq!(a.watchpoint_pct, 10);
+}
+
+#[test]
+fn raise_preempt_vector_gated_on_usable_vector() {
+    let mut ctx = MockVmContext::new();
+    // Default APIC: software-disabled, LVT timer masked -> must not raise.
+    assert!(!raise_preempt_vector(&mut ctx.state_mut().devices.apic));
+    assert!(!irr_set(&ctx, 0x40));
+
+    // Wire up a deliverable vector -> raises it in IRR.
+    enable_apic_timer_vector(&mut ctx, 0x40);
+    assert!(raise_preempt_vector(&mut ctx.state_mut().devices.apic));
+    assert!(irr_set(&ctx, 0x40));
+}

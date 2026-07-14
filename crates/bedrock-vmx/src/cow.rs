@@ -12,6 +12,24 @@
 #[derive(Debug, Clone, Copy)]
 pub struct CowInsertError;
 
+/// Per-page watchpoint classification record for the arm-then-cull directed
+/// preemption strategy. Each armed userspace page starts as a watchpoint; this
+/// record tracks the first writer thread (guest FS_BASE), the thread-switch
+/// epoch at arm time, a fault counter, and whether the page has been confirmed
+/// shared (written by >= 2 distinct threads). Single-writer pages are culled;
+/// confirmed pages stay armed and drive preemption.
+#[derive(Clone, Copy)]
+pub struct WpClass {
+    /// Guest FS_BASE of the thread that first wrote this page after it armed.
+    pub first_tid: u64,
+    /// `wp_switch_epoch` value when this page was armed.
+    pub arm_epoch: u32,
+    /// Number of write faults observed on this page while classifying.
+    pub fault_count: u32,
+    /// True once a second distinct thread has written this page.
+    pub confirmed: bool,
+}
+
 // ============================================================================
 // Cargo build: Use alloc::collections::BTreeMap
 // ============================================================================
@@ -102,10 +120,48 @@ mod cargo_impl {
             Self::new()
         }
     }
+
+    /// Maps page-aligned GPAs to per-page watchpoint classification records
+    /// (arm-then-cull). Mirrors `CowPageMap` but holds `WpClass` values.
+    pub struct WatchpointClassMap {
+        classes: BTreeMap<u64, super::WpClass>,
+    }
+
+    impl WatchpointClassMap {
+        /// Create a new empty classification map.
+        pub fn new() -> Self {
+            Self {
+                classes: BTreeMap::new(),
+            }
+        }
+
+        /// Record (or replace) the classification for a page.
+        pub fn insert(
+            &mut self,
+            gpa: GuestPhysAddr,
+            class: super::WpClass,
+        ) -> Result<(), super::CowInsertError> {
+            let page_aligned = gpa.as_u64() & !0xFFF;
+            self.classes.insert(page_aligned, class);
+            Ok(())
+        }
+
+        /// Get a mutable reference to a page's classification, if present.
+        pub fn get_mut(&mut self, gpa: GuestPhysAddr) -> Option<&mut super::WpClass> {
+            let page_aligned = gpa.as_u64() & !0xFFF;
+            self.classes.get_mut(&page_aligned)
+        }
+    }
+
+    impl Default for WatchpointClassMap {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
 }
 
 #[cfg(feature = "cargo")]
-pub use cargo_impl::CowPageMap;
+pub use cargo_impl::{CowPageMap, WatchpointClassMap};
 
 // ============================================================================
 // Kernel build: Use kernel::rbtree::RBTree
@@ -204,7 +260,50 @@ mod kernel_impl {
             Self::new()
         }
     }
+
+    /// Maps page-aligned GPAs to per-page watchpoint classification records
+    /// (arm-then-cull). Mirrors `CowPageMap` but holds `WpClass` values.
+    pub struct WatchpointClassMap {
+        classes: RBTree<u64, super::WpClass>,
+    }
+
+    impl WatchpointClassMap {
+        /// Create a new empty classification map.
+        pub fn new() -> Self {
+            Self {
+                classes: RBTree::new(),
+            }
+        }
+
+        /// Record (or replace) the classification for a page.
+        pub fn insert(
+            &mut self,
+            gpa: GuestPhysAddr,
+            class: super::WpClass,
+        ) -> Result<(), super::CowInsertError> {
+            let page_aligned = gpa.as_u64() & !0xFFF;
+            match self
+                .classes
+                .try_create_and_insert(page_aligned, class, GFP_ATOMIC)
+            {
+                Ok(_) => Ok(()),
+                Err(_) => Err(super::CowInsertError),
+            }
+        }
+
+        /// Get a mutable reference to a page's classification, if present.
+        pub fn get_mut(&mut self, gpa: GuestPhysAddr) -> Option<&mut super::WpClass> {
+            let page_aligned = gpa.as_u64() & !0xFFF;
+            self.classes.get_mut(&page_aligned)
+        }
+    }
+
+    impl Default for WatchpointClassMap {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
 }
 
 #[cfg(not(feature = "cargo"))]
-pub use kernel_impl::CowPageMap;
+pub use kernel_impl::{CowPageMap, WatchpointClassMap};

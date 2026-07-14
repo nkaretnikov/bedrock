@@ -59,6 +59,7 @@ PLATEAU="${PLATEAU:-500}"           # stop a target after this many forks add no
 MAX="${MAX:-20000}"                 # hard cap on forks
 PARENT_READY_TIMEOUT="${PARENT_READY_TIMEOUT:-300}"
 PREEMPT_PERIOD="${BEDROCK_PREEMPT_PERIOD:-0}"   # forced-preempt period per child (retired instrs); 0=off
+WATCHPOINT_PCT="${BEDROCK_WATCHPOINT_PCT:-0}"   # EPT write-watchpoint directed-preempt chance % per shared write; 0=off (much slower per fork: use a small MAX)
 TARGETS=(blackscholes streamcluster fluidanimate)
 
 # Capture lsmod and string-match it, rather than `lsmod | grep -q`: under
@@ -145,7 +146,7 @@ declare -A reached                  # target -> space-separated union of bug ids
 declare -A noNew                    # target -> consecutive forks with no new bug
 for t in "${TARGETS[@]}"; do reached[$t]=""; noNew[$t]=0; done
 
-echo "--- bedrock coverage (fork): boot_seed=$BOOT_SEED seed_base=$SEED_BASE plateau=$PLATEAU max=$MAX preempt_period=$PREEMPT_PERIOD ---"
+echo "--- bedrock coverage (fork): boot_seed=$BOOT_SEED seed_base=$SEED_BASE plateau=$PLATEAU max=$MAX preempt_period=$PREEMPT_PERIOD watchpoint_pct=$WATCHPOINT_PCT ---"
 
 forks=0
 aborts=0
@@ -167,6 +168,7 @@ while [ "$forks" -lt "$MAX" ]; do
   child_rc=0
   out=$(cd "$REPO_ROOT" && BEDROCK_PARENT_ID="$PARENT_ID" RDRAND_SEED="$seed" \
         BEDROCK_PREEMPT_PERIOD="$PREEMPT_PERIOD" \
+        BEDROCK_WATCHPOINT_PCT="$WATCHPOINT_PCT" \
         nix run .#test-racebench-fork-child 2>&1) || child_rc=$?
 
   # Classify the fork. `case` (not `printf | grep -q`) avoids the pipefail/SIGPIPE

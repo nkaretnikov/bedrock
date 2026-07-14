@@ -552,6 +552,12 @@ pub(crate) fn handle_set_event_config<F: VmFileOps>(vm_file: &mut F, arg: usize)
         .devices
         .apic
         .configure_preempt(config.preempt_period, config.preempt_seed);
+    // EPT write-watchpoint directed preemption: force a reschedule at watched
+    // shared-memory writes with probability watchpoint_pct (0 = disabled).
+    state
+        .devices
+        .apic
+        .configure_watchpoints(config.watchpoint_pct, config.watchpoint_seed);
 
     log_info!(
         "SET_EVENT_CONFIG: enabled={}, categories={:#x}, exit_trigger={:?}, exit_flags={:#x} for VM {}\n",

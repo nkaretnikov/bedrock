@@ -88,6 +88,18 @@ pub struct ApicState {
     /// on the per-CPU PEBS counter, so it never competes with the APIC timer's
     /// precise landing. Internal state, not an APIC register.
     pub preempt_deadline: u64,
+    /// Percentage chance [0, 100) of forcing a preemption at each EPT
+    /// write-watchpoint hit (0 = feature disabled). Drives *directed*
+    /// preemption: userspace-written pages are left EPT R+E so every write to
+    /// them faults, and on each hit this probability decides whether to inject a
+    /// preemption at that exact shared-memory access (rather than at a blind
+    /// instruction-count period). Not a real APIC register.
+    pub watchpoint_pct: u32,
+    /// Dedicated xorshift64 stream for the per-hit watchpoint preemption
+    /// decision, kept separate from the RDRAND PRNG and the preemption-jitter
+    /// PRNG so it never perturbs the randomness the guest observes. Internal
+    /// state, not an APIC register.
+    pub watchpoint_seed: u64,
 }
 
 impl Default for ApicState {
@@ -123,6 +135,10 @@ impl Default for ApicState {
             preempt_period: 0,
             preempt_seed: 0,
             preempt_deadline: 0,
+            // EPT write-watchpoint directed preemption disabled by default;
+            // enabled by `configure_watchpoints`. Guests are unaffected until then.
+            watchpoint_pct: 0,
+            watchpoint_seed: 0,
         }
     }
 }
@@ -152,6 +168,29 @@ impl ApicState {
         x ^= x << 17;
         self.preempt_seed = x;
         self.preempt_period + (x % self.preempt_period)
+    }
+
+    /// Enable EPT write-watchpoint directed preemption: at each watchpoint hit,
+    /// force a preemption with probability `pct` percent, using `seed` to drive
+    /// the per-hit decision PRNG. `pct == 0` disables the feature. A zero `seed`
+    /// is forced to 1, since 0 is a fixed point of the xorshift PRNG.
+    pub fn configure_watchpoints(&mut self, pct: u32, seed: u64) {
+        self.watchpoint_pct = pct;
+        self.watchpoint_seed = if seed == 0 { 1 } else { seed };
+    }
+
+    /// Advance the watchpoint-decision PRNG and return whether this hit should
+    /// force a preemption: true with probability `watchpoint_pct` percent. A
+    /// dedicated xorshift64 stream (mirrors `next_preempt_interval`), so drawing
+    /// it never perturbs guest-observed randomness. Caller guarantees
+    /// `watchpoint_pct != 0`.
+    pub fn watchpoint_should_preempt(&mut self) -> bool {
+        let mut x = self.watchpoint_seed;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.watchpoint_seed = x;
+        (x % 100) < self.watchpoint_pct as u64
     }
 }
 
@@ -189,6 +228,8 @@ impl StateHash for ApicState {
         h.write_u64(self.preempt_period);
         h.write_u64(self.preempt_seed);
         h.write_u64(self.preempt_deadline);
+        h.write_u32(self.watchpoint_pct);
+        h.write_u64(self.watchpoint_seed);
         h.finish()
     }
 }

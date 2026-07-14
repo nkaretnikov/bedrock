@@ -40,7 +40,8 @@ mod vmcall;
 pub use apic::{APIC_BASE, APIC_SIZE, IOAPIC_BASE, IOAPIC_SIZE};
 pub use helpers::{ExitError, ExitHandlerResult};
 pub use interrupts::{
-    check_io_channel, inject_pending_interrupt, reinject_vectored_event, IO_CHANNEL_IRQ,
+    check_io_channel, inject_pending_interrupt, raise_preempt_vector, reinject_vectored_event,
+    IO_CHANNEL_IRQ,
 };
 pub use pebs::{
     arm_for_next_iteration, arm_precise_exit, disarm_precise_exit, get_pebs_margin,
@@ -245,7 +246,11 @@ pub fn update_mtf_state<C: VmContext>(ctx: &mut C) -> Result<(), ExitError> {
             || in_margin(stop_at_count)
             || in_margin(next_single_step_start_count(ctx)));
 
-    let should_enable = in_single_step || in_pebs_margin;
+    // A pending EPT write-watchpoint step also needs MTF: the watched write was
+    // let through with the page temporarily writable, and we single-step exactly
+    // one instruction so `reprotect_watchpoint` can restore R+E right after it.
+    let should_enable =
+        in_single_step || in_pebs_margin || ctx.state().watchpoint_stepping.is_some();
 
     if should_enable != currently_enabled {
         // Toggle MTF in primary processor-based controls
@@ -346,7 +351,13 @@ pub fn handle_exit<C: VmContext, K: Kernel, A: CowAllocator<C::CowPage>>(
                 Some((start, end)) => tsc >= start && tsc < end,
                 None => false,
             };
-            !(on_boundary || in_single_step_range)
+            // An EPT write-watchpoint single-step is deterministic: the watched
+            // write faults at a deterministic instruction count (a pure function
+            // of guest execution), so the one MTF step that follows it also
+            // lands at a deterministic count. Feature-gated, so this is inert
+            // unless watchpoints are enabled.
+            let wp_step = ctx.state().watchpoint_stepping.is_some();
+            !(on_boundary || in_single_step_range || wp_step)
         }
         _ => false,
     };
@@ -386,8 +397,15 @@ pub fn handle_exit<C: VmContext, K: Kernel, A: CowAllocator<C::CowPage>>(
         ExitReason::Rdseed => handle_rdseed(ctx),
 
         // Monitor Trap Flag - VM exit after each guest instruction (single-step mode)
-        // The exit is already logged above; just continue executing.
-        ExitReason::MonitorTrapFlag => ExitHandlerResult::Continue,
+        // The exit is already logged above; just continue executing. If this MTF
+        // exit completes an EPT write-watchpoint let-through step, re-protect the
+        // page to R+E first so its next write faults again.
+        ExitReason::MonitorTrapFlag => {
+            if ctx.state().watchpoint_stepping.is_some() {
+                ctx.reprotect_watchpoint(allocator);
+            }
+            ExitHandlerResult::Continue
+        }
 
         ExitReason::Hlt => handle_idle(ctx),
 

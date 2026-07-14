@@ -158,8 +158,7 @@ fn check_preempt<C: VmContext>(ctx: &mut C) {
     if (apic.lvt_timer & (1 << 16)) != 0 {
         return;
     }
-    let vector = (apic.lvt_timer & 0xFF) as u8;
-    if vector < 16 {
+    if (apic.lvt_timer & 0xFF) < 16 {
         return;
     }
 
@@ -182,12 +181,37 @@ fn check_preempt<C: VmContext>(ctx: &mut C) {
 
     // Due: raise the vector in IRR (idempotent if a real timer fires on the
     // same instruction -- both set the same bit) and schedule the next one.
-    let irr_index = (vector / 32) as usize;
-    let irr_bit = 1u32 << (vector % 32);
     let apic = &mut ctx.state_mut().devices.apic;
-    apic.irr[irr_index] |= irr_bit;
+    raise_preempt_vector(apic);
     let interval = apic.next_preempt_interval();
     apic.preempt_deadline = current_tsc.saturating_add(interval);
+}
+
+/// Raise the guest's LVT-timer interrupt vector in the APIC IRR, if the guest
+/// has wired up a usable one: APIC software-enabled (SVR bit 8), LVT timer
+/// unmasked (bit 16 clear), and a deliverable vector (>= 16). Returns whether
+/// the vector was raised.
+///
+/// Shared by the periodic forced preemption (`check_preempt`) and the EPT
+/// write-watchpoint directed preemption: both drive a guest reschedule by
+/// injecting what looks like an extra timer tick. Injection is IRR-only and
+/// never arms the per-CPU PEBS counter, so it cannot steal the APIC timer's
+/// precise landing (the regression fixed in commit 4bc2fbf).
+pub fn raise_preempt_vector(apic: &mut ApicState) -> bool {
+    if (apic.svr & (1 << 8)) == 0 {
+        return false;
+    }
+    if (apic.lvt_timer & (1 << 16)) != 0 {
+        return false;
+    }
+    let vector = (apic.lvt_timer & 0xFF) as u8;
+    if vector < 16 {
+        return false;
+    }
+    let irr_index = (vector / 32) as usize;
+    let irr_bit = 1u32 << (vector % 32);
+    apic.irr[irr_index] |= irr_bit;
+    true
 }
 
 /// Check whether an I/O channel request is queued and not yet delivered to
