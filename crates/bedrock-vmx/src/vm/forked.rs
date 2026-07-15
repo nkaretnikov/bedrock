@@ -20,21 +20,17 @@ use crate::exits::raise_preempt_vector;
 
 const PAGE_SIZE: usize = 4096;
 
-/// Arm-then-cull tuning for EPT write-watchpoints. On a single vCPU one thread
-/// runs a whole quantum, so a genuinely-shared page looks single-writer for many
-/// faults before another thread is scheduled. Culling on a raw fault count would
-/// prematurely release shared pages (e.g. fluidanimate bug 7's spin-loop page,
-/// written many times per quantum). So the PRIMARY cull signal is surviving
-/// `WP_CULL_EPOCHS` observed userspace thread switches still single-writer.
-///
-/// `WP_CULL_FAULT_CAP` is only a runaway backstop for a page that never spans a
-/// switch (e.g. a single-threaded phase): it must sit well ABOVE a scheduler
-/// quantum's worth of writes to one page, or it culls shared spin-loop pages
-/// before a second thread writes them -- turning bug 7 into a false negative.
-/// These two values are the primary on-box tuning knobs; bias high until the
-/// sweep is confirmed to find bugs, then lower for speed.
-const WP_CULL_EPOCHS: u32 = 2;
-const WP_CULL_FAULT_CAP: u32 = 65536;
+// Arm-then-cull tuning for EPT write-watchpoints lives in ApicState
+// (watchpoint_cull_epochs / watchpoint_cull_cap), set from the
+// BEDROCK_WATCHPOINT_CULL_EPOCHS / BEDROCK_WATCHPOINT_CULL_CAP env knobs so it
+// can be tuned on-box without a rebuild. On a single vCPU one thread runs a
+// whole quantum, so a genuinely-shared page looks single-writer for many faults
+// before another thread is scheduled. So the PRIMARY cull signal is surviving
+// `cull_epochs` observed userspace thread switches still single-writer; the
+// `cull_cap` fault count is only a backstop for a page that never spans a switch
+// (e.g. a single-threaded phase). A too-low cap culls shared spin-loop pages
+// before a second thread writes them (a false negative for bug 7); a too-high
+// cap makes no-switch phases crawl. Defaults 2 / 256.
 
 /// Error type for ForkedVm creation.
 #[derive(Debug)]
@@ -88,6 +84,9 @@ pub struct ForkedVm<V: VirtualMachineControlStructure, P: Page, I: InstructionCo
 
     /// Count of observed userspace thread switches (bumped when the FS_BASE at a
     /// CPL 3 watchpoint fault differs from `wp_last_tid`). Drives the cull epoch.
+    /// The arm-then-cull diagnostic counters (faults/armed/culled/confirmed/
+    /// preempts) and this epoch live in `exit_stats` (AllExitStats.wp_*), which
+    /// reaches userspace via GET_EXIT_STATS rather than dmesg.
     wp_switch_epoch: u32,
 
     /// Parent VM for reading non-COW pages (type-erased trait object).
@@ -344,6 +343,7 @@ impl<V: VirtualMachineControlStructure, P: Page, I: InstructionCounter> ForkedVm
         if !self.wp_remap_rwx(page_gpa, hpa, allocator) {
             return None;
         }
+        self.state.exit_stats.wp_culled += 1;
         Some(ExitHandlerResult::Continue)
     }
 
@@ -505,6 +505,9 @@ impl<V: VirtualMachineControlStructure, P: Page, I: InstructionCounter> VmContex
             if self.state.devices.apic.watchpoint_pct != 0 {
                 if let Some((hpa, perms)) = self.state.ept.lookup(allocator, page_gpa) {
                     if perms == EptPermissions::READ_EXECUTE {
+                        // Diagnostic counters (observability only), surfaced via
+                        // exit_stats -> GET_EXIT_STATS -> bedrock-cli stdout.
+                        self.state.exit_stats.wp_faults += 1;
                         // Armed watchpoint hit. Thread id = guest FS_BASE (the
                         // per-thread TLS base); CPL from the CS selector's low 2
                         // bits. Both are deterministic VMCS reads at a
@@ -527,6 +530,7 @@ impl<V: VirtualMachineControlStructure, P: Page, I: InstructionCounter> VmContex
                         if cpl == 3 && tid != self.wp_last_tid {
                             self.wp_last_tid = tid;
                             self.wp_switch_epoch = self.wp_switch_epoch.wrapping_add(1);
+                            self.state.exit_stats.wp_epoch = self.wp_switch_epoch as u64;
                         }
 
                         // Snapshot the classification (ends the map borrow). A
@@ -547,6 +551,7 @@ impl<V: VirtualMachineControlStructure, P: Page, I: InstructionCounter> VmContex
                                 && self.state.devices.apic.watchpoint_should_preempt()
                                 && raise_preempt_vector(&mut self.state.devices.apic)
                             {
+                                self.state.exit_stats.wp_preempts += 1;
                                 return Some(ExitHandlerResult::Continue);
                             }
                             return self.wp_grant_and_step(page_gpa, hpa, allocator);
@@ -570,9 +575,11 @@ impl<V: VirtualMachineControlStructure, P: Page, I: InstructionCounter> VmContex
                             if let Some(c) = self.watchpoint_class.get_mut(page_gpa) {
                                 c.confirmed = true;
                             }
+                            self.state.exit_stats.wp_confirmed += 1;
                             if self.state.devices.apic.watchpoint_should_preempt()
                                 && raise_preempt_vector(&mut self.state.devices.apic)
                             {
+                                self.state.exit_stats.wp_preempts += 1;
                                 return Some(ExitHandlerResult::Continue);
                             }
                             return self.wp_grant_and_step(page_gpa, hpa, allocator);
@@ -585,8 +592,10 @@ impl<V: VirtualMachineControlStructure, P: Page, I: InstructionCounter> VmContex
                         if let Some(c) = self.watchpoint_class.get_mut(page_gpa) {
                             c.fault_count = new_count;
                         }
-                        if self.wp_switch_epoch.wrapping_sub(rec.arm_epoch) >= WP_CULL_EPOCHS
-                            || new_count >= WP_CULL_FAULT_CAP
+                        let cull_epochs = self.state.devices.apic.watchpoint_cull_epochs;
+                        let cull_cap = self.state.devices.apic.watchpoint_cull_cap;
+                        if self.wp_switch_epoch.wrapping_sub(rec.arm_epoch) >= cull_epochs
+                            || new_count >= cull_cap
                         {
                             return self.wp_cull(page_gpa, hpa, allocator);
                         }
@@ -718,6 +727,7 @@ impl<V: VirtualMachineControlStructure, P: Page, I: InstructionCounter> VmContex
                     page_gpa.as_u64()
                 );
             }
+            self.state.exit_stats.wp_armed += 1;
         }
 
         log_debug!(

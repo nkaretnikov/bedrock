@@ -152,6 +152,20 @@ pub struct ExitStats {
     /// The `timer_deadline` missed at the strict late-inject abort, or 0 if no
     /// abort occurred. Renders "timer fired N past deadline D".
     pub late_inject_abort_deadline: i64,
+    /// EPT write-watchpoint (arm-then-cull) diagnostics. Must stay layout-
+    /// identical to `BedrockExitStats` on the kernel side (raw memcpy across
+    /// GET_EXIT_STATS). `wp_faults` = armed-page write faults handled.
+    pub wp_faults: u64,
+    /// Pages armed as watchpoints.
+    pub wp_armed: u64,
+    /// Pages culled as single-writer (granted W, silent).
+    pub wp_culled: u64,
+    /// Pages confirmed shared (>= 2 distinct writer threads).
+    pub wp_confirmed: u64,
+    /// Preemptions actually raised at a shared-page write.
+    pub wp_preempts: u64,
+    /// Latest observed userspace thread-switch epoch.
+    pub wp_epoch: u64,
 }
 
 impl ExitStats {
@@ -408,6 +422,19 @@ impl fmt::Display for ExitStatsReport<'_> {
             f,
             "  max pebs skid:      {:>16}  (min safe margin_for_host_cpu)",
             stats.max_pebs_skid
+        )?;
+        writeln!(f)?;
+        writeln!(f, "Watchpoints (arm-then-cull):")?;
+        writeln!(f, "{TABLE_SEP}")?;
+        writeln!(
+            f,
+            "  faults={} armed={} culled={} confirmed={} preempts={} epoch={}",
+            stats.wp_faults,
+            stats.wp_armed,
+            stats.wp_culled,
+            stats.wp_confirmed,
+            stats.wp_preempts,
+            stats.wp_epoch
         )?;
         write!(f, "{TABLE_SEP}")
     }

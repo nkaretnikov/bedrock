@@ -257,7 +257,11 @@ fn build_event_config(args: &Args) -> EventConfig {
     // set BEDROCK_WATCHPOINT_SEED to decouple the two.
     if let Some(pct) = env_u64("BEDROCK_WATCHPOINT_PCT").filter(|&p| p != 0) {
         let seed = env_u64("BEDROCK_WATCHPOINT_SEED").unwrap_or(args.rdrand_seed);
-        config = config.with_watchpoints(pct as u32, seed);
+        // Arm-then-cull knobs (tunable on-box without a rebuild). Epoch is the
+        // primary cull signal; the cap is a backstop. Defaults 2 / 256.
+        let cull_epochs = env_u64("BEDROCK_WATCHPOINT_CULL_EPOCHS").unwrap_or(2) as u32;
+        let cull_cap = env_u64("BEDROCK_WATCHPOINT_CULL_CAP").unwrap_or(256) as u32;
+        config = config.with_watchpoints(pct as u32, seed, cull_epochs, cull_cap);
     }
     config
 }

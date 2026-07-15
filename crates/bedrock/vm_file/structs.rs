@@ -231,6 +231,12 @@ pub(crate) struct BedrockEventConfig {
     pub watchpoint_pct: u32,
     /// Seed for the per-hit watchpoint decision PRNG.
     pub watchpoint_seed: u64,
+    /// Arm-then-cull: thread switches a single-writer page survives before cull
+    /// (0 = default).
+    pub watchpoint_cull_epochs: u32,
+    /// Arm-then-cull: fault-count backstop for a page that never spans a switch
+    /// (0 = default).
+    pub watchpoint_cull_cap: u32,
 }
 
 /// Per-exit-type statistics for userspace.
@@ -316,6 +322,14 @@ pub(crate) struct BedrockExitStats {
     pub late_inject_abort_lateness: i64,
     /// The deadline missed by the late-inject abort, or 0 if no abort.
     pub late_inject_abort_deadline: i64,
+    /// EPT write-watchpoint (arm-then-cull) diagnostics. Appended in the same
+    /// order as the CLI-side `ExitStats` (raw memcpy across GET_EXIT_STATS).
+    pub wp_faults: u64,
+    pub wp_armed: u64,
+    pub wp_culled: u64,
+    pub wp_confirmed: u64,
+    pub wp_preempts: u64,
+    pub wp_epoch: u64,
 }
 
 /// VM exit information returned to userspace from RUN ioctl.

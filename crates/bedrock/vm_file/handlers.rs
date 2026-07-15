@@ -554,10 +554,12 @@ pub(crate) fn handle_set_event_config<F: VmFileOps>(vm_file: &mut F, arg: usize)
         .configure_preempt(config.preempt_period, config.preempt_seed);
     // EPT write-watchpoint directed preemption: force a reschedule at watched
     // shared-memory writes with probability watchpoint_pct (0 = disabled).
-    state
-        .devices
-        .apic
-        .configure_watchpoints(config.watchpoint_pct, config.watchpoint_seed);
+    state.devices.apic.configure_watchpoints(
+        config.watchpoint_pct,
+        config.watchpoint_seed,
+        config.watchpoint_cull_epochs,
+        config.watchpoint_cull_cap,
+    );
 
     log_info!(
         "SET_EVENT_CONFIG: enabled={}, categories={:#x}, exit_trigger={:?}, exit_flags={:#x} for VM {}\n",
@@ -615,6 +617,12 @@ pub(crate) fn handle_get_exit_stats<F: VmFileOps>(vm_file: &F, arg: usize) -> is
         pebs_margin_abort_margin: stats.pebs_margin_abort_margin,
         late_inject_abort_lateness: stats.late_inject_abort_lateness,
         late_inject_abort_deadline: stats.late_inject_abort_deadline,
+        wp_faults: stats.wp_faults,
+        wp_armed: stats.wp_armed,
+        wp_culled: stats.wp_culled,
+        wp_confirmed: stats.wp_confirmed,
+        wp_preempts: stats.wp_preempts,
+        wp_epoch: stats.wp_epoch,
     };
 
     // SAFETY: `arg` is a user-provided pointer from the ioctl syscall, and `exit_stats`

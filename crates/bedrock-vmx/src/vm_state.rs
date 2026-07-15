@@ -800,6 +800,21 @@ pub struct AllExitStats {
     /// occurred. Pairs with `late_inject_abort_lateness` so userspace can render
     /// "timer fired N past deadline D".
     pub late_inject_abort_deadline: i64,
+    /// EPT write-watchpoint (arm-then-cull) diagnostics; 0 unless watchpoints are
+    /// enabled. Observability only: never read into any decision, schedule, or
+    /// hash. Surfaced to userspace via GET_EXIT_STATS (dmesg/pr_info is a no-op in
+    /// default builds). `wp_faults` = armed-page write faults handled.
+    pub wp_faults: u64,
+    /// Pages armed as watchpoints (first userspace write CoW'd them R+E).
+    pub wp_armed: u64,
+    /// Pages culled as single-writer (granted W permanently, then silent).
+    pub wp_culled: u64,
+    /// Pages confirmed shared (written by >= 2 distinct userspace threads).
+    pub wp_confirmed: u64,
+    /// Preemptions actually raised at a confirmed-shared write.
+    pub wp_preempts: u64,
+    /// Latest observed userspace thread-switch epoch (the cull clock).
+    pub wp_epoch: u64,
 }
 
 impl AllExitStats {

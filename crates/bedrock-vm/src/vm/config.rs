@@ -93,6 +93,12 @@ pub struct EventConfig {
     /// Seed for the per-hit watchpoint decision PRNG (only meaningful when
     /// `watchpoint_pct != 0`). A dedicated stream, separate from RDRAND.
     pub watchpoint_seed: u64,
+    /// Arm-then-cull: thread switches a single-writer watched page must survive
+    /// before culling (0 = use default). See `ApicState::configure_watchpoints`.
+    pub watchpoint_cull_epochs: u32,
+    /// Arm-then-cull: fault-count backstop for a page that never spans a switch
+    /// (0 = use default). See `ApicState::configure_watchpoints`.
+    pub watchpoint_cull_cap: u32,
 }
 
 impl EventConfig {
@@ -167,9 +173,17 @@ impl EventConfig {
     /// each watched shared-memory write with probability `pct` percent (0 =
     /// disabled), using `seed` for the per-hit decision PRNG. See
     /// `ApicState::configure_watchpoints` in bedrock-vmx.
-    pub fn with_watchpoints(mut self, pct: u32, seed: u64) -> Self {
+    pub fn with_watchpoints(
+        mut self,
+        pct: u32,
+        seed: u64,
+        cull_epochs: u32,
+        cull_cap: u32,
+    ) -> Self {
         self.watchpoint_pct = pct;
         self.watchpoint_seed = seed;
+        self.watchpoint_cull_epochs = cull_epochs;
+        self.watchpoint_cull_cap = cull_cap;
         self
     }
 

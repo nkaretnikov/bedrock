@@ -122,19 +122,19 @@ fn check_preempt_holds_off_until_vector_usable() {
 fn watchpoint_decision_is_deterministic_and_respects_pct() {
     // Same seed -> identical decision stream (reproducible schedule).
     let mut a = crate::prelude::ApicState::default();
-    a.configure_watchpoints(50, 0x1234_5678);
+    a.configure_watchpoints(50, 0x1234_5678, 2, 256);
     let mut b = crate::prelude::ApicState::default();
-    b.configure_watchpoints(50, 0x1234_5678);
+    b.configure_watchpoints(50, 0x1234_5678, 2, 256);
     for _ in 0..64 {
         assert_eq!(a.watchpoint_should_preempt(), b.watchpoint_should_preempt());
     }
 
     // pct 0 (via a live pct field) never preempts; pct 100 always does.
     let mut never = crate::prelude::ApicState::default();
-    never.configure_watchpoints(100, 0x1);
+    never.configure_watchpoints(100, 0x1, 2, 256);
     never.watchpoint_pct = 0;
     let mut always = crate::prelude::ApicState::default();
-    always.configure_watchpoints(100, 0xdead_beef);
+    always.configure_watchpoints(100, 0xdead_beef, 2, 256);
     for _ in 0..256 {
         assert!(!never.watchpoint_should_preempt());
         assert!(always.watchpoint_should_preempt());
@@ -144,7 +144,7 @@ fn watchpoint_decision_is_deterministic_and_respects_pct() {
 #[test]
 fn configure_watchpoints_forces_nonzero_seed() {
     let mut a = crate::prelude::ApicState::default();
-    a.configure_watchpoints(10, 0); // 0 is a xorshift fixed point; must be bumped
+    a.configure_watchpoints(10, 0, 2, 256); // 0 is a xorshift fixed point; must be bumped
     assert_ne!(a.watchpoint_seed, 0);
     assert_eq!(a.watchpoint_pct, 10);
 }

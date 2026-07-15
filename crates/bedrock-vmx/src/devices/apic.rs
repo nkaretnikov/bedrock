@@ -100,6 +100,14 @@ pub struct ApicState {
     /// PRNG so it never perturbs the randomness the guest observes. Internal
     /// state, not an APIC register.
     pub watchpoint_seed: u64,
+    /// Arm-then-cull: number of observed userspace thread switches a
+    /// single-writer watched page must survive before it is culled. 0 means
+    /// "use the default" (see `configure_watchpoints`). Config, not state.
+    pub watchpoint_cull_epochs: u32,
+    /// Arm-then-cull: fault-count backstop for culling a page that never spans a
+    /// thread switch (e.g. a single-threaded phase). 0 means "use the default".
+    /// Config, not state.
+    pub watchpoint_cull_cap: u32,
 }
 
 impl Default for ApicState {
@@ -139,6 +147,8 @@ impl Default for ApicState {
             // enabled by `configure_watchpoints`. Guests are unaffected until then.
             watchpoint_pct: 0,
             watchpoint_seed: 0,
+            watchpoint_cull_epochs: 0,
+            watchpoint_cull_cap: 0,
         }
     }
 }
@@ -174,9 +184,14 @@ impl ApicState {
     /// force a preemption with probability `pct` percent, using `seed` to drive
     /// the per-hit decision PRNG. `pct == 0` disables the feature. A zero `seed`
     /// is forced to 1, since 0 is a fixed point of the xorshift PRNG.
-    pub fn configure_watchpoints(&mut self, pct: u32, seed: u64) {
+    pub fn configure_watchpoints(&mut self, pct: u32, seed: u64, cull_epochs: u32, cull_cap: u32) {
         self.watchpoint_pct = pct;
         self.watchpoint_seed = if seed == 0 { 1 } else { seed };
+        // A zero from an unset config field means "use the default", never
+        // "cull instantly" (cull_epochs == 0 would release every armed page on
+        // its first same-thread refault, defeating arm-then-cull).
+        self.watchpoint_cull_epochs = if cull_epochs == 0 { 2 } else { cull_epochs };
+        self.watchpoint_cull_cap = if cull_cap == 0 { 256 } else { cull_cap };
     }
 
     /// Advance the watchpoint-decision PRNG and return whether this hit should
