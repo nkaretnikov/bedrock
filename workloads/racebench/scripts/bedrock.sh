@@ -49,6 +49,17 @@
 #   MAX         hard cap on forks                                    (default 20000)
 #   PARENT_READY_TIMEOUT  seconds to wait for the parent to reach
 #               the ready checkpoint before giving up               (default 300)
+#   BEDROCK_PREEMPT_PERIOD  forced-preempt period per child, retired
+#               instructions                                        (default 0=off)
+#   BEDROCK_WATCHPOINT_PCT  EPT write-watchpoint directed-preempt
+#               chance % per shared write                           (default 0=off)
+#   BEDROCK_WATCHPOINT_REARM  sampling re-arm interval, emulated-TSC
+#               ticks; 0 uses the CLI default (100k)                (default 0)
+#   BEDROCK_WATCHPOINT_CULL_EPOCHS  cull a watched page after N
+#               epochs without spanning a switch                    (default 2)
+#   BEDROCK_WATCHPOINT_CULL_CAP  fault-count backstop cull          (default 256)
+# The preempt/watchpoint knobs are recorded in the run header so a triggered
+# bug's repro -- (guest build, boot_seed, child_seed, these knobs) -- is complete.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -60,6 +71,16 @@ MAX="${MAX:-20000}"                 # hard cap on forks
 PARENT_READY_TIMEOUT="${PARENT_READY_TIMEOUT:-300}"
 PREEMPT_PERIOD="${BEDROCK_PREEMPT_PERIOD:-0}"   # forced-preempt period per child (retired instrs); 0=off
 WATCHPOINT_PCT="${BEDROCK_WATCHPOINT_PCT:-0}"   # EPT write-watchpoint directed-preempt chance % per shared write; 0=off (much slower per fork: use a small MAX)
+# Watchpoint tuning knobs. Defaults mirror bedrock-cli's own defaults, so an
+# unset knob forwards the same value the CLI would have picked and behavior is
+# unchanged: the point of forwarding them explicitly is that they land in the
+# run header below, so a triggered bug's repro is complete. Inert when
+# WATCHPOINT_PCT=0 (the CLI reads them only when watchpoints are on). The
+# watchpoint decision seed is deliberately NOT forwarded: it defaults to the
+# child's RDRAND seed, so the watchpoint schedule sweeps with the child seed.
+WATCHPOINT_REARM="${BEDROCK_WATCHPOINT_REARM:-0}"        # sampling re-arm interval (emulated-TSC ticks); 0=CLI default (100k)
+WATCHPOINT_CULL_EPOCHS="${BEDROCK_WATCHPOINT_CULL_EPOCHS:-2}"   # cull a page after N epochs without spanning a switch
+WATCHPOINT_CULL_CAP="${BEDROCK_WATCHPOINT_CULL_CAP:-256}"       # fault-count backstop cull
 TARGETS=(blackscholes streamcluster fluidanimate)
 
 # Capture lsmod and string-match it, rather than `lsmod | grep -q`: under
@@ -146,7 +167,7 @@ declare -A reached                  # target -> space-separated union of bug ids
 declare -A noNew                    # target -> consecutive forks with no new bug
 for t in "${TARGETS[@]}"; do reached[$t]=""; noNew[$t]=0; done
 
-echo "--- bedrock coverage (fork): boot_seed=$BOOT_SEED seed_base=$SEED_BASE plateau=$PLATEAU max=$MAX preempt_period=$PREEMPT_PERIOD watchpoint_pct=$WATCHPOINT_PCT ---"
+echo "--- bedrock coverage (fork): boot_seed=$BOOT_SEED seed_base=$SEED_BASE plateau=$PLATEAU max=$MAX preempt_period=$PREEMPT_PERIOD watchpoint_pct=$WATCHPOINT_PCT watchpoint_rearm=$WATCHPOINT_REARM watchpoint_cull_epochs=$WATCHPOINT_CULL_EPOCHS watchpoint_cull_cap=$WATCHPOINT_CULL_CAP ---"
 
 forks=0
 aborts=0
@@ -169,6 +190,9 @@ while [ "$forks" -lt "$MAX" ]; do
   out=$(cd "$REPO_ROOT" && BEDROCK_PARENT_ID="$PARENT_ID" RDRAND_SEED="$seed" \
         BEDROCK_PREEMPT_PERIOD="$PREEMPT_PERIOD" \
         BEDROCK_WATCHPOINT_PCT="$WATCHPOINT_PCT" \
+        BEDROCK_WATCHPOINT_REARM="$WATCHPOINT_REARM" \
+        BEDROCK_WATCHPOINT_CULL_EPOCHS="$WATCHPOINT_CULL_EPOCHS" \
+        BEDROCK_WATCHPOINT_CULL_CAP="$WATCHPOINT_CULL_CAP" \
         nix run .#test-racebench-fork-child 2>&1) || child_rc=$?
 
   # Classify the fork. `case` (not `printf | grep -q`) avoids the pipefail/SIGPIPE
