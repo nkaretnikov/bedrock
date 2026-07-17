@@ -88,12 +88,13 @@ pub trait VmContext {
         false
     }
 
-    /// Re-protect the EPT write-watchpoint page currently being single-stepped
-    /// (`watchpoint_stepping`) back to R+E, so its next write faults again.
+    /// Batch re-arm sampled EPT write-watchpoints: re-protect every watched page
+    /// that was let through (granted RWX) back to R+E so it can fault (and
+    /// preempt) again, issuing a single INVEPT for the whole batch.
     ///
-    /// Called from the MTF exit handler after a watchpoint let a write through.
+    /// Called from `check_wp_rearm` at a deterministic emulated-TSC deadline.
     /// For root VMs (no COW, no watchpoints) this is a no-op.
-    fn reprotect_watchpoint<A: CowAllocator<Self::CowPage>>(&mut self, _allocator: &mut A) {}
+    fn rearm_watchpoints<A: CowAllocator<Self::CowPage>>(&mut self, _allocator: &mut A) {}
 
     /// Copy-on-write every page of the feedback buffer at `index` into this
     /// VM so that a host mapping of the buffer stays coherent with later guest

@@ -237,6 +237,9 @@ pub(crate) struct BedrockEventConfig {
     /// Arm-then-cull: fault-count backstop for a page that never spans a switch
     /// (0 = default).
     pub watchpoint_cull_cap: u32,
+    /// Sampling re-arm interval in emulated-TSC ticks: how often let-through
+    /// watchpoints are batch re-protected to R+E (0 = default).
+    pub watchpoint_rearm: u64,
 }
 
 /// Per-exit-type statistics for userspace.
@@ -330,6 +333,8 @@ pub(crate) struct BedrockExitStats {
     pub wp_confirmed: u64,
     pub wp_preempts: u64,
     pub wp_epoch: u64,
+    pub wp_rearms: u64,
+    pub wp_rearm_pages: u64,
 }
 
 /// VM exit information returned to userspace from RUN ioctl.

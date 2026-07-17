@@ -151,6 +151,20 @@ mod cargo_impl {
             let page_aligned = gpa.as_u64() & !0xFFF;
             self.classes.get_mut(&page_aligned)
         }
+
+        /// Drop a page's classification record. Called when a page is culled so
+        /// the batch re-arm pass never re-protects it (a stale record would
+        /// resurrect its fault cost every window).
+        pub fn remove(&mut self, gpa: GuestPhysAddr) {
+            let page_aligned = gpa.as_u64() & !0xFFF;
+            self.classes.remove(&page_aligned);
+        }
+
+        /// Iterate the page-aligned GPAs of every still-tracked watchpoint.
+        /// Only the GPAs are needed (the batch re-arm re-protects by address).
+        pub fn iter(&self) -> impl Iterator<Item = GuestPhysAddr> + '_ {
+            self.classes.keys().map(|&gpa| GuestPhysAddr::new(gpa))
+        }
     }
 
     impl Default for WatchpointClassMap {
@@ -295,6 +309,20 @@ mod kernel_impl {
         pub fn get_mut(&mut self, gpa: GuestPhysAddr) -> Option<&mut super::WpClass> {
             let page_aligned = gpa.as_u64() & !0xFFF;
             self.classes.get_mut(&page_aligned)
+        }
+
+        /// Drop a page's classification record. Called when a page is culled so
+        /// the batch re-arm pass never re-protects it (a stale record would
+        /// resurrect its fault cost every window).
+        pub fn remove(&mut self, gpa: GuestPhysAddr) {
+            let page_aligned = gpa.as_u64() & !0xFFF;
+            self.classes.remove(&page_aligned);
+        }
+
+        /// Iterate the page-aligned GPAs of every still-tracked watchpoint.
+        /// Only the GPAs are needed (the batch re-arm re-protects by address).
+        pub fn iter(&self) -> impl Iterator<Item = GuestPhysAddr> + '_ {
+            self.classes.keys().map(|&gpa| GuestPhysAddr::new(gpa))
         }
     }
 

@@ -305,10 +305,12 @@ impl<V: VirtualMachineControlStructure, P: Page, I: InstructionCounter> ForkedVm
         true
     }
 
-    /// Let a watched write through and single-step it: grant write, then arm MTF
-    /// via `watchpoint_stepping` so `reprotect_watchpoint` restores R+E after the
-    /// one instruction, keeping the page armed for its next write.
-    fn wp_grant_and_step<A: CowAllocator<P>>(
+    /// Let a watched write through and LEAVE the page writable (RWX): the next
+    /// write to it will not fault until the batch re-arm (`rearm_watchpoints`)
+    /// re-protects it to R+E. This is the sampling protocol: one fault per page
+    /// per re-arm window instead of one fault (plus an MTF step and two INVEPTs)
+    /// per write.
+    fn wp_grant_and_leave<A: CowAllocator<P>>(
         &mut self,
         page_gpa: GuestPhysAddr,
         hpa: HostPhysAddr,
@@ -320,17 +322,14 @@ impl<V: VirtualMachineControlStructure, P: Page, I: InstructionCounter> ForkedVm
         if !self.wp_remap_rwx(page_gpa, hpa, allocator) {
             return None;
         }
-        if self.state.watchpoint_stepping.is_some() {
-            log_debug!("watchpoint: overwriting in-flight single-step\n");
-        }
-        self.state.watchpoint_stepping = Some(page_gpa.as_u64());
         Some(ExitHandlerResult::Continue)
     }
 
-    /// Cull a single-writer watched page: grant write permanently (no
-    /// re-protection), so it stops faulting. The stale classification record is
-    /// left in place and harmless: the page is now RWX, so the perm check on any
-    /// future fault excludes it from the watchpoint path.
+    /// Cull a single-writer watched page: grant write permanently and drop its
+    /// classification record, so it stops faulting for good. Removing the record
+    /// is REQUIRED under sampling: the batch re-arm (`rearm_watchpoints`) walks
+    /// the classification map and re-protects every page in it, so a leftover
+    /// record would re-arm a culled page every window and resurrect its cost.
     fn wp_cull<A: CowAllocator<P>>(
         &mut self,
         page_gpa: GuestPhysAddr,
@@ -343,6 +342,7 @@ impl<V: VirtualMachineControlStructure, P: Page, I: InstructionCounter> ForkedVm
         if !self.wp_remap_rwx(page_gpa, hpa, allocator) {
             return None;
         }
+        self.watchpoint_class.remove(page_gpa);
         self.state.exit_stats.wp_culled += 1;
         Some(ExitHandlerResult::Continue)
     }
@@ -554,7 +554,7 @@ impl<V: VirtualMachineControlStructure, P: Page, I: InstructionCounter> VmContex
                                 self.state.exit_stats.wp_preempts += 1;
                                 return Some(ExitHandlerResult::Continue);
                             }
-                            return self.wp_grant_and_step(page_gpa, hpa, allocator);
+                            return self.wp_grant_and_leave(page_gpa, hpa, allocator);
                         }
 
                         // Classifying: record present and not yet confirmed.
@@ -562,12 +562,12 @@ impl<V: VirtualMachineControlStructure, P: Page, I: InstructionCounter> VmContex
                             Some(r) => r,
                             // Unreachable given the `confirmed` handling above,
                             // but avoid a panic: just let the write through.
-                            None => return self.wp_grant_and_step(page_gpa, hpa, allocator),
+                            None => return self.wp_grant_and_leave(page_gpa, hpa, allocator),
                         };
                         if cpl != 3 {
                             // Do not classify on kernel faults: FS_BASE at CPL 0
                             // is not the userspace thread id. Just let it through.
-                            return self.wp_grant_and_step(page_gpa, hpa, allocator);
+                            return self.wp_grant_and_leave(page_gpa, hpa, allocator);
                         }
                         if tid != rec.first_tid {
                             // A second distinct thread wrote this page: confirm it
@@ -582,7 +582,7 @@ impl<V: VirtualMachineControlStructure, P: Page, I: InstructionCounter> VmContex
                                 self.state.exit_stats.wp_preempts += 1;
                                 return Some(ExitHandlerResult::Continue);
                             }
-                            return self.wp_grant_and_step(page_gpa, hpa, allocator);
+                            return self.wp_grant_and_leave(page_gpa, hpa, allocator);
                         }
                         // Same thread as the first writer. Count the fault, and
                         // cull the page (grant W permanently) once it has survived
@@ -599,7 +599,7 @@ impl<V: VirtualMachineControlStructure, P: Page, I: InstructionCounter> VmContex
                         {
                             return self.wp_cull(page_gpa, hpa, allocator);
                         }
-                        return self.wp_grant_and_step(page_gpa, hpa, allocator);
+                        return self.wp_grant_and_leave(page_gpa, hpa, allocator);
                     }
                 }
             }
@@ -744,26 +744,46 @@ impl<V: VirtualMachineControlStructure, P: Page, I: InstructionCounter> VmContex
         true
     }
 
-    fn reprotect_watchpoint<A: CowAllocator<Self::CowPage>>(&mut self, allocator: &mut A) {
-        let gpa_u64 = match self.state.watchpoint_stepping {
-            Some(g) => g,
-            None => return,
-        };
-        let page_gpa = GuestPhysAddr::new(gpa_u64);
-        // Re-protect the just-stepped watchpoint page back to R+E so its next
-        // write faults again. Keep the same host page (the COW copy); only the
-        // permissions change.
-        if let Some((hpa, _)) = self.state.ept.lookup(allocator, page_gpa) {
-            let _ = self.state.ept.remap_4k(
-                allocator,
-                page_gpa,
-                hpa,
-                EptPermissions::READ_EXECUTE,
-                EptMemoryType::WriteBack,
-            );
-            let _ = <<V::M as Machine>::V as Vmx>::invept_single_context(self.state.ept.eptp());
+    fn rearm_watchpoints<A: CowAllocator<Self::CowPage>>(&mut self, allocator: &mut A) {
+        if self.state.devices.apic.watchpoint_pct == 0 {
+            return;
         }
-        self.state.watchpoint_stepping = None;
+        // Re-protect every tracked watchpoint page that is currently writable
+        // (was let through since the last re-arm) back to R+E, so its next write
+        // faults and can preempt again. Pages already R+E (never granted this
+        // window, or holding after a preempt refault) are skipped. Disjoint
+        // field borrows: iterate the classification map while remapping through
+        // `state.ept` -- `&mut self` method calls would alias, so split first.
+        let Self {
+            watchpoint_class,
+            state,
+            ..
+        } = self;
+        let mut rearmed = 0u64;
+        // Iterate by page GPA. remap_4k only touches the leaf for that GPA, so
+        // mutating the EPT while iterating the (separate) class map is sound; no
+        // GPA list is collected first, keeping this off the 8KB kernel stack.
+        for page_gpa in watchpoint_class.iter() {
+            if let Some((hpa, perms)) = state.ept.lookup(allocator, page_gpa) {
+                if perms == EptPermissions::READ_WRITE_EXECUTE {
+                    let _ = state.ept.remap_4k(
+                        allocator,
+                        page_gpa,
+                        hpa,
+                        EptPermissions::READ_EXECUTE,
+                        EptMemoryType::WriteBack,
+                    );
+                    rearmed += 1;
+                }
+            }
+        }
+        // One INVEPT for the whole batch (not one per page): the point of
+        // sampling is to pay a single flush per window instead of per write.
+        if rearmed > 0 {
+            let _ = <<V::M as Machine>::V as Vmx>::invept_single_context(state.ept.eptp());
+            state.exit_stats.wp_rearms += 1;
+            state.exit_stats.wp_rearm_pages += rearmed;
+        }
     }
 
     fn cow_feedback_buffer_for_mapping<A: CowAllocator<Self::CowPage>>(

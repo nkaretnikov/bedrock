@@ -4,6 +4,7 @@
 //! and the `ApicState` preemption helpers.
 
 use super::*;
+use crate::exits::check_wp_rearm;
 use crate::tests::MockVmContext;
 
 /// Software-enable the APIC and give the LVT timer an unmasked, deliverable
@@ -122,19 +123,19 @@ fn check_preempt_holds_off_until_vector_usable() {
 fn watchpoint_decision_is_deterministic_and_respects_pct() {
     // Same seed -> identical decision stream (reproducible schedule).
     let mut a = crate::prelude::ApicState::default();
-    a.configure_watchpoints(50, 0x1234_5678, 2, 256);
+    a.configure_watchpoints(50, 0x1234_5678, 2, 256, 100_000);
     let mut b = crate::prelude::ApicState::default();
-    b.configure_watchpoints(50, 0x1234_5678, 2, 256);
+    b.configure_watchpoints(50, 0x1234_5678, 2, 256, 100_000);
     for _ in 0..64 {
         assert_eq!(a.watchpoint_should_preempt(), b.watchpoint_should_preempt());
     }
 
     // pct 0 (via a live pct field) never preempts; pct 100 always does.
     let mut never = crate::prelude::ApicState::default();
-    never.configure_watchpoints(100, 0x1, 2, 256);
+    never.configure_watchpoints(100, 0x1, 2, 256, 100_000);
     never.watchpoint_pct = 0;
     let mut always = crate::prelude::ApicState::default();
-    always.configure_watchpoints(100, 0xdead_beef, 2, 256);
+    always.configure_watchpoints(100, 0xdead_beef, 2, 256, 100_000);
     for _ in 0..256 {
         assert!(!never.watchpoint_should_preempt());
         assert!(always.watchpoint_should_preempt());
@@ -144,9 +145,94 @@ fn watchpoint_decision_is_deterministic_and_respects_pct() {
 #[test]
 fn configure_watchpoints_forces_nonzero_seed() {
     let mut a = crate::prelude::ApicState::default();
-    a.configure_watchpoints(10, 0, 2, 256); // 0 is a xorshift fixed point; must be bumped
+    a.configure_watchpoints(10, 0, 2, 256, 100_000); // 0 is a xorshift fixed point; must be bumped
     assert_ne!(a.watchpoint_seed, 0);
     assert_eq!(a.watchpoint_pct, 10);
+}
+
+#[test]
+fn configure_watchpoints_defaults_rearm_interval() {
+    // 0 means "use the default", never "never re-arm" (which would leave a
+    // let-through page writable forever and only fault once).
+    let mut a = crate::prelude::ApicState::default();
+    a.configure_watchpoints(10, 0x1, 2, 256, 0);
+    assert_eq!(a.wp_rearm_interval, 100_000);
+    // A non-zero interval passes through unchanged.
+    let mut b = crate::prelude::ApicState::default();
+    b.configure_watchpoints(10, 0x1, 2, 256, 4096);
+    assert_eq!(b.wp_rearm_interval, 4096);
+    // Re-configuring clears any inherited deadline.
+    b.wp_rearm_deadline = 999;
+    b.configure_watchpoints(10, 0x1, 2, 256, 4096);
+    assert_eq!(b.wp_rearm_deadline, 0);
+}
+
+#[test]
+fn check_wp_rearm_noop_when_disabled() {
+    let mut ctx = MockVmContext::new();
+    let mut alloc = crate::test_mocks::MockFrameAllocator::new();
+    // watchpoint_pct defaults to 0 -> feature off; deadline stays unarmed.
+    ctx.set_emulated_tsc(1_000_000);
+    check_wp_rearm(&mut ctx, &mut alloc);
+    assert_eq!(ctx.state().devices.apic.wp_rearm_deadline, 0);
+}
+
+#[test]
+fn check_wp_rearm_lazy_arms_then_fires_and_reschedules() {
+    let mut ctx = MockVmContext::new();
+    let mut alloc = crate::test_mocks::MockFrameAllocator::new();
+    ctx.state_mut()
+        .devices
+        .apic
+        .configure_watchpoints(20, 0x1, 2, 256, 1000);
+
+    // First eligible pass arms the deadline (current_tsc + interval).
+    ctx.set_emulated_tsc(0);
+    check_wp_rearm(&mut ctx, &mut alloc);
+    assert_eq!(ctx.state().devices.apic.wp_rearm_deadline, 1000);
+
+    // Before the deadline: nothing changes.
+    ctx.set_emulated_tsc(999);
+    check_wp_rearm(&mut ctx, &mut alloc);
+    assert_eq!(ctx.state().devices.apic.wp_rearm_deadline, 1000);
+
+    // On/after the deadline: re-arm and schedule the next window from NOW.
+    ctx.set_emulated_tsc(1500);
+    check_wp_rearm(&mut ctx, &mut alloc);
+    assert_eq!(
+        ctx.state().devices.apic.wp_rearm_deadline,
+        2500,
+        "next window is current_tsc + interval, not deadline + interval"
+    );
+}
+
+#[test]
+fn check_wp_rearm_deadline_is_deterministic() {
+    // Two contexts fed the same emulated-TSC sequence must reach identical
+    // re-arm deadlines: the schedule is a pure function of guest progress.
+    let tscs = [0u64, 500, 1000, 1000, 3300, 3300];
+    let mut a = MockVmContext::new();
+    let mut b = MockVmContext::new();
+    let mut aa = crate::test_mocks::MockFrameAllocator::new();
+    let mut ba = crate::test_mocks::MockFrameAllocator::new();
+    a.state_mut()
+        .devices
+        .apic
+        .configure_watchpoints(20, 0x1, 2, 256, 1000);
+    b.state_mut()
+        .devices
+        .apic
+        .configure_watchpoints(20, 0x1, 2, 256, 1000);
+    for &tsc in &tscs {
+        a.set_emulated_tsc(tsc);
+        b.set_emulated_tsc(tsc);
+        check_wp_rearm(&mut a, &mut aa);
+        check_wp_rearm(&mut b, &mut ba);
+        assert_eq!(
+            a.state().devices.apic.wp_rearm_deadline,
+            b.state().devices.apic.wp_rearm_deadline
+        );
+    }
 }
 
 #[test]

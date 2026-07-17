@@ -559,6 +559,7 @@ pub(crate) fn handle_set_event_config<F: VmFileOps>(vm_file: &mut F, arg: usize)
         config.watchpoint_seed,
         config.watchpoint_cull_epochs,
         config.watchpoint_cull_cap,
+        config.watchpoint_rearm,
     );
 
     log_info!(
@@ -623,6 +624,8 @@ pub(crate) fn handle_get_exit_stats<F: VmFileOps>(vm_file: &F, arg: usize) -> is
         wp_confirmed: stats.wp_confirmed,
         wp_preempts: stats.wp_preempts,
         wp_epoch: stats.wp_epoch,
+        wp_rearms: stats.wp_rearms,
+        wp_rearm_pages: stats.wp_rearm_pages,
     };
 
     // SAFETY: `arg` is a user-provided pointer from the ioctl syscall, and `exit_stats`

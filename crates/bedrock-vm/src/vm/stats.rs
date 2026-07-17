@@ -166,6 +166,11 @@ pub struct ExitStats {
     pub wp_preempts: u64,
     /// Latest observed userspace thread-switch epoch.
     pub wp_epoch: u64,
+    /// Batch re-arm passes performed (one per elapsed re-arm window that found
+    /// at least one let-through page to re-protect).
+    pub wp_rearms: u64,
+    /// Total pages re-protected across all batch re-arm passes.
+    pub wp_rearm_pages: u64,
 }
 
 impl ExitStats {
@@ -428,13 +433,15 @@ impl fmt::Display for ExitStatsReport<'_> {
         writeln!(f, "{TABLE_SEP}")?;
         writeln!(
             f,
-            "  faults={} armed={} culled={} confirmed={} preempts={} epoch={}",
+            "  faults={} armed={} culled={} confirmed={} preempts={} epoch={} rearms={} rearm_pages={}",
             stats.wp_faults,
             stats.wp_armed,
             stats.wp_culled,
             stats.wp_confirmed,
             stats.wp_preempts,
-            stats.wp_epoch
+            stats.wp_epoch,
+            stats.wp_rearms,
+            stats.wp_rearm_pages
         )?;
         write!(f, "{TABLE_SEP}")
     }

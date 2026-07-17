@@ -99,6 +99,10 @@ pub struct EventConfig {
     /// Arm-then-cull: fault-count backstop for a page that never spans a switch
     /// (0 = use default). See `ApicState::configure_watchpoints`.
     pub watchpoint_cull_cap: u32,
+    /// Sampling re-arm interval in emulated-TSC ticks: how often let-through
+    /// watchpoints are batch re-protected to R+E (0 = use default). See
+    /// `ApicState::configure_watchpoints`.
+    pub watchpoint_rearm: u64,
 }
 
 impl EventConfig {
@@ -179,11 +183,13 @@ impl EventConfig {
         seed: u64,
         cull_epochs: u32,
         cull_cap: u32,
+        rearm: u64,
     ) -> Self {
         self.watchpoint_pct = pct;
         self.watchpoint_seed = seed;
         self.watchpoint_cull_epochs = cull_epochs;
         self.watchpoint_cull_cap = cull_cap;
+        self.watchpoint_rearm = rearm;
         self
     }
 

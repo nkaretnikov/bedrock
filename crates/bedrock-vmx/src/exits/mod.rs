@@ -246,11 +246,7 @@ pub fn update_mtf_state<C: VmContext>(ctx: &mut C) -> Result<(), ExitError> {
             || in_margin(stop_at_count)
             || in_margin(next_single_step_start_count(ctx)));
 
-    // A pending EPT write-watchpoint step also needs MTF: the watched write was
-    // let through with the page temporarily writable, and we single-step exactly
-    // one instruction so `reprotect_watchpoint` can restore R+E right after it.
-    let should_enable =
-        in_single_step || in_pebs_margin || ctx.state().watchpoint_stepping.is_some();
+    let should_enable = in_single_step || in_pebs_margin;
 
     if should_enable != currently_enabled {
         // Toggle MTF in primary processor-based controls
@@ -275,6 +271,46 @@ pub fn update_mtf_state<C: VmContext>(ctx: &mut C) -> Result<(), ExitError> {
     }
 
     Ok(())
+}
+
+/// Drive the sampled-watchpoint batch re-arm. When EPT write-watchpoints are
+/// enabled, watched pages that were let through (granted RWX) are re-protected
+/// back to R+E once per `wp_rearm_interval` emulated-TSC ticks, rather than
+/// after every write. This trades per-write cost (two exits + two INVEPTs) for
+/// per-window cost (one INVEPT), at the price of sampling at most one fault per
+/// page per window.
+///
+/// Fires only on the `last_exit_deterministic` path (the caller gates on
+/// `!non_deterministic_exit`) and keys off `emulated_tsc`, so the re-arm points
+/// are a pure function of guest execution and reproducible across runs -- the
+/// same determinism argument as `check_preempt`. It lives here (not next to
+/// `check_preempt` in interrupts.rs) because re-arming needs the COW allocator,
+/// which the interrupt-injection path does not thread through.
+fn check_wp_rearm<C: VmContext, A: CowAllocator<C::CowPage>>(ctx: &mut C, allocator: &mut A) {
+    let apic = &ctx.state().devices.apic;
+    if apic.watchpoint_pct == 0 || apic.wp_rearm_interval == 0 {
+        return; // feature disabled
+    }
+
+    let current_tsc = ctx.state().emulated_tsc;
+    let deadline = apic.wp_rearm_deadline;
+    let interval = apic.wp_rearm_interval;
+
+    // Lazy arm: on the first eligible pass, schedule the first re-arm and
+    // return (mirrors check_preempt's lazy deadline).
+    if deadline == 0 {
+        ctx.state_mut().devices.apic.wp_rearm_deadline = current_tsc.saturating_add(interval);
+        return;
+    }
+    if current_tsc < deadline {
+        return;
+    }
+
+    // Due: re-protect all let-through watchpoints (one INVEPT), then schedule
+    // the next window from NOW so a long exit-free stretch doesn't produce a
+    // burst of catch-up re-arms.
+    ctx.rearm_watchpoints(allocator);
+    ctx.state_mut().devices.apic.wp_rearm_deadline = current_tsc.saturating_add(interval);
 }
 
 /// Handle a VM exit.
@@ -351,13 +387,7 @@ pub fn handle_exit<C: VmContext, K: Kernel, A: CowAllocator<C::CowPage>>(
                 Some((start, end)) => tsc >= start && tsc < end,
                 None => false,
             };
-            // An EPT write-watchpoint single-step is deterministic: the watched
-            // write faults at a deterministic instruction count (a pure function
-            // of guest execution), so the one MTF step that follows it also
-            // lands at a deterministic count. Feature-gated, so this is inert
-            // unless watchpoints are enabled.
-            let wp_step = ctx.state().watchpoint_stepping.is_some();
-            !(on_boundary || in_single_step_range || wp_step)
+            !(on_boundary || in_single_step_range)
         }
         _ => false,
     };
@@ -370,6 +400,17 @@ pub fn handle_exit<C: VmContext, K: Kernel, A: CowAllocator<C::CowPage>>(
     if !non_deterministic_exit {
         let tsc = ctx.state().last_instruction_count + ctx.state().tsc_offset;
         ctx.state_mut().emulated_tsc = tsc;
+    }
+
+    // Batch re-arm of sampled EPT write-watchpoints. Runs only on deterministic
+    // exits at an emulated-TSC deadline, so the re-arm points (and therefore
+    // which watched writes fault, and where preemptions land) are a pure
+    // function of guest execution: reproducible across runs. Placed BEFORE exit
+    // dispatch so if this same exit is a watchpoint fault, the page is re-armed
+    // first and the fault handler then grants+leaves it for this window, rather
+    // than being re-protected out from under a just-granted write.
+    if !non_deterministic_exit {
+        check_wp_rearm(ctx, allocator);
     }
 
     // Handle the exit FIRST, before any logging or threshold checks.
@@ -397,15 +438,8 @@ pub fn handle_exit<C: VmContext, K: Kernel, A: CowAllocator<C::CowPage>>(
         ExitReason::Rdseed => handle_rdseed(ctx),
 
         // Monitor Trap Flag - VM exit after each guest instruction (single-step mode)
-        // The exit is already logged above; just continue executing. If this MTF
-        // exit completes an EPT write-watchpoint let-through step, re-protect the
-        // page to R+E first so its next write faults again.
-        ExitReason::MonitorTrapFlag => {
-            if ctx.state().watchpoint_stepping.is_some() {
-                ctx.reprotect_watchpoint(allocator);
-            }
-            ExitHandlerResult::Continue
-        }
+        // The exit is already logged above; just continue executing.
+        ExitReason::MonitorTrapFlag => ExitHandlerResult::Continue,
 
         ExitReason::Hlt => handle_idle(ctx),
 

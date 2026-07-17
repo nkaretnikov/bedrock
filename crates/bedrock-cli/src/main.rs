@@ -261,7 +261,12 @@ fn build_event_config(args: &Args) -> EventConfig {
         // primary cull signal; the cap is a backstop. Defaults 2 / 256.
         let cull_epochs = env_u64("BEDROCK_WATCHPOINT_CULL_EPOCHS").unwrap_or(2) as u32;
         let cull_cap = env_u64("BEDROCK_WATCHPOINT_CULL_CAP").unwrap_or(256) as u32;
-        config = config.with_watchpoints(pct as u32, seed, cull_epochs, cull_cap);
+        // Sampling re-arm interval in emulated-TSC ticks: how often let-through
+        // watchpoints are batch re-protected so they fault (and can preempt)
+        // again. 0 uses the in-hypervisor default (100k). A let-through page is
+        // not re-protected per-write; this bounds how stale a sample gets.
+        let rearm = env_u64("BEDROCK_WATCHPOINT_REARM").unwrap_or(0);
+        config = config.with_watchpoints(pct as u32, seed, cull_epochs, cull_cap, rearm);
     }
     config
 }

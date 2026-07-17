@@ -108,6 +108,17 @@ pub struct ApicState {
     /// thread switch (e.g. a single-threaded phase). 0 means "use the default".
     /// Config, not state.
     pub watchpoint_cull_cap: u32,
+    /// Sampling re-arm interval, in emulated-TSC (retired-instruction) ticks:
+    /// how often confirmed watchpoints that were let through (granted RWX) are
+    /// batch re-protected back to R+E so they can fault (and preempt) again. A
+    /// let-through write is NOT re-protected per-instruction (that cost 2 exits
+    /// + 2 INVEPTs each); instead all granted pages are re-armed together, one
+    /// INVEPT per window. 0 means "use the default". Config, not state.
+    pub wp_rearm_interval: u64,
+    /// Emulated-TSC of the next batch re-arm (0 = not yet armed). Lazily armed
+    /// on the first eligible pass (see `check_wp_rearm`), then advanced from the
+    /// current TSC after each fire. Internal state, not config.
+    pub wp_rearm_deadline: u64,
 }
 
 impl Default for ApicState {
@@ -149,6 +160,8 @@ impl Default for ApicState {
             watchpoint_seed: 0,
             watchpoint_cull_epochs: 0,
             watchpoint_cull_cap: 0,
+            wp_rearm_interval: 0,
+            wp_rearm_deadline: 0,
         }
     }
 }
@@ -184,7 +197,14 @@ impl ApicState {
     /// force a preemption with probability `pct` percent, using `seed` to drive
     /// the per-hit decision PRNG. `pct == 0` disables the feature. A zero `seed`
     /// is forced to 1, since 0 is a fixed point of the xorshift PRNG.
-    pub fn configure_watchpoints(&mut self, pct: u32, seed: u64, cull_epochs: u32, cull_cap: u32) {
+    pub fn configure_watchpoints(
+        &mut self,
+        pct: u32,
+        seed: u64,
+        cull_epochs: u32,
+        cull_cap: u32,
+        rearm_interval: u64,
+    ) {
         self.watchpoint_pct = pct;
         self.watchpoint_seed = if seed == 0 { 1 } else { seed };
         // A zero from an unset config field means "use the default", never
@@ -192,6 +212,15 @@ impl ApicState {
         // its first same-thread refault, defeating arm-then-cull).
         self.watchpoint_cull_epochs = if cull_epochs == 0 { 2 } else { cull_epochs };
         self.watchpoint_cull_cap = if cull_cap == 0 { 256 } else { cull_cap };
+        // 0 means "use the default"; a re-arm interval of 0 would never re-arm,
+        // so a let-through page would stay writable forever and only fault once.
+        self.wp_rearm_interval = if rearm_interval == 0 {
+            100_000
+        } else {
+            rearm_interval
+        };
+        // Re-arm afresh: any inherited deadline is meaningless under a new config.
+        self.wp_rearm_deadline = 0;
     }
 
     /// Advance the watchpoint-decision PRNG and return whether this hit should
