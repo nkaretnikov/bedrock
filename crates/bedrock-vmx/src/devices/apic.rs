@@ -111,9 +111,10 @@ pub struct ApicState {
     /// Sampling re-arm interval, in emulated-TSC (retired-instruction) ticks:
     /// how often confirmed watchpoints that were let through (granted RWX) are
     /// batch re-protected back to R+E so they can fault (and preempt) again. A
-    /// let-through write is NOT re-protected per-instruction (that cost 2 exits
-    /// + 2 INVEPTs each); instead all granted pages are re-armed together, one
-    /// INVEPT per window. 0 means "use the default". Config, not state.
+    /// let-through write is NOT re-protected per-instruction (that cost 2
+    /// exits + 2 INVEPTs each); instead all granted pages are re-armed
+    /// together, one INVEPT per window. 0 means "use the default". Config, not
+    /// state.
     pub wp_rearm_interval: u64,
     /// Emulated-TSC of the next batch re-arm (0 = not yet armed). Lazily armed
     /// on the first eligible pass (see `check_wp_rearm`), then advanced from the
@@ -234,7 +235,7 @@ impl ApicState {
         x ^= x >> 7;
         x ^= x << 17;
         self.watchpoint_seed = x;
-        (x % 100) < self.watchpoint_pct as u64
+        (x % 100) < u64::from(self.watchpoint_pct)
     }
 }
 

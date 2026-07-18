@@ -530,7 +530,7 @@ impl<V: VirtualMachineControlStructure, P: Page, I: InstructionCounter> VmContex
                         if cpl == 3 && tid != self.wp_last_tid {
                             self.wp_last_tid = tid;
                             self.wp_switch_epoch = self.wp_switch_epoch.wrapping_add(1);
-                            self.state.exit_stats.wp_epoch = self.wp_switch_epoch as u64;
+                            self.state.exit_stats.wp_epoch = u64::from(self.wp_switch_epoch);
                         }
 
                         // Snapshot the classification (ends the map borrow). A
