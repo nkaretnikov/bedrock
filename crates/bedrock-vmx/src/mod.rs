@@ -11,6 +11,8 @@ mod compat;
 mod cow;
 mod decoder;
 mod devices;
+mod dr_hw;
+mod dr_watch;
 mod events;
 mod exit_record;
 mod exits;

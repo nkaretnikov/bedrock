@@ -267,6 +267,22 @@ fn build_event_config(args: &Args) -> EventConfig {
         // not re-protected per-write; this bounds how stale a sample gets.
         let rearm = env_u64("BEDROCK_WATCHPOINT_REARM").unwrap_or(0);
         config = config.with_watchpoints(pct as u32, seed, cull_epochs, cull_cap, rearm);
+        // Hardware data-breakpoint race detector (DataCollider-style): layer the
+        // exact-address DR trigger on top of the EPT candidate sampler. Confirmed
+        // -shared writes arm a DR on the faulting byte/word; a #DB from a
+        // different thread is a realized race (surfaced as wp_dr_conflicts).
+        // Fires ONLY on an actual second-thread conflict, and arming costs no
+        // INVEPT. BEDROCK_WATCHPOINT_DR=0/unset leaves it off (EPT-only behavior).
+        if env_u64("BEDROCK_WATCHPOINT_DR")
+            .filter(|&v| v != 0)
+            .is_some()
+        {
+            let len = env_u64("BEDROCK_WATCHPOINT_DR_LEN").unwrap_or(4) as u8;
+            // Oneshot on by default; set BEDROCK_WATCHPOINT_DR_ONESHOT=0 to keep
+            // a slot armed after a conflict (catch repeated conflicts on a word).
+            let oneshot = env_u64("BEDROCK_WATCHPOINT_DR_ONESHOT").unwrap_or(1) != 0;
+            config = config.with_watchpoint_dr(len, oneshot);
+        }
     }
     config
 }

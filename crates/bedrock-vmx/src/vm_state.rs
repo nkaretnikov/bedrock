@@ -820,6 +820,16 @@ pub struct AllExitStats {
     pub wp_rearms: u64,
     /// Total pages re-protected across all batch re-arm passes.
     pub wp_rearm_pages: u64,
+    /// Hardware data-breakpoint race detector: `DR` slots armed on the exact
+    /// address of a confirmed-shared write.
+    pub wp_dr_armed: u64,
+    /// Cross-thread conflicts detected (a `#DB` from a thread other than the
+    /// slot's owner): realized data races.
+    pub wp_dr_conflicts: u64,
+    /// `#DB`s where the owner re-touched its own watched location (not a race).
+    pub wp_dr_self: u64,
+    /// `DR` slots evicted while still armed because all four were in use.
+    pub wp_dr_evictions: u64,
 }
 
 impl AllExitStats {
@@ -1138,6 +1148,15 @@ pub struct VmState<V: VirtualMachineControlStructure, I: InstructionCounter> {
     /// The #PF is logged and reinjected so the guest handles it normally.
     /// Used for determinism analysis to observe spurious page faults.
     pub intercept_pf: bool,
+    /// Hardware data-breakpoint race detector (DataCollider-style): the 4 `DR`
+    /// slots plus policy. Slots are armed from confirmed-shared EPT
+    /// write-watchpoint hits; a `#DB` from a thread other than a slot's owner is
+    /// a realized data race. Inert unless `devices.apic.watchpoint_dr` is set.
+    pub debug_watch: DebugWatch,
+    /// `DR6` captured by the run loop immediately after VM exit (VMX does not
+    /// save `DR6`). Read by the `#DB` handler to find which slot fired; the run
+    /// loop clears hardware `DR6` after capturing it.
+    pub dr6_capture: u64,
     /// When true, a PEBS skid that exceeds `get_pebs_margin()` is tolerated:
     /// the handler records `max_pebs_skid` and continues (the old best-effort
     /// behavior). When false (the default), such a skid aborts the run
@@ -1439,6 +1458,8 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             feedback_buffers: feedback_buffers_new(),
             vpid,
             intercept_pf: false,
+            debug_watch: DebugWatch::new(),
+            dr6_capture: 0,
             ignore_pebs_margin: false,
             ignore_late_inject: false,
             pebs_state: None,
@@ -1975,6 +1996,23 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
         let _ = self.vmcs.write32(VmcsField32::ExceptionBitmap, new_bitmap);
     }
 
+    /// Apply the `#DB` interception flag (bit 1 of the exception bitmap) to the
+    /// VMCS so the hardware data-breakpoint race detector's `#DB` traps exit to
+    /// the hypervisor instead of reaching the guest. Keyed off the feature flag
+    /// (`devices.apic.watchpoint_dr`) so the bit is stable for the whole run:
+    /// hardware `DR` slots are armed/disarmed dynamically, but the exception
+    /// bitmap need not be rewritten per exit. Mirrors `apply_intercept_pf` and
+    /// must be called after `vmcs.load()`.
+    pub fn apply_intercept_db(&self) {
+        let bitmap = self.vmcs.read32(VmcsField32::ExceptionBitmap).unwrap_or(0);
+        let new_bitmap = if self.devices.apic.watchpoint_dr {
+            bitmap | (1 << 1)
+        } else {
+            bitmap & !(1 << 1)
+        };
+        let _ = self.vmcs.write32(VmcsField32::ExceptionBitmap, new_bitmap);
+    }
+
     /// Write a log entry for a VM exit.
     ///
     /// This captures guest registers, hashes all device states, and writes an
@@ -2352,6 +2390,8 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             feedback_buffers: feedback_buffers_new(),
             vpid: 0, // Tests don't use VPID
             intercept_pf: false,
+            debug_watch: DebugWatch::new(),
+            dr6_capture: 0,
             ignore_pebs_margin: false,
             ignore_late_inject: false,
             pebs_state: None,
@@ -2622,6 +2662,10 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             feedback_buffers: feedback_buffers_from(&parent_state.feedback_buffers), // Deep-copy parent's feedback buffers
             vpid: allocated_vpid,
             intercept_pf: false,
+            // DR race-detector slots are per-run hardware state: start empty in
+            // the child (the config that enables them is inherited via devices).
+            debug_watch: DebugWatch::new(),
+            dr6_capture: 0,
             // Inherit the strict/ignore policies so forked children enforce the
             // same PEBS-margin and late-inject invariants as their parent run.
             ignore_pebs_margin: parent_state.ignore_pebs_margin,

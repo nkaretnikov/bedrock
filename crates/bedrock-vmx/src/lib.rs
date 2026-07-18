@@ -12,6 +12,8 @@ pub mod compat;
 pub mod cow;
 pub mod decoder;
 pub mod devices;
+pub mod dr_hw;
+pub mod dr_watch;
 pub mod events;
 pub mod exit_record;
 pub mod exits;

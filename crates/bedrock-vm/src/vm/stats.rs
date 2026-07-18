@@ -171,6 +171,17 @@ pub struct ExitStats {
     pub wp_rearms: u64,
     /// Total pages re-protected across all batch re-arm passes.
     pub wp_rearm_pages: u64,
+    /// Hardware data-breakpoint race detector (DataCollider-style): `DR` slots
+    /// armed on the exact address of a confirmed-shared write.
+    pub wp_dr_armed: u64,
+    /// Cross-thread conflicts detected: a `#DB` from a thread other than the
+    /// slot's owner. These are realized data races.
+    pub wp_dr_conflicts: u64,
+    /// `#DB`s where the owner thread re-touched its own watched location (not a
+    /// race); tracked to gauge how much of the `#DB` traffic is self-noise.
+    pub wp_dr_self: u64,
+    /// `DR` slots evicted while still armed because all four were in use.
+    pub wp_dr_evictions: u64,
 }
 
 impl ExitStats {
@@ -442,6 +453,14 @@ impl fmt::Display for ExitStatsReport<'_> {
             stats.wp_epoch,
             stats.wp_rearms,
             stats.wp_rearm_pages
+        )?;
+        writeln!(
+            f,
+            "  dr_armed={} dr_conflicts={} dr_self={} dr_evictions={}  (hardware data-breakpoint race detector)",
+            stats.wp_dr_armed,
+            stats.wp_dr_conflicts,
+            stats.wp_dr_self,
+            stats.wp_dr_evictions,
         )?;
         write!(f, "{TABLE_SEP}")
     }

@@ -240,6 +240,14 @@ pub(crate) struct BedrockEventConfig {
     /// Sampling re-arm interval in emulated-TSC ticks: how often let-through
     /// watchpoints are batch re-protected to R+E (0 = default).
     pub watchpoint_rearm: u64,
+    /// Enable the hardware data-breakpoint race detector (DataCollider-style):
+    /// confirmed-shared writes arm a `DR` on the exact address; a `#DB` from a
+    /// different thread is a realized race. Requires `watchpoint_pct != 0`.
+    pub watchpoint_dr: bool,
+    /// Watch length in bytes for `DR` slots (0 = default 4).
+    pub watchpoint_dr_len: u8,
+    /// Disarm a `DR` slot on its first conflict (default true).
+    pub watchpoint_dr_oneshot: bool,
 }
 
 /// Per-exit-type statistics for userspace.
@@ -335,6 +343,10 @@ pub(crate) struct BedrockExitStats {
     pub wp_epoch: u64,
     pub wp_rearms: u64,
     pub wp_rearm_pages: u64,
+    pub wp_dr_armed: u64,
+    pub wp_dr_conflicts: u64,
+    pub wp_dr_self: u64,
+    pub wp_dr_evictions: u64,
 }
 
 /// VM exit information returned to userspace from RUN ioctl.

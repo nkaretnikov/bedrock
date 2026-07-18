@@ -81,6 +81,14 @@ WATCHPOINT_PCT="${BEDROCK_WATCHPOINT_PCT:-0}"   # EPT write-watchpoint directed-
 WATCHPOINT_REARM="${BEDROCK_WATCHPOINT_REARM:-0}"        # sampling re-arm interval (emulated-TSC ticks); 0=CLI default (100k)
 WATCHPOINT_CULL_EPOCHS="${BEDROCK_WATCHPOINT_CULL_EPOCHS:-2}"   # cull a page after N epochs without spanning a switch
 WATCHPOINT_CULL_CAP="${BEDROCK_WATCHPOINT_CULL_CAP:-256}"       # fault-count backstop cull
+# Hardware data-breakpoint race detector (DataCollider-style). Layered on the EPT
+# watchpoint sampler (needs WATCHPOINT_PCT>0 for candidates): confirmed-shared
+# writes arm a DR on the exact address, and a #DB from a different thread is a
+# realized race (surfaced as wp_dr_conflicts). Fires ONLY on an actual conflict,
+# and arming costs no INVEPT. WATCHPOINT_DR=0 = EPT-only behavior.
+WATCHPOINT_DR="${BEDROCK_WATCHPOINT_DR:-0}"                     # enable DR race detector; 0=off
+WATCHPOINT_DR_LEN="${BEDROCK_WATCHPOINT_DR_LEN:-4}"            # DR watch width in bytes (1/2/4/8)
+WATCHPOINT_DR_ONESHOT="${BEDROCK_WATCHPOINT_DR_ONESHOT:-1}"   # disarm a slot on first conflict; 0=keep armed
 TARGETS=(blackscholes streamcluster fluidanimate)
 
 # Capture lsmod and string-match it, rather than `lsmod | grep -q`: under
@@ -167,7 +175,7 @@ declare -A reached                  # target -> space-separated union of bug ids
 declare -A noNew                    # target -> consecutive forks with no new bug
 for t in "${TARGETS[@]}"; do reached[$t]=""; noNew[$t]=0; done
 
-echo "--- bedrock coverage (fork): boot_seed=$BOOT_SEED seed_base=$SEED_BASE plateau=$PLATEAU max=$MAX preempt_period=$PREEMPT_PERIOD watchpoint_pct=$WATCHPOINT_PCT watchpoint_rearm=$WATCHPOINT_REARM watchpoint_cull_epochs=$WATCHPOINT_CULL_EPOCHS watchpoint_cull_cap=$WATCHPOINT_CULL_CAP ---"
+echo "--- bedrock coverage (fork): boot_seed=$BOOT_SEED seed_base=$SEED_BASE plateau=$PLATEAU max=$MAX preempt_period=$PREEMPT_PERIOD watchpoint_pct=$WATCHPOINT_PCT watchpoint_rearm=$WATCHPOINT_REARM watchpoint_cull_epochs=$WATCHPOINT_CULL_EPOCHS watchpoint_cull_cap=$WATCHPOINT_CULL_CAP watchpoint_dr=$WATCHPOINT_DR watchpoint_dr_len=$WATCHPOINT_DR_LEN watchpoint_dr_oneshot=$WATCHPOINT_DR_ONESHOT ---"
 
 forks=0
 aborts=0
@@ -193,6 +201,9 @@ while [ "$forks" -lt "$MAX" ]; do
         BEDROCK_WATCHPOINT_REARM="$WATCHPOINT_REARM" \
         BEDROCK_WATCHPOINT_CULL_EPOCHS="$WATCHPOINT_CULL_EPOCHS" \
         BEDROCK_WATCHPOINT_CULL_CAP="$WATCHPOINT_CULL_CAP" \
+        BEDROCK_WATCHPOINT_DR="$WATCHPOINT_DR" \
+        BEDROCK_WATCHPOINT_DR_LEN="$WATCHPOINT_DR_LEN" \
+        BEDROCK_WATCHPOINT_DR_ONESHOT="$WATCHPOINT_DR_ONESHOT" \
         nix run .#test-racebench-fork-child 2>&1) || child_rc=$?
 
   # Classify the fork. `case` (not `printf | grep -q`) avoids the pipefail/SIGPIPE

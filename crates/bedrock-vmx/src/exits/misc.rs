@@ -3,6 +3,7 @@
 //! Miscellaneous exit handlers: exceptions, XSETBV, triple fault debugging.
 
 use super::helpers::{advance_rip, inject_exception, ExitError, ExitHandlerResult};
+use super::interrupts::raise_preempt_vector;
 use super::qualifications::{InterruptionInfo, InterruptionType};
 use super::reasons::ExitReason;
 
@@ -38,6 +39,48 @@ pub fn handle_exception_nmi<C: VmContext>(ctx: &mut C) -> ExitHandlerResult {
 
         // After handling the host NMI, resume the guest.
         // The NMI was for the host, not the guest.
+        return ExitHandlerResult::Continue;
+    }
+
+    // Hardware data-breakpoint race detector (DataCollider-style): a #DB from a
+    // breakpoint *we* armed on a confirmed-shared address. Classify it from the
+    // DR6 captured by the run loop and the faulting thread. A hit from a thread
+    // other than the slot's owner is a realized data race; the owner re-touching
+    // its own location is not. This #DB is ours and is NEVER reflected to the
+    // guest. A data breakpoint is a trap (the access already completed), so we
+    // simply resume.
+    if info.vector == 1 && ctx.state().devices.apic.watchpoint_dr {
+        let dr6 = ctx.state().dr6_capture;
+        let cpl = (ctx
+            .state()
+            .vmcs
+            .read16(VmcsField16::GuestCsSelector)
+            .unwrap_or(0)
+            & 3) as u8;
+        let tid = ctx
+            .state()
+            .vmcs
+            .read_natural(VmcsFieldNatural::GuestFsBase)
+            .unwrap_or(0);
+        let oneshot = ctx.state().devices.apic.watchpoint_dr_oneshot;
+        let state = ctx.state_mut();
+        match state.debug_watch.on_db(dr6, tid, cpl, oneshot) {
+            DbOutcome::Conflict { .. } => {
+                state.exit_stats.wp_dr_conflicts += 1;
+                // Nudge the scheduler at the conflict point to keep interleaving.
+                let _ = raise_preempt_vector(&mut state.devices.apic);
+            }
+            DbOutcome::OwnerReaccess { .. } => {
+                state.exit_stats.wp_dr_self += 1;
+            }
+            // DR6 matched no slot we own. We own the DRs entirely while active
+            // (the guest's MOV-DR is shadowed), so this is spurious: swallow it.
+            DbOutcome::NotOurs => {}
+        }
+        // Clear the sticky DR6 capture so a later exit does not re-observe this
+        // hit. Hardware DR6 is cleared by the run loop after capture; the
+        // exception-bitmap #DB bit stays set for the whole run (feature-driven).
+        state.dr6_capture = 0;
         return ExitHandlerResult::Continue;
     }
 

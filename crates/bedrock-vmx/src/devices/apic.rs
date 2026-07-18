@@ -120,6 +120,19 @@ pub struct ApicState {
     /// on the first eligible pass (see `check_wp_rearm`), then advanced from the
     /// current TSC after each fire. Internal state, not config.
     pub wp_rearm_deadline: u64,
+    /// Enable the hardware data-breakpoint race detector (DataCollider-style):
+    /// confirmed-shared EPT watchpoint hits arm a `DR` slot on the exact
+    /// faulting address, and a `#DB` from a different thread is a realized race.
+    /// The EPT watchpoint sampler (`watchpoint_pct`) supplies the candidates, so
+    /// this is only active when both are set. Config, not state.
+    pub watchpoint_dr: bool,
+    /// Watch length in bytes for armed `DR` slots (1/2/4/8; default 4 for the
+    /// aligned `volatile u32` RaceBench variables). Alignment-clamped per slot.
+    /// 0 means "use the default". Config, not state.
+    pub watchpoint_dr_len: u8,
+    /// Disarm a `DR` slot as soon as it reports a conflict (default true) so a
+    /// hot shared word does not re-fire a `#DB` every access. Config, not state.
+    pub watchpoint_dr_oneshot: bool,
 }
 
 impl Default for ApicState {
@@ -163,6 +176,11 @@ impl Default for ApicState {
             watchpoint_cull_cap: 0,
             wp_rearm_interval: 0,
             wp_rearm_deadline: 0,
+            // Hardware data-breakpoint race detector disabled by default;
+            // enabled by `configure_watchpoint_dr`.
+            watchpoint_dr: false,
+            watchpoint_dr_len: 0,
+            watchpoint_dr_oneshot: true,
         }
     }
 }
@@ -224,6 +242,24 @@ impl ApicState {
         self.wp_rearm_deadline = 0;
     }
 
+    /// Enable the hardware data-breakpoint race detector. `len` is the watch
+    /// width in bytes (0 = default 4); `oneshot` disarms a slot on its first
+    /// conflict. The EPT watchpoint sampler (`configure_watchpoints`) must also
+    /// be enabled to supply candidate addresses.
+    pub fn configure_watchpoint_dr(&mut self, enabled: bool, len: u8, oneshot: bool) {
+        self.watchpoint_dr = enabled;
+        self.watchpoint_dr_len = len;
+        self.watchpoint_dr_oneshot = oneshot;
+    }
+
+    /// Watch length in bytes for `DR` slots, applying the default when unset.
+    pub fn watchpoint_dr_len(&self) -> u8 {
+        match self.watchpoint_dr_len {
+            1 | 2 | 4 | 8 => self.watchpoint_dr_len,
+            _ => 4,
+        }
+    }
+
     /// Advance the watchpoint-decision PRNG and return whether this hit should
     /// force a preemption: true with probability `watchpoint_pct` percent. A
     /// dedicated xorshift64 stream (mirrors `next_preempt_interval`), so drawing
@@ -275,6 +311,9 @@ impl StateHash for ApicState {
         h.write_u64(self.preempt_deadline);
         h.write_u32(self.watchpoint_pct);
         h.write_u64(self.watchpoint_seed);
+        h.write_u8(u8::from(self.watchpoint_dr));
+        h.write_u8(self.watchpoint_dr_len);
+        h.write_u8(u8::from(self.watchpoint_dr_oneshot));
         h.finish()
     }
 }

@@ -103,6 +103,15 @@ pub struct EventConfig {
     /// watchpoints are batch re-protected to R+E (0 = use default). See
     /// `ApicState::configure_watchpoints`.
     pub watchpoint_rearm: u64,
+    /// Enable the hardware data-breakpoint race detector (DataCollider-style):
+    /// confirmed-shared writes arm a `DR` on the exact address, and a `#DB` from
+    /// a different thread is a realized race. Requires `watchpoint_pct != 0` for
+    /// candidates. See `ApicState::configure_watchpoint_dr`.
+    pub watchpoint_dr: bool,
+    /// Watch length in bytes for `DR` slots (0 = default 4).
+    pub watchpoint_dr_len: u8,
+    /// Disarm a `DR` slot on its first conflict (default true).
+    pub watchpoint_dr_oneshot: bool,
 }
 
 impl EventConfig {
@@ -190,6 +199,17 @@ impl EventConfig {
         self.watchpoint_cull_epochs = cull_epochs;
         self.watchpoint_cull_cap = cull_cap;
         self.watchpoint_rearm = rearm;
+        self
+    }
+
+    /// Enable the hardware data-breakpoint race detector. `len` is the watch
+    /// width in bytes (0 = default 4); `oneshot` disarms a slot on its first
+    /// conflict. Only effective alongside `with_watchpoints` (which supplies the
+    /// candidate addresses). See `ApicState::configure_watchpoint_dr`.
+    pub fn with_watchpoint_dr(mut self, len: u8, oneshot: bool) -> Self {
+        self.watchpoint_dr = true;
+        self.watchpoint_dr_len = len;
+        self.watchpoint_dr_oneshot = oneshot;
         self
     }
 

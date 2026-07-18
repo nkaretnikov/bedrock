@@ -18,6 +18,11 @@ use super::super::exits::raise_preempt_vector;
 #[cfg(feature = "cargo")]
 use crate::exits::raise_preempt_vector;
 
+#[cfg(not(feature = "cargo"))]
+use super::super::dr_watch::ArmResult;
+#[cfg(feature = "cargo")]
+use crate::dr_watch::ArmResult;
+
 const PAGE_SIZE: usize = 4096;
 
 // Arm-then-cull tuning for EPT write-watchpoints lives in ApicState
@@ -347,6 +352,38 @@ impl<V: VirtualMachineControlStructure, P: Page, I: InstructionCounter> ForkedVm
         Some(ExitHandlerResult::Continue)
     }
 
+    /// Arm a hardware data breakpoint on the EXACT address of a confirmed-shared
+    /// write (DataCollider-style), so a later access to that byte/word by a
+    /// *different* thread fires a `#DB` -- a realized data race. Unlike the EPT
+    /// watchpoint this is byte-granular and costs no INVEPT (arming is register
+    /// state programmed by the run loop). `#DB` interception is already enabled
+    /// for the whole run by the feature flag (see `apply_intercept_db`). Returns
+    /// whether a slot is now watching this address.
+    ///
+    /// The exact faulting linear address comes from `GuestLinearAddr`, set by the
+    /// EPT violation; a page-granular address would defeat the whole point.
+    fn wp_arm_dr(&mut self, owner_tid: u64) -> bool {
+        let gva = self
+            .state
+            .vmcs
+            .read_natural(VmcsFieldNatural::GuestLinearAddr)
+            .unwrap_or(0);
+        if gva == 0 {
+            return false;
+        }
+        let len = self.state.devices.apic.watchpoint_dr_len();
+        let epoch = self.wp_switch_epoch;
+        match self.state.debug_watch.arm(gva, len, owner_tid, epoch) {
+            ArmResult::Armed { .. } => self.state.exit_stats.wp_dr_armed += 1,
+            ArmResult::Evicted { .. } => {
+                self.state.exit_stats.wp_dr_armed += 1;
+                self.state.exit_stats.wp_dr_evictions += 1;
+            }
+            ArmResult::AlreadyWatched { .. } => return true,
+        }
+        true
+    }
+
     /// Get the parent's memory size.
     fn parent_memory_size(&self) -> usize {
         // SAFETY: Parent is valid as long as this ForkedVm exists (enforced by children_count)
@@ -547,6 +584,24 @@ impl<V: VirtualMachineControlStructure, P: Page, I: InstructionCounter> VmContex
                         // always makes progress); watchpoint_should_preempt still
                         // advances its PRNG on every CPL 3 confirmed hit.
                         if confirmed {
+                            // Hardware data-breakpoint mode (DataCollider): arm a
+                            // DR on the exact faulting address for this thread and
+                            // force a preemption so another thread runs while the
+                            // breakpoint is live. A #DB from a different thread is
+                            // then a realized race. The write is let through (the
+                            // DR, not the EPT page, now watches the location), so
+                            // this pays no per-write INVEPT.
+                            if self.state.devices.apic.watchpoint_dr {
+                                if cpl == 3 {
+                                    self.wp_arm_dr(tid);
+                                    if self.state.devices.apic.watchpoint_should_preempt()
+                                        && raise_preempt_vector(&mut self.state.devices.apic)
+                                    {
+                                        self.state.exit_stats.wp_preempts += 1;
+                                    }
+                                }
+                                return self.wp_grant_and_leave(page_gpa, hpa, allocator);
+                            }
                             if cpl == 3
                                 && self.state.devices.apic.watchpoint_should_preempt()
                                 && raise_preempt_vector(&mut self.state.devices.apic)
@@ -576,6 +631,18 @@ impl<V: VirtualMachineControlStructure, P: Page, I: InstructionCounter> VmContex
                                 c.confirmed = true;
                             }
                             self.state.exit_stats.wp_confirmed += 1;
+                            // DR mode: arm on the exact address at the moment we
+                            // confirm the page shared (this fault is already a
+                            // second-thread write, the strongest candidate).
+                            if self.state.devices.apic.watchpoint_dr {
+                                self.wp_arm_dr(tid);
+                                if self.state.devices.apic.watchpoint_should_preempt()
+                                    && raise_preempt_vector(&mut self.state.devices.apic)
+                                {
+                                    self.state.exit_stats.wp_preempts += 1;
+                                }
+                                return self.wp_grant_and_leave(page_gpa, hpa, allocator);
+                            }
                             if self.state.devices.apic.watchpoint_should_preempt()
                                 && raise_preempt_vector(&mut self.state.devices.apic)
                             {

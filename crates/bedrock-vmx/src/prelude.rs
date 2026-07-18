@@ -172,8 +172,12 @@ pub use crate::hypercalls::{
 // =============================================================================
 #[cfg(not(feature = "cargo"))]
 pub use super::cow::{CowPageMap, WatchpointClassMap, WpClass};
+#[cfg(not(feature = "cargo"))]
+pub use super::dr_watch::{DbOutcome, DebugWatch};
 #[cfg(feature = "cargo")]
 pub use crate::cow::{CowPageMap, WatchpointClassMap, WpClass};
+#[cfg(feature = "cargo")]
+pub use crate::dr_watch::{DbOutcome, DebugWatch};
 
 // =============================================================================
 // VM state

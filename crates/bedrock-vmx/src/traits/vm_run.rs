@@ -15,6 +15,11 @@ use super::{
     VirtualMachineControlStructure, VmContext, VmRunError, VmRunner,
 };
 
+#[cfg(not(feature = "cargo"))]
+use super::super::dr_hw;
+#[cfg(feature = "cargo")]
+use crate::dr_hw;
+
 // ========== GPR Sync Methods ==========
 
 /// Copy GPRs from GeneralPurposeRegisters to VmxContext guest registers.
@@ -133,6 +138,11 @@ where
 
     // Apply #PF interception to exception bitmap (requires VMCS to be loaded).
     ctx.state().apply_intercept_pf();
+
+    // Apply #DB interception for the hardware data-breakpoint race detector.
+    // Set when a DR slot is armed (see forked.rs wp_arm_dr) so the breakpoint's
+    // #DB traps to the hypervisor instead of the guest.
+    ctx.state().apply_intercept_db();
 
     // Initialize MTF state before the first VM entry. Without this, single-stepping
     // won't be active until the first deterministic exit triggers update_mtf_state(),
@@ -354,6 +364,32 @@ where
             pebs_pre_vm_entry(ctx, msr);
         }
 
+        // Swap in the guest hardware data breakpoints for the race detector.
+        // VMX does not save/restore DR0-3 or DR6 (only guest DR7 lives in the
+        // VMCS), so we save the host DRs, program the armed slot addresses into
+        // DR0-3, load the computed DR7 via the VMCS, run, then read back which
+        // fired (DR6) and restore the host DRs. Only when a slot is armed, so the
+        // common case pays nothing (mirrors the PEBS DS_AREA swap above). A #DB
+        // from a slot is caught by the exception bitmap and classified in
+        // handle_exception_nmi.
+        let dr_saved = if ctx.state().debug_watch.any_armed() {
+            let dw = &ctx.state().debug_watch;
+            let addrs = [
+                dw.slot(0).map_or(0, |s| s.gva),
+                dw.slot(1).map_or(0, |s| s.gva),
+                dw.slot(2).map_or(0, |s| s.gva),
+                dw.slot(3).map_or(0, |s| s.gva),
+            ];
+            let dr7 = dw.dr7();
+            let _ = ctx
+                .state()
+                .vmcs
+                .write_natural(VmcsFieldNatural::GuestDr7, dr7);
+            Some(dr_hw::program_guest_drs(&addrs))
+        } else {
+            None
+        };
+
         // Enter the guest.
         // We need to split the borrow here to get mutable access to vmx_ctx
         // while keeping immutable access to vmcs.
@@ -361,6 +397,13 @@ where
         // SAFETY: Caller guarantees VMCS is properly configured and loaded,
         // interrupts are disabled, and preemption cannot migrate us.
         let run_result = unsafe { runner.run(&mut state.vmx_ctx, &state.vmcs) };
+
+        // Capture which breakpoints fired (guest DR6) before restoring the host
+        // DRs; the #DB handler reads `dr6_capture`.
+        if let Some(saved) = dr_saved {
+            ctx.state_mut().dr6_capture = dr_hw::read_guest_dr6();
+            dr_hw::restore_host_drs(&saved);
+        }
 
         // Restore host PMU MSRs immediately after VM exit if we loaded our
         // PEBS state on entry. This must precede any other host-side MSR

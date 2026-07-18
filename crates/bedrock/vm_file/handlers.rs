@@ -561,6 +561,13 @@ pub(crate) fn handle_set_event_config<F: VmFileOps>(vm_file: &mut F, arg: usize)
         config.watchpoint_cull_cap,
         config.watchpoint_rearm,
     );
+    // Hardware data-breakpoint race detector: layer the exact-address DR trigger
+    // over the EPT candidate sampler (0 = disabled, EPT-only behavior).
+    state.devices.apic.configure_watchpoint_dr(
+        config.watchpoint_dr,
+        config.watchpoint_dr_len,
+        config.watchpoint_dr_oneshot,
+    );
 
     log_info!(
         "SET_EVENT_CONFIG: enabled={}, categories={:#x}, exit_trigger={:?}, exit_flags={:#x} for VM {}\n",
@@ -626,6 +633,10 @@ pub(crate) fn handle_get_exit_stats<F: VmFileOps>(vm_file: &F, arg: usize) -> is
         wp_epoch: stats.wp_epoch,
         wp_rearms: stats.wp_rearms,
         wp_rearm_pages: stats.wp_rearm_pages,
+        wp_dr_armed: stats.wp_dr_armed,
+        wp_dr_conflicts: stats.wp_dr_conflicts,
+        wp_dr_self: stats.wp_dr_self,
+        wp_dr_evictions: stats.wp_dr_evictions,
     };
 
     // SAFETY: `arg` is a user-provided pointer from the ioctl syscall, and `exit_stats`
