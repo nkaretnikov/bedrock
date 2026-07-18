@@ -637,6 +637,8 @@ pub(crate) fn handle_get_exit_stats<F: VmFileOps>(vm_file: &F, arg: usize) -> is
         wp_dr_conflicts: stats.wp_dr_conflicts,
         wp_dr_self: stats.wp_dr_self,
         wp_dr_evictions: stats.wp_dr_evictions,
+        wp_dr_sample_gva: stats.wp_dr_sample_gva,
+        wp_dr_sample_rip: stats.wp_dr_sample_rip,
     };
 
     // SAFETY: `arg` is a user-provided pointer from the ioctl syscall, and `exit_stats`

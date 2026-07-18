@@ -347,6 +347,8 @@ pub(crate) struct BedrockExitStats {
     pub wp_dr_conflicts: u64,
     pub wp_dr_self: u64,
     pub wp_dr_evictions: u64,
+    pub wp_dr_sample_gva: [u64; 8],
+    pub wp_dr_sample_rip: [u64; 8],
 }
 
 /// VM exit information returned to userspace from RUN ioctl.

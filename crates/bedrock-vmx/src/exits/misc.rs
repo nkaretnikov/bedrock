@@ -73,8 +73,24 @@ pub fn handle_exception_nmi<C: VmContext>(ctx: &mut C) -> ExitHandlerResult {
         let oneshot = ctx.state().devices.apic.watchpoint_dr_oneshot;
         let state = ctx.state_mut();
         match state.debug_watch.on_db(fired, tid, cpl, oneshot) {
-            DbOutcome::Conflict { .. } => {
+            DbOutcome::Conflict { gva, .. } => {
                 state.exit_stats.wp_dr_conflicts += 1;
+                // Diagnostic: record up to N DISTINCT racing addresses (+ the
+                // faulting RIP) into exit_stats so userspace sees the VARIETY of
+                // race sites, not repeats of the single hottest one. A watched
+                // gva is never 0 (guarded at arm time), so 0 marks an empty slot.
+                // Surfaced in the CLI output; the kernel log is not usable here.
+                let samples = &state.exit_stats.wp_dr_sample_gva;
+                if !samples.iter().any(|&g| g == gva) {
+                    if let Some(idx) = samples.iter().position(|&g| g == 0) {
+                        let rip = state
+                            .vmcs
+                            .read_natural(VmcsFieldNatural::GuestRip)
+                            .unwrap_or(0);
+                        state.exit_stats.wp_dr_sample_gva[idx] = gva;
+                        state.exit_stats.wp_dr_sample_rip[idx] = rip;
+                    }
+                }
                 // Nudge the scheduler at the conflict point to keep interleaving.
                 let _ = raise_preempt_vector(&mut state.devices.apic);
             }

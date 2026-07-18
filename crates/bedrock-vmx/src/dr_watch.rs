@@ -59,6 +59,8 @@ pub enum DbOutcome {
     /// A different thread touched a watched location: a race is realized.
     Conflict {
         slot: usize,
+        /// The watched guest linear address (the racing location).
+        gva: u64,
         owner_tid: u64,
         tid: u64,
     },
@@ -182,11 +184,13 @@ impl DebugWatch {
             };
             if cpl == 3 && tid != slot.owner_tid {
                 let owner_tid = slot.owner_tid;
+                let gva = slot.gva;
                 if oneshot {
                     self.slots[i] = None;
                 }
                 return DbOutcome::Conflict {
                     slot: i,
+                    gva,
                     owner_tid,
                     tid,
                 };
@@ -287,6 +291,7 @@ mod tests {
             w.on_db(0b0001, /*tid*/ 222, 3, true),
             DbOutcome::Conflict {
                 slot: 0,
+                gva: 0x1000,
                 owner_tid: 111,
                 tid: 222
             }

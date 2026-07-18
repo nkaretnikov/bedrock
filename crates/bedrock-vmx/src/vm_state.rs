@@ -830,6 +830,13 @@ pub struct AllExitStats {
     pub wp_dr_self: u64,
     /// `DR` slots evicted while still armed because all four were in use.
     pub wp_dr_evictions: u64,
+    /// Diagnostic sample: watched guest linear address of the first 8 detected
+    /// conflicts (0 = unused slot). Lets userspace see WHAT raced (bug variables
+    /// vs benign lock/arena words) without the kernel log.
+    pub wp_dr_sample_gva: [u64; 8],
+    /// Diagnostic sample: guest RIP at each of the first 8 conflicts (paired with
+    /// `wp_dr_sample_gva`), i.e. where the conflicting code was.
+    pub wp_dr_sample_rip: [u64; 8],
 }
 
 impl AllExitStats {
