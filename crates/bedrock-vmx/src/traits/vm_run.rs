@@ -398,10 +398,10 @@ where
         // interrupts are disabled, and preemption cannot migrate us.
         let run_result = unsafe { runner.run(&mut state.vmx_ctx, &state.vmcs) };
 
-        // Capture which breakpoints fired (guest DR6) before restoring the host
-        // DRs; the #DB handler reads `dr6_capture`.
+        // Restore the host DRs after guest execution. Which breakpoints fired is
+        // read from the VM-exit qualification in the #DB handler (a #DB VM exit
+        // does not update DR6), so nothing is captured here.
         if let Some(saved) = dr_saved {
-            ctx.state_mut().dr6_capture = dr_hw::read_guest_dr6();
             dr_hw::restore_host_drs(&saved);
         }
 

@@ -584,19 +584,22 @@ impl<V: VirtualMachineControlStructure, P: Page, I: InstructionCounter> VmContex
                         // always makes progress); watchpoint_should_preempt still
                         // advances its PRNG on every CPL 3 confirmed hit.
                         if confirmed {
-                            // Hardware data-breakpoint mode (DataCollider): arm a
-                            // DR on the exact faulting address for this thread and
-                            // force a preemption so another thread runs while the
-                            // breakpoint is live. A #DB from a different thread is
-                            // then a realized race. The write is let through (the
-                            // DR, not the EPT page, now watches the location), so
+                            // Hardware data-breakpoint mode (DataCollider): on a
+                            // sampled write (probability watchpoint_pct), arm a DR
+                            // on the exact faulting address for this thread AND
+                            // force a preemption, so another thread runs into the
+                            // breakpoint. A #DB from a different thread is then a
+                            // realized race. Arming is GATED on the same coin flip
+                            // as the preemption: otherwise every write to a
+                            // confirmed page arms a slot, and with only 4 slots the
+                            // set thrashes (a fresh slot is evicted before the
+                            // other thread reaches it). The write is let through
+                            // (the DR, not the EPT page, watches the location), so
                             // this pays no per-write INVEPT.
                             if self.state.devices.apic.watchpoint_dr {
-                                if cpl == 3 {
+                                if cpl == 3 && self.state.devices.apic.watchpoint_should_preempt() {
                                     self.wp_arm_dr(tid);
-                                    if self.state.devices.apic.watchpoint_should_preempt()
-                                        && raise_preempt_vector(&mut self.state.devices.apic)
-                                    {
+                                    if raise_preempt_vector(&mut self.state.devices.apic) {
                                         self.state.exit_stats.wp_preempts += 1;
                                     }
                                 }

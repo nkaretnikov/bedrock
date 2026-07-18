@@ -89,6 +89,12 @@ WATCHPOINT_CULL_CAP="${BEDROCK_WATCHPOINT_CULL_CAP:-256}"       # fault-count ba
 WATCHPOINT_DR="${BEDROCK_WATCHPOINT_DR:-0}"                     # enable DR race detector; 0=off
 WATCHPOINT_DR_LEN="${BEDROCK_WATCHPOINT_DR_LEN:-4}"            # DR watch width in bytes (1/2/4/8)
 WATCHPOINT_DR_ONESHOT="${BEDROCK_WATCHPOINT_DR_ONESHOT:-1}"   # disarm a slot on first conflict; 0=keep armed
+# Per-fork wall-clock timeout (seconds). A child that livelocks (no forward
+# progress -- e.g. under heavy forced preemption) would otherwise hang the whole
+# sweep, since a fork has no internal watchdog visible here. On timeout the child
+# is killed and counted as a no-trigger fork (its schedule is deterministic, so a
+# timed-out seed reproduces). 0 disables the timeout (old behavior).
+FORK_TIMEOUT="${FORK_TIMEOUT:-120}"
 TARGETS=(blackscholes streamcluster fluidanimate)
 
 # Capture lsmod and string-match it, rather than `lsmod | grep -q`: under
@@ -195,7 +201,11 @@ while [ "$forks" -lt "$MAX" ]; do
   # shutdown, so the child exits 0. A late-inject abort makes the child exit
   # non-zero; capture rc without tripping `set -e`.
   child_rc=0
-  out=$(cd "$REPO_ROOT" && BEDROCK_PARENT_ID="$PARENT_ID" RDRAND_SEED="$seed" \
+  # `timeout` (coreutils) bounds a livelocking fork; FORK_TIMEOUT=0 disables it.
+  # SIGKILL after a short grace so a wedged child cannot ignore the signal.
+  timeout_cmd=()
+  [ "$FORK_TIMEOUT" != "0" ] && timeout_cmd=(timeout --kill-after=10 "$FORK_TIMEOUT")
+  out=$(cd "$REPO_ROOT" && "${timeout_cmd[@]}" env BEDROCK_PARENT_ID="$PARENT_ID" RDRAND_SEED="$seed" \
         BEDROCK_PREEMPT_PERIOD="$PREEMPT_PERIOD" \
         BEDROCK_WATCHPOINT_PCT="$WATCHPOINT_PCT" \
         BEDROCK_WATCHPOINT_REARM="$WATCHPOINT_REARM" \
@@ -206,8 +216,15 @@ while [ "$forks" -lt "$MAX" ]; do
         BEDROCK_WATCHPOINT_DR_ONESHOT="$WATCHPOINT_DR_ONESHOT" \
         nix run .#test-racebench-fork-child 2>&1) || child_rc=$?
 
-  # Classify the fork. `case` (not `printf | grep -q`) avoids the pipefail/SIGPIPE
-  # trap noted above.
+  # Classify the fork. A timed-out fork (timeout exits 124, or 137 if it needed
+  # SIGKILL) is checked first: it is a livelock/too-slow schedule that was killed,
+  # contributes no coverage, but still counts toward the plateau (falls through to
+  # the bug-id parse below, which finds no triggers). `case` (not `printf |
+  # grep -q`) avoids the pipefail/SIGPIPE trap noted above.
+  if [ "$child_rc" = 124 ] || [ "$child_rc" = 137 ]; then
+    aborts=$((aborts + 1))
+    echo "fork $forks seed $seed: TIMEOUT after ${FORK_TIMEOUT}s (livelock/too slow; killed, rc=$child_rc)" >&2
+  else
   case "$out" in
     *"RaceBench workload: OK"*) : ;;
     *"Late-inject abort"*|*"injected late"*)
@@ -222,6 +239,7 @@ while [ "$forks" -lt "$MAX" ]; do
       echo "fork $forks seed $seed: WARNING fork did not complete cleanly (no OK marker, rc=$child_rc)" >&2
       ;;
   esac
+  fi
 
   # Parse "<name>: BUG TRIGGERED (rc=...) bug_ids: 3 7" lines; update per-target
   # union and plateau counters. Targets with no trigger this fork just increment.

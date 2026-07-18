@@ -6,14 +6,15 @@
 //! VMX does not save/restore DR0-3 or DR6 across VM entry/exit (only guest DR7
 //! lives in the VMCS), so the run loop must swap them by hand, exactly like the
 //! PEBS `IA32_DS_AREA` swap: save the host values, program the guest breakpoints,
-//! run, read back which fired (DR6), then restore the host values. KVM does the
-//! same in `kvm_load_guest_debug_regs` / `switch_db_regs`.
+//! run, then restore the host values. KVM does the same in
+//! `kvm_load_guest_debug_regs` / `switch_db_regs`. Which breakpoint fired is NOT
+//! read back from DR6: a `#DB` that causes a VM exit does not update DR6, so the
+//! `#DB` handler reads the VM-exit qualification (bits 3:0) instead.
 //!
 //! This is real hardware access, so it exists only in the kernel build. Under the
 //! `cargo` feature the whole thing is a no-op: `program_guest_drs` returns an
-//! empty token, `read_guest_dr6` returns 0, and `restore_host_drs` does nothing,
-//! so the run loop and the `#DB` handler compile and run in unit tests with the
-//! detector simply inert (DR6 always 0 -> every classified `#DB` is `NotOurs`).
+//! empty token and `restore_host_drs` does nothing, so the run loop and the `#DB`
+//! handler compile and run in unit tests with the detector simply inert.
 
 use super::dr_watch::NUM_SLOTS;
 
@@ -71,18 +72,6 @@ pub fn program_guest_drs(addrs: &[u64; NUM_SLOTS]) -> HostDrState {
     }
 }
 
-/// Read hardware DR6 after VM exit: bits 0-3 (`B0-B3`) say which breakpoints
-/// fired during guest execution.
-#[cfg(all(target_arch = "x86_64", not(feature = "cargo")))]
-pub fn read_guest_dr6() -> u64 {
-    // SAFETY: reading DR6 at CPL 0 has no side effects.
-    unsafe {
-        let dr6: u64;
-        core::arch::asm!("mov {}, dr6", out(reg) dr6, options(nostack, preserves_flags));
-        dr6
-    }
-}
-
 /// Restore the host DR state saved by `program_guest_drs`. DR7 is written last so
 /// the host's breakpoints are only re-enabled once DR0-3 hold the host values.
 #[cfg(all(target_arch = "x86_64", not(feature = "cargo")))]
@@ -106,11 +95,6 @@ pub fn restore_host_drs(s: &HostDrState) {
 #[cfg(any(feature = "cargo", not(target_arch = "x86_64")))]
 pub fn program_guest_drs(_addrs: &[u64; NUM_SLOTS]) -> HostDrState {
     HostDrState
-}
-
-#[cfg(any(feature = "cargo", not(target_arch = "x86_64")))]
-pub fn read_guest_dr6() -> u64 {
-    0
 }
 
 #[cfg(any(feature = "cargo", not(target_arch = "x86_64")))]

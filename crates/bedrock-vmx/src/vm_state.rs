@@ -1153,10 +1153,6 @@ pub struct VmState<V: VirtualMachineControlStructure, I: InstructionCounter> {
     /// write-watchpoint hits; a `#DB` from a thread other than a slot's owner is
     /// a realized data race. Inert unless `devices.apic.watchpoint_dr` is set.
     pub debug_watch: DebugWatch,
-    /// `DR6` captured by the run loop immediately after VM exit (VMX does not
-    /// save `DR6`). Read by the `#DB` handler to find which slot fired; the run
-    /// loop clears hardware `DR6` after capturing it.
-    pub dr6_capture: u64,
     /// When true, a PEBS skid that exceeds `get_pebs_margin()` is tolerated:
     /// the handler records `max_pebs_skid` and continues (the old best-effort
     /// behavior). When false (the default), such a skid aborts the run
@@ -1459,7 +1455,6 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             vpid,
             intercept_pf: false,
             debug_watch: DebugWatch::new(),
-            dr6_capture: 0,
             ignore_pebs_margin: false,
             ignore_late_inject: false,
             pebs_state: None,
@@ -2391,7 +2386,6 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             vpid: 0, // Tests don't use VPID
             intercept_pf: false,
             debug_watch: DebugWatch::new(),
-            dr6_capture: 0,
             ignore_pebs_margin: false,
             ignore_late_inject: false,
             pebs_state: None,
@@ -2665,7 +2659,6 @@ impl<V: VirtualMachineControlStructure, I: InstructionCounter> VmState<V, I> {
             // DR race-detector slots are per-run hardware state: start empty in
             // the child (the config that enables them is inherited via devices).
             debug_watch: DebugWatch::new(),
-            dr6_capture: 0,
             // Inherit the strict/ignore policies so forked children enforce the
             // same PEBS-margin and late-inject invariants as their parent run.
             ignore_pebs_margin: parent_state.ignore_pebs_margin,
