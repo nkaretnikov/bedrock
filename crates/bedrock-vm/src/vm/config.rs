@@ -112,6 +112,12 @@ pub struct EventConfig {
     pub watchpoint_dr_len: u8,
     /// Disarm a `DR` slot on its first conflict (default true).
     pub watchpoint_dr_oneshot: bool,
+    /// Low bound (inclusive) of the RIP window a `DR` candidate must fault from
+    /// to be armed (0 with `watchpoint_dr_rip_hi == 0` disables the filter). See
+    /// `ApicState::watchpoint_dr_rip_allowed`.
+    pub watchpoint_dr_rip_lo: u64,
+    /// High bound (exclusive) of the `DR`-candidate RIP window (0 = filter off).
+    pub watchpoint_dr_rip_hi: u64,
 }
 
 impl EventConfig {
@@ -204,12 +210,16 @@ impl EventConfig {
 
     /// Enable the hardware data-breakpoint race detector. `len` is the watch
     /// width in bytes (0 = default 4); `oneshot` disarms a slot on its first
-    /// conflict. Only effective alongside `with_watchpoints` (which supplies the
-    /// candidate addresses). See `ApicState::configure_watchpoint_dr`.
-    pub fn with_watchpoint_dr(mut self, len: u8, oneshot: bool) -> Self {
+    /// conflict. `rip_lo`/`rip_hi` bound the RIP window a candidate must fault
+    /// from to be armed (`rip_hi == 0` disables the filter). Only effective
+    /// alongside `with_watchpoints` (which supplies the candidate addresses).
+    /// See `ApicState::configure_watchpoint_dr`.
+    pub fn with_watchpoint_dr(mut self, len: u8, oneshot: bool, rip_lo: u64, rip_hi: u64) -> Self {
         self.watchpoint_dr = true;
         self.watchpoint_dr_len = len;
         self.watchpoint_dr_oneshot = oneshot;
+        self.watchpoint_dr_rip_lo = rip_lo;
+        self.watchpoint_dr_rip_hi = rip_hi;
         self
     }
 

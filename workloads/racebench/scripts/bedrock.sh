@@ -89,12 +89,31 @@ WATCHPOINT_CULL_CAP="${BEDROCK_WATCHPOINT_CULL_CAP:-256}"       # fault-count ba
 WATCHPOINT_DR="${BEDROCK_WATCHPOINT_DR:-0}"                     # enable DR race detector; 0=off
 WATCHPOINT_DR_LEN="${BEDROCK_WATCHPOINT_DR_LEN:-4}"            # DR watch width in bytes (1/2/4/8)
 WATCHPOINT_DR_ONESHOT="${BEDROCK_WATCHPOINT_DR_ONESHOT:-1}"   # disarm a slot on first conflict; 0=keep armed
+# DR candidate RIP-window filter. Only arm a DR when the racy access faults from
+# [RIP_LO, RIP_HI): keeps library-internal shared writes (malloc/futex/stdio,
+# whose RIPs live in the 0x7f... shared-object mapping) from monopolizing the 4
+# slots, so cold in-target race sites (the rb_state bug words, faulted from the
+# PIE target text) actually get watched. Default HI=0x7f0000000000 excludes the
+# whole shared-library region while keeping target (0x55...) and the low static
+# helper. To watch ONLY the PIE target region (also excluding the 0x42b617 static
+# helper), tighten to LO=0x550000000000 HI=0x570000000000. RIP_HI=0 = filter off.
+WATCHPOINT_DR_RIP_LO="${BEDROCK_WATCHPOINT_DR_RIP_LO:-0}"          # arm-window low bound (inclusive)
+WATCHPOINT_DR_RIP_HI="${BEDROCK_WATCHPOINT_DR_RIP_HI:-0x7f0000000000}"  # arm-window high bound (exclusive); 0=off
 # Per-fork wall-clock timeout (seconds). A child that livelocks (no forward
 # progress -- e.g. under heavy forced preemption) would otherwise hang the whole
 # sweep, since a fork has no internal watchdog visible here. On timeout the child
 # is killed and counted as a no-trigger fork (its schedule is deterministic, so a
 # timed-out seed reproduces). 0 disables the timeout (old behavior).
 FORK_TIMEOUT="${FORK_TIMEOUT:-120}"
+# Circuit breaker. A per-fork leak on the held parent (child VM slots filling the
+# kernel's fixed MAX_TRACKED_VMS=1024 table -> ENOSPC, or the parent process being
+# OOM-killed under an accumulating COW/Arc leak -> parent-not-found) makes EVERY
+# subsequent fork fail the same way. Without a breaker the sweep grinds all the
+# way to MAX firing thousands of doomed forks (a 6000-fork run wasted ~4900 that
+# way and hid the cause). Abort after this many CONSECUTIVE non-clean forks: an
+# occasional timeout/late-inject resets the counter when the next fork completes,
+# but a systemic break trips it fast and prints the captured child error. 0=off.
+FAIL_ABORT="${FAIL_ABORT:-25}"
 TARGETS=(blackscholes streamcluster fluidanimate)
 
 # Capture lsmod and string-match it, rather than `lsmod | grep -q`: under
@@ -181,10 +200,11 @@ declare -A reached                  # target -> space-separated union of bug ids
 declare -A noNew                    # target -> consecutive forks with no new bug
 for t in "${TARGETS[@]}"; do reached[$t]=""; noNew[$t]=0; done
 
-echo "--- bedrock coverage (fork): boot_seed=$BOOT_SEED seed_base=$SEED_BASE plateau=$PLATEAU max=$MAX preempt_period=$PREEMPT_PERIOD watchpoint_pct=$WATCHPOINT_PCT watchpoint_rearm=$WATCHPOINT_REARM watchpoint_cull_epochs=$WATCHPOINT_CULL_EPOCHS watchpoint_cull_cap=$WATCHPOINT_CULL_CAP watchpoint_dr=$WATCHPOINT_DR watchpoint_dr_len=$WATCHPOINT_DR_LEN watchpoint_dr_oneshot=$WATCHPOINT_DR_ONESHOT ---"
+echo "--- bedrock coverage (fork): boot_seed=$BOOT_SEED seed_base=$SEED_BASE plateau=$PLATEAU max=$MAX preempt_period=$PREEMPT_PERIOD watchpoint_pct=$WATCHPOINT_PCT watchpoint_rearm=$WATCHPOINT_REARM watchpoint_cull_epochs=$WATCHPOINT_CULL_EPOCHS watchpoint_cull_cap=$WATCHPOINT_CULL_CAP watchpoint_dr=$WATCHPOINT_DR watchpoint_dr_len=$WATCHPOINT_DR_LEN watchpoint_dr_oneshot=$WATCHPOINT_DR_ONESHOT watchpoint_dr_rip_lo=$WATCHPOINT_DR_RIP_LO watchpoint_dr_rip_hi=$WATCHPOINT_DR_RIP_HI ---"
 
 forks=0
 aborts=0
+consec_fail=0                       # consecutive non-clean forks; feeds the circuit breaker
 while [ "$forks" -lt "$MAX" ]; do
   # Stop once every target has plateaued.
   done_all=1
@@ -192,6 +212,16 @@ while [ "$forks" -lt "$MAX" ]; do
     [ "${noNew[$t]}" -lt "$PLATEAU" ] && done_all=0
   done
   [ "$done_all" -eq 1 ] && break
+
+  # Parent-liveness recheck. The held fork parent was verified once at boot, but a
+  # long sweep can outlive it: an accumulating per-fork leak can get the 5GB parent
+  # OOM-killed, after which every child forks off a dead parent_id and fails. Catch
+  # that here with a clear cause instead of grinding out doomed forks to MAX.
+  if [ -n "$parent_pid" ] && ! kill -0 "$parent_pid" 2>/dev/null; then
+    echo "ERROR: fork parent (pid $parent_pid, vm_id=$PARENT_ID) died at fork $forks -- every subsequent fork would fail off a dead parent. Stopping. Parent log tail:" >&2
+    tail -20 "$parent_log" >&2 2>/dev/null || true
+    break
+  fi
 
   seed=$((SEED_BASE + forks))
   forks=$((forks + 1))
@@ -214,6 +244,8 @@ while [ "$forks" -lt "$MAX" ]; do
         BEDROCK_WATCHPOINT_DR="$WATCHPOINT_DR" \
         BEDROCK_WATCHPOINT_DR_LEN="$WATCHPOINT_DR_LEN" \
         BEDROCK_WATCHPOINT_DR_ONESHOT="$WATCHPOINT_DR_ONESHOT" \
+        BEDROCK_WATCHPOINT_DR_RIP_LO="$WATCHPOINT_DR_RIP_LO" \
+        BEDROCK_WATCHPOINT_DR_RIP_HI="$WATCHPOINT_DR_RIP_HI" \
         nix run .#test-racebench-fork-child 2>&1) || child_rc=$?
 
   # Classify the fork. A timed-out fork (timeout exits 124, or 137 if it needed
@@ -221,12 +253,13 @@ while [ "$forks" -lt "$MAX" ]; do
   # contributes no coverage, but still counts toward the plateau (falls through to
   # the bug-id parse below, which finds no triggers). `case` (not `printf |
   # grep -q`) avoids the pipefail/SIGPIPE trap noted above.
+  fork_ok=0                          # set only when the child prints the OK marker; resets the breaker
   if [ "$child_rc" = 124 ] || [ "$child_rc" = 137 ]; then
     aborts=$((aborts + 1))
     echo "fork $forks seed $seed: TIMEOUT after ${FORK_TIMEOUT}s (livelock/too slow; killed, rc=$child_rc)" >&2
   else
   case "$out" in
-    *"RaceBench workload: OK"*) : ;;
+    *"RaceBench workload: OK"*) fork_ok=1 ;;
     *"Late-inject abort"*|*"injected late"*)
       # A late inject INSIDE a scored schedule: the child could not be delivered
       # deterministically. This is the signal the strict abort exists to surface
@@ -237,8 +270,30 @@ while [ "$forks" -lt "$MAX" ]; do
       ;;
     *)
       echo "fork $forks seed $seed: WARNING fork did not complete cleanly (no OK marker, rc=$child_rc)" >&2
+      # Dump the child's tail so the FAILURE REASON is captured, not discarded. A
+      # fork that cannot start (dead parent, VM cap, OOM) prints no exit-stats
+      # block, so without this the log records only "rc=1" and the cause is lost --
+      # exactly what made the ~1100-fork cliff undiagnosable. Tail only (the block
+      # is short on failure) and indent so it is greppable as fork-child-err.
+      printf '%s\n' "$out" | tail -20 | sed "s/^/fork $forks seed $seed: fork-child-err| /" >&2
       ;;
   esac
+  fi
+
+  # Circuit breaker. A clean fork resets the streak; any non-clean fork extends it.
+  # A systemic break (ENOSPC once the parent's VM table fills, or a dead parent)
+  # fails every fork the same way, so the streak reaches FAIL_ABORT quickly. Abort
+  # then, rather than firing thousands more doomed forks -- the fork-child-err dump
+  # just above names the cause (e.g. "Failed to create VM: ENOSPC" = 1024-slot VM
+  # table full = per-fork slot leak; "parent ... not found" = parent process gone).
+  if [ "$fork_ok" = 1 ]; then
+    consec_fail=0
+  else
+    consec_fail=$((consec_fail + 1))
+    if [ "$FAIL_ABORT" != 0 ] && [ "$consec_fail" -ge "$FAIL_ABORT" ]; then
+      echo "ERROR: $consec_fail consecutive forks failed to complete cleanly (through fork $forks, seed $seed) -- systemic break, not a coverage result. Stopping the sweep. See the fork-child-err lines above for the cause (ENOSPC = kernel VM-table full; parent-not-found = parent died). Set FAIL_ABORT=0 to disable this breaker." >&2
+      break
+    fi
   fi
 
   # Parse "<name>: BUG TRIGGERED (rc=...) bug_ids: 3 7" lines; update per-target
@@ -274,6 +329,28 @@ while [ "$forks" -lt "$MAX" ]; do
   done
   [ -n "$newmsg" ] && newmsg=" NEW:$newmsg"
   echo "fork $forks seed $seed: coverage ${total_now}/60; slowest-plateau ${minplat}/${PLATEAU}${newmsg}" >&2
+
+  # DR race-detector harvest. The child prints ONE exit-stats block per fork (the
+  # whole corpus runs in one child), so its `dr_conflicts=` count and the
+  # `dr_conflict[i]: gva=.. rip=..` samples live in $out. The classification above
+  # never dumps $out, so without this the per-seed DR data is lost. Emit one
+  # compact line per fork (count always, so the sweep is a per-seed dataset;
+  # gva=rip sites only when nonzero) into the tee'd log. Inert when DR is off.
+  if [ "$WATCHPOINT_DR" != 0 ]; then
+    drc=$(printf '%s\n' "$out" | sed -n 's/.*dr_conflicts=\([0-9][0-9]*\).*/\1/p' | tail -1)
+    [ -z "$drc" ] && drc=0
+    # sed (not grep -oE): grep exits 1 on no-match, and under `set -o pipefail`
+    # that fails the whole command substitution and `set -e` would abort the
+    # sweep. A timed-out fork prints no exit-stats block, so no-match is normal.
+    drsites=$(printf '%s\n' "$out" \
+      | sed -n 's/.*dr_conflict\[[0-9]*\]: \(gva=0x[0-9a-f]* rip=0x[0-9a-f]*\).*/\1/p' \
+      | tr '\n' ';')
+    if [ "$drc" != 0 ]; then
+      echo "fork $forks seed $seed: DR dr_conflicts=$drc sites: ${drsites%;}" >&2
+    else
+      echo "fork $forks seed $seed: DR dr_conflicts=0" >&2
+    fi
+  fi
 done
 
 total=0

@@ -133,6 +133,17 @@ pub struct ApicState {
     /// Disarm a `DR` slot as soon as it reports a conflict (default true) so a
     /// hot shared word does not re-fire a `#DB` every access. Config, not state.
     pub watchpoint_dr_oneshot: bool,
+    /// Low bound (inclusive) of the RIP window a `DR` candidate must fault from
+    /// to be armed. With `watchpoint_dr_rip_hi`, restricts arming to accesses
+    /// made by code in `[lo, hi)` -- e.g. the target executable's text -- so the
+    /// 4 slots are not monopolized by high-frequency library-internal shared
+    /// writes (malloc arena, futex, stdio locks) that are not injected-bug races.
+    /// Config, not state. See `watchpoint_dr_rip_allowed`.
+    pub watchpoint_dr_rip_lo: u64,
+    /// High bound (exclusive) of the `DR`-candidate RIP window. `0` disables the
+    /// filter entirely (any faulting RIP may arm a slot -- the original
+    /// behavior). Config, not state.
+    pub watchpoint_dr_rip_hi: u64,
 }
 
 impl Default for ApicState {
@@ -181,6 +192,10 @@ impl Default for ApicState {
             watchpoint_dr: false,
             watchpoint_dr_len: 0,
             watchpoint_dr_oneshot: true,
+            // RIP-window candidate filter off by default (hi == 0): any faulting
+            // RIP may arm a slot, as before.
+            watchpoint_dr_rip_lo: 0,
+            watchpoint_dr_rip_hi: 0,
         }
     }
 }
@@ -246,10 +261,29 @@ impl ApicState {
     /// width in bytes (0 = default 4); `oneshot` disarms a slot on its first
     /// conflict. The EPT watchpoint sampler (`configure_watchpoints`) must also
     /// be enabled to supply candidate addresses.
-    pub fn configure_watchpoint_dr(&mut self, enabled: bool, len: u8, oneshot: bool) {
+    pub fn configure_watchpoint_dr(
+        &mut self,
+        enabled: bool,
+        len: u8,
+        oneshot: bool,
+        rip_lo: u64,
+        rip_hi: u64,
+    ) {
         self.watchpoint_dr = enabled;
         self.watchpoint_dr_len = len;
         self.watchpoint_dr_oneshot = oneshot;
+        self.watchpoint_dr_rip_lo = rip_lo;
+        self.watchpoint_dr_rip_hi = rip_hi;
+    }
+
+    /// Whether a `DR` candidate faulting from `rip` is inside the configured
+    /// arming window. `watchpoint_dr_rip_hi == 0` disables the filter (always
+    /// allowed). Otherwise the access must come from `[rip_lo, rip_hi)` -- used
+    /// to keep library-internal shared writes (whose RIPs sit in the shared-
+    /// object mapping, not the target text) from consuming the 4 slots.
+    pub fn watchpoint_dr_rip_allowed(&self, rip: u64) -> bool {
+        self.watchpoint_dr_rip_hi == 0
+            || (rip >= self.watchpoint_dr_rip_lo && rip < self.watchpoint_dr_rip_hi)
     }
 
     /// Watch length in bytes for `DR` slots, applying the default when unset.
@@ -314,6 +348,38 @@ impl StateHash for ApicState {
         h.write_u8(u8::from(self.watchpoint_dr));
         h.write_u8(self.watchpoint_dr_len);
         h.write_u8(u8::from(self.watchpoint_dr_oneshot));
+        h.write_u64(self.watchpoint_dr_rip_lo);
+        h.write_u64(self.watchpoint_dr_rip_hi);
         h.finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dr_rip_filter_off_by_default_allows_any() {
+        let a = ApicState::default();
+        // hi == 0 => filter disabled: every RIP is allowed, including 0.
+        assert!(a.watchpoint_dr_rip_allowed(0));
+        assert!(a.watchpoint_dr_rip_allowed(0x7f00_1234_5678));
+        assert!(a.watchpoint_dr_rip_allowed(0x42b617));
+    }
+
+    #[test]
+    fn dr_rip_filter_gates_to_window() {
+        let mut a = ApicState::default();
+        // Target text window; exclude the shared-library (0x7f...) region.
+        a.configure_watchpoint_dr(true, 4, true, 0x5500_0000_0000, 0x5600_0000_0000);
+        // In-window target RIP: allowed.
+        assert!(a.watchpoint_dr_rip_allowed(0x5592_ae73_d026));
+        // Library RIP (malloc/futex/stdio) above the window: rejected.
+        assert!(!a.watchpoint_dr_rip_allowed(0x7f5e_58a6_c58d));
+        // Static-helper RIP below the window: rejected.
+        assert!(!a.watchpoint_dr_rip_allowed(0x42b617));
+        // Boundaries: lo inclusive, hi exclusive.
+        assert!(a.watchpoint_dr_rip_allowed(0x5500_0000_0000));
+        assert!(!a.watchpoint_dr_rip_allowed(0x5600_0000_0000));
     }
 }

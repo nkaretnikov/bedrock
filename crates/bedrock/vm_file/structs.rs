@@ -248,6 +248,11 @@ pub(crate) struct BedrockEventConfig {
     pub watchpoint_dr_len: u8,
     /// Disarm a `DR` slot on its first conflict (default true).
     pub watchpoint_dr_oneshot: bool,
+    /// Low bound (inclusive) of the RIP window a `DR` candidate must fault from
+    /// to be armed (`watchpoint_dr_rip_hi == 0` disables the filter).
+    pub watchpoint_dr_rip_lo: u64,
+    /// High bound (exclusive) of the `DR`-candidate RIP window (0 = filter off).
+    pub watchpoint_dr_rip_hi: u64,
 }
 
 /// Per-exit-type statistics for userspace.

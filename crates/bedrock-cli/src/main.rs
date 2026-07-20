@@ -281,7 +281,14 @@ fn build_event_config(args: &Args) -> EventConfig {
             // Oneshot on by default; set BEDROCK_WATCHPOINT_DR_ONESHOT=0 to keep
             // a slot armed after a conflict (catch repeated conflicts on a word).
             let oneshot = env_u64("BEDROCK_WATCHPOINT_DR_ONESHOT").unwrap_or(1) != 0;
-            config = config.with_watchpoint_dr(len, oneshot);
+            // RIP-window candidate filter: only arm a DR when the racy access
+            // faults from [RIP_LO, RIP_HI). Keeps library-internal shared writes
+            // (malloc/futex/stdio, whose RIPs live in the shared-object mapping)
+            // from monopolizing the 4 slots so cold in-target race sites get
+            // watched. RIP_HI unset/0 = filter off (any RIP may arm), unchanged.
+            let rip_lo = env_u64("BEDROCK_WATCHPOINT_DR_RIP_LO").unwrap_or(0);
+            let rip_hi = env_u64("BEDROCK_WATCHPOINT_DR_RIP_HI").unwrap_or(0);
+            config = config.with_watchpoint_dr(len, oneshot, rip_lo, rip_hi);
         }
     }
     config

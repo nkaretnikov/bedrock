@@ -567,6 +567,8 @@ pub(crate) fn handle_set_event_config<F: VmFileOps>(vm_file: &mut F, arg: usize)
         config.watchpoint_dr,
         config.watchpoint_dr_len,
         config.watchpoint_dr_oneshot,
+        config.watchpoint_dr_rip_lo,
+        config.watchpoint_dr_rip_hi,
     );
 
     log_info!(

@@ -371,6 +371,21 @@ impl<V: VirtualMachineControlStructure, P: Page, I: InstructionCounter> ForkedVm
         if gva == 0 {
             return false;
         }
+        // RIP-window candidate filter. A candidate is only worth a scarce DR slot
+        // if the racy access comes from code in the configured window (typically
+        // the target executable's text): library-internal shared writes
+        // (malloc/futex/stdio) fault from the shared-object mapping and would
+        // otherwise monopolize all 4 slots, starving the cold in-target race
+        // sites. Skip arming (but not the paired preemption, decided at the call
+        // site) when the faulting RIP is out of window. Disabled when rip_hi == 0.
+        let rip = self
+            .state
+            .vmcs
+            .read_natural(VmcsFieldNatural::GuestRip)
+            .unwrap_or(0);
+        if !self.state.devices.apic.watchpoint_dr_rip_allowed(rip) {
+            return false;
+        }
         let len = self.state.devices.apic.watchpoint_dr_len();
         let epoch = self.wp_switch_epoch;
         match self.state.debug_watch.arm(gva, len, owner_tid, epoch) {
