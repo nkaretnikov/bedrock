@@ -63,7 +63,7 @@ Any single boot fires at most a handful (each needs its own interleaving), so 60
 is the full ground-truth space the scheduler tries to reach across seeds, not
 what one run hits.
 
-Only variant `.1` of each target is vendored. Upstream ships five variants per
+Only variant `.1` of each target is used. Upstream ships five variants per
 program (`blackscholes.1`..`blackscholes.5`); a variant is a different random
 injection instance of the *same* program (a different set of 20 bugs at
 different sites), so `.2`..`.5` would add bug diversity in code we already build,
@@ -72,7 +72,7 @@ while a new program name (e.g. `pigz`) adds new concurrency structure.
 ### Bug types
 
 We do **not** have a per-bug type label: upstream RaceBench does not tag bugs by
-category, and nothing in the vendored files does either. All 20 bugs per target
+category, and nothing in the fetched files does either. All 20 bugs per target
 are the same fundamental kind: a hidden state machine (the `rb_stateN` struct of
 counters plus a mutex) whose code is spliced into the real program across
 threads. It reads the input file (`rb_input`) and shared racing variables, and
@@ -83,23 +83,27 @@ invariant violation (data-race / atomicity- / order-violation style) that aborts
 via SIGABRT: there are no deadlock or livelock bugs, and `trigger_num[i]` records
 only *which* id fired, not a type.
 
-To add more later: vendor another target's `code/` (instrumented source +
-`racebench*.{c,h}` + its Makefile) and a few `input/` files under
-`fuzz/targets/<name>/`, add its name to the loops in `fuzz/Dockerfile` and
-`fuzz/run.sh`, and confirm it builds and runs clean.
+To add more later: add another target's name to the `TARGETS` list in
+`fuzz/fetch_targets.sh` (it must exist upstream as `<name>.1/code`) and to the
+loops in `fuzz/Dockerfile` and `fuzz/run.sh`, then confirm it builds and runs
+clean.
 
 ## Provenance and licensing
 
-Sources are vendored (not fetched at build time) from RaceBench, pinned to:
+The target corpus is **not vendored**. `fuzz/fetch_targets.sh` downloads it from
+RaceBench at build time (called by `build.sh`), pinned to a single commit:
 
 - Data:    https://github.com/rb130/RaceBenchData  commit `cb79cc5` (2023-04-03)
 - Tooling: https://github.com/rb130/RaceBench      commit `8c4b3e8`
 
-Only the files necessary to build and run each target are vendored (the
-instrumented program source, the RaceBench harness `racebench*.{c,h}`, the
-target's own Makefile/`rb-build`, and three input files). Prebuilt binaries,
-`.o` files, Windows project files, sample data, and unused build variants were
-dropped.
+The pinned commit lives in `fetch_targets.sh` (`RB_DATA_COMMIT`); bump it there
+and update the hash above to move the corpus. The fetch is a partial + sparse
+clone that pulls only each target's `.1/code` tree and three input files. It
+never downloads upstream's prebuilt binaries (`<name>.1/install/`): those are
+explicitly untrusted, and every target is compiled from source by
+`fuzz/Dockerfile`. The extra source files a full `code/` tree carries (SIMD
+variants, Windows project files, sample data) are ignored by the build's
+Makefiles and never reach the image.
 
 Licenses:
 

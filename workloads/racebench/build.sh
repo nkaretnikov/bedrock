@@ -30,6 +30,11 @@ DOCKER="${DOCKER:-docker}"
 trap 'rm -f fuzz/libvmcall.h' EXIT
 cp ../../guest/libvmcall.h fuzz/libvmcall.h
 
+# Fetch the RaceBench target corpus into the build context (fuzz/targets/). The
+# third-party program source is not vendored: it is downloaded here, pinned to a
+# single upstream commit. No-op after the first run. See fetch_targets.sh.
+fuzz/fetch_targets.sh
+
 $DOCKER build -t bedrock/racebench:latest fuzz/
 
 # Pack into one docker-archive. `podman load` inside the initrd reads the

@@ -5,12 +5,7 @@ images.tar
 # exit; ignored here in case a build is interrupted before cleanup.
 fuzz/libvmcall.h
 
-# Build outputs. Every target is compiled from source in fuzz/Dockerfile
-# (make && make install), so these are never needed and must never be
-# committed - the prebuilt RaceBench binaries are explicitly untrusted (README).
-# A local build-sanity check leaves them behind; keep them out of git.
-*.o
-fuzz/targets/*/code/racebench/
-fuzz/targets/*/code/src/blackscholes
-fuzz/targets/*/code/src/fluidanimate
-fuzz/targets/*/code/src/streamcluster
+# The RaceBench target corpus is not vendored: fuzz/fetch_targets.sh downloads
+# it into fuzz/targets/ at build time, pinned to an upstream commit. Nothing
+# under targets/ is committed (program source, inputs, or build outputs).
+fuzz/targets/
