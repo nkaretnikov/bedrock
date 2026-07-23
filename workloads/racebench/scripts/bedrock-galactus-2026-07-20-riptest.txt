@@ -1,0 +1,110 @@
+--- guest-build: commit=eac12741a1e3+dirty images.tar=sha256:92da93bc2f906a87 ---
+--- guest-build: kernel=/nix/store/d4xl9kx4f65kk5967r3i6w4pls62n0yq-linux-6.18.0 ---
+--- guest-build: initrd=/nix/store/c17v0lazs7rrj7gmay3d4l1q54q6rah9-bedrock-podman-rootfs ---
+--- booting fork parent (boot_seed=0); tolerating early-boot late injects ---
+--- fork parent ready: vm_id=3 (boot_seed=0) ---
+--- bedrock coverage (fork): boot_seed=0 seed_base=1 plateau=50 max=500 preempt_period=0 watchpoint_pct=20 watchpoint_rearm=0 watchpoint_cull_epochs=2 watchpoint_cull_cap=256 watchpoint_dr=1 watchpoint_dr_len=4 watchpoint_dr_oneshot=1 watchpoint_dr_rip_lo=0x550000000000 watchpoint_dr_rip_hi=0x570000000000 ---
+fork 1 seed 1: coverage 0/60; slowest-plateau 1/50
+fork 1 seed 1: DR dr_conflicts=6 sites: gva=0x7f6d9087ef0c rip=0x563fdf95d678;gva=0x7f6d9087ee58 rip=0x563fdf95fbe2;gva=0x7f6d908be11c rip=0x563fdf958726;gva=0x7f6d908c2000 rip=0x563fdf9586e9;gva=0x7f6d908c3000 rip=0x563fdf95857f;gva=0x7f6d90a59000 rip=0x563fdf95857f
+fork 2 seed 2: coverage 0/60; slowest-plateau 2/50
+fork 2 seed 2: DR dr_conflicts=5 sites: gva=0x7f79fecb0f08 rip=0x56019edfc678;gva=0x7f79fee8f080 rip=0x56019edf76e9;gva=0x7f79feecfe84 rip=0x56019edf75ba;gva=0x7f79feed1000 rip=0x56019edf757f;gva=0x7f79fef1701c rip=0x56019edf75ba
+fork 3 seed 3: coverage 0/60; slowest-plateau 3/50
+fork 3 seed 3: DR dr_conflicts=7 sites: gva=0x7f92c5461f00 rip=0x55ccf45b7678;gva=0x7f92c5461f08 rip=0x55ccf45b7678;gva=0x55ccf45c03bc rip=0x55ccf45bb07b;gva=0x7f92c5417084 rip=0x55ccf45b2726;gva=0x7f92c54a111c rip=0x55ccf45b2726;gva=0x7f92c54a1dbc rip=0x55ccf45b257f;gva=0x7f92c5689380 rip=0x55ccf45b257f
+fork 4 seed 4: coverage 0/60; slowest-plateau 4/50
+fork 4 seed 4: DR dr_conflicts=8 sites: gva=0x7f9c41aa0f0c rip=0x560a53074678;gva=0x7f9c41ae5d8c rip=0x560a53074678;gva=0x7f9c41cc5200 rip=0x560a5307479c;gva=0x7f9c41a9b104 rip=0x560a5306f5ba;gva=0x7f9c41c7e110 rip=0x560a5306f5ba;gva=0x7f9c41d06904 rip=0x560a5306f5ba;gva=0x7f9c41d08180 rip=0x560a5306f57f
+fork 5 seed 5: coverage 0/60; slowest-plateau 5/50
+fork 5 seed 5: DR dr_conflicts=7 sites: gva=0x5592c8deccd1 rip=0x7f5e589ac389;gva=0x7f5e483adf08 rip=0x559b575c0678;gva=0x7f5e485ceda8 rip=0x559b575c079c;gva=0x7f5e483ec510 rip=0x559b575bb5ba;gva=0x7f5e483f430c rip=0x559b575bb57f;gva=0x7f5e48588000 rip=0x559b575bb57f;gva=0x7f5e4858b110 rip=0x559b575bb5ba
+fork 6 seed 6: coverage 0/60; slowest-plateau 6/50
+fork 6 seed 6: DR dr_conflicts=18 sites: gva=0x564f584cdd00 rip=0x564f584c77a2;gva=0x564f584cd5e0 rip=0x564f584c8920;gva=0x564f584cdd80 rip=0x564f584c8ba4;gva=0x7f92d28c4400 rip=0x564f584c579c;gva=0x7f92d294dd8c rip=0x564f584c5678;gva=0x7f92d290fb88 rip=0x564f584c579c;gva=0x7f92d2b30680 rip=0x564f584c579c;gva=0x7f92d28c4080 rip=0x564f584c5e5a
+fork 7 seed 7: coverage 0/60; slowest-plateau 7/50
+fork 7 seed 7: DR dr_conflicts=11 sites: gva=0x5576577d35e0 rip=0x5576577ce920;gva=0x5576577d3ee0 rip=0x5576577cebdb;gva=0x5576577d43bc rip=0x5576577cf07b;gva=0x5576577d3a20 rip=0x5576577ce98c;gva=0x5576577d3800 rip=0x5576577ce967;gva=0x7f3b46286080 rip=0x5576577c66e9;gva=0x7f3b462cc080 rip=0x5576577c66e9;gva=0x7f3b4630d900 rip=0x5576577c657f
+fork 8 seed 8: coverage 0/60; slowest-plateau 8/50
+fork 8 seed 8: DR dr_conflicts=8 sites: gva=0x5592c8decd4e rip=0x7f5e58a6c58d;gva=0x7feb9a48cf08 rip=0x562dd4f2c678;gva=0x7feb9a6b4680 rip=0x562dd4f2c79c;gva=0x7feb9a440100 rip=0x562dd4f276e9;gva=0x7feb9a4d3100 rip=0x562dd4f276e9;gva=0x7feb9a6b2400 rip=0x562dd4f2757f;gva=0x7feb9a6f7080 rip=0x562dd4f276e9
+fork 9 seed 9: coverage 0/60; slowest-plateau 9/50
+fork 9 seed 9: DR dr_conflicts=5 sites: gva=0x5592c8deccd1 rip=0x7f5e589ac389;gva=0x7f4498693080 rip=0x55c4ebb35e5a;gva=0x7f4498717dbc rip=0x55c4ebb3057f;gva=0x7f449871e30c rip=0x55c4ebb3057f;gva=0x7f44988b2000 rip=0x55c4ebb3057f
+fork 10 seed 10: coverage 0/60; slowest-plateau 10/50
+fork 10 seed 10: DR dr_conflicts=6 sites: gva=0x7fcdc6d2d408 rip=0x55898900f79c;gva=0x7fcdc6d30880 rip=0x55898900f79c;gva=0x7fcdc6d25110 rip=0x55898900a726;gva=0x7fcdc6db6000 rip=0x55898900a57f;gva=0x7fcdc6f4c000 rip=0x55898900a57f;gva=0x7fcdc6f99000 rip=0x55898900a57f
+fork 11 seed 11: coverage 0/60; slowest-plateau 11/50
+fork 11 seed 11: DR dr_conflicts=5 sites: gva=0x5592c8deccd1 rip=0x7f5e589ac389;gva=0x7fd952b58510 rip=0x55558418c5ba;gva=0x7fd952b6030c rip=0x55558418c57f;gva=0x7fd952d38e84 rip=0x55558418c5ba;gva=0x7fd952d7e454 rip=0x55558418c57f
+fork 12 seed 12: coverage 0/60; slowest-plateau 12/50
+fork 12 seed 12: DR dr_conflicts=4 sites: gva=0x7f95327df084 rip=0x55f9d4ba3726;gva=0x7f9532a4c300 rip=0x55f9d4ba357f;gva=0x7f9532a4fe80 rip=0x55f9d4ba357f;gva=0x7f9532a91180 rip=0x55f9d4ba357f
+fork 13 seed 13: coverage 0/60; slowest-plateau 13/50
+fork 13 seed 13: DR dr_conflicts=5 sites: gva=0x7f29f2215fc0 rip=0x561905ed4c4e;gva=0x7f29f1feb184 rip=0x561905ecd5ba;gva=0x7f29f2210d10 rip=0x561905ecd5ba;gva=0x7f29f2211084 rip=0x561905ecd5ba;gva=0x7f29f221301c rip=0x561905ecd5ba
+fork 14 seed 14: coverage 0/60; slowest-plateau 14/50
+fork 14 seed 14: DR dr_conflicts=6 sites: gva=0x5592c8decd4e rip=0x7f5e58a6c58d;gva=0x7f6d10abdf4c rip=0x5635d34d8be2;gva=0x7f6d1092530c rip=0x5635d34d157f;gva=0x7f6d10affa84 rip=0x5635d34d15ba;gva=0x7f6d10b42d10 rip=0x5635d34d15ba;gva=0x7f6d10b43084 rip=0x5635d34d15ba
+fork 15 seed 15: coverage 0/60; slowest-plateau 15/50
+fork 15 seed 15: DR dr_conflicts=6 sites: gva=0x7f75d4426d8c rip=0x564f9f25a678;gva=0x7f75d439d080 rip=0x564f9f25ae5a;gva=0x7f75d4395110 rip=0x564f9f255726;gva=0x7f75d442111c rip=0x564f9f255726;gva=0x7f75d4425200 rip=0x564f9f25557f;gva=0x7f75d442830c rip=0x564f9f25557f
+fork 16 seed 16: coverage 0/60; slowest-plateau 16/50
+fork 16 seed 16: DR dr_conflicts=6 sites: gva=0x7fbaff1ea200 rip=0x55d8cd6b979c;gva=0x7fbaff1ed240 rip=0x55d8cd6bbc4e;gva=0x7fbaff00900c rip=0x55d8cd6b46e9;gva=0x7fbaff1e7190 rip=0x55d8cd6b45ba;gva=0x7fbaff1f0480 rip=0x55d8cd6b457f;gva=0x7fbaff232200 rip=0x55d8cd6b457f
+fork 17 seed 17: coverage 0/60; slowest-plateau 17/50
+fork 17 seed 17: DR dr_conflicts=5 sites: gva=0x7fb48deaa200 rip=0x556e0932979c;gva=0x7fb48dc89080 rip=0x556e0932457f;gva=0x7fb48dcc3000 rip=0x556e0932457f;gva=0x7fb48de63110 rip=0x556e093245ba;gva=0x7fb48deabe80 rip=0x556e0932457f
+fork 18 seed 18: coverage 0/60; slowest-plateau 18/50
+fork 18 seed 18: DR dr_conflicts=9 sites: gva=0x5592c8dece4c rip=0x7f5e58a6c58d;gva=0x5592c8deccd1 rip=0x7f5e589ac389;gva=0x7f4d3bca0300 rip=0x55a2b055779c;gva=0x7f4d3ba78e64 rip=0x55a2b0559be2;gva=0x7f4d3ba34340 rip=0x55a2b0559c4e;gva=0x7f4d3ba78180 rip=0x55a2b055257f;gva=0x7f4d3bc53000 rip=0x55a2b055257f;gva=0x7f4d3bc9ee80 rip=0x55a2b055257f
+fork 19 seed 19: coverage 0/60; slowest-plateau 19/50
+fork 19 seed 19: DR dr_conflicts=5 sites: gva=0x7f6a1ab0af00 rip=0x55695246079c;gva=0x7f6a1a92e180 rip=0x55695245b57f;gva=0x7f6a1a972200 rip=0x55695245b57f;gva=0x7f6a1a976480 rip=0x55695245b57f;gva=0x7f6a1ab0ac10 rip=0x55695245b5ba
+fork 20 seed 20: coverage 0/60; slowest-plateau 20/50
+fork 20 seed 20: DR dr_conflicts=14 sites: gva=0x559982469d00 rip=0x5599824637a2;gva=0x5599824695e0 rip=0x559982464920;gva=0x7f0a5984c980 rip=0x55998246179c;gva=0x7f0a59852f18 rip=0x559982461678;gva=0x7f0a59ab882c rip=0x559982463c4e;gva=0x559982469b40 rip=0x559982464b82;gva=0x7f0a59856080 rip=0x55998245c57f;gva=0x7f0a59a30110 rip=0x55998245c5ba
+fork 21 seed 21: coverage 0/60; slowest-plateau 21/50
+fork 21 seed 21: DR dr_conflicts=6 sites: gva=0x7f85843de680 rip=0x55a61b01979c;gva=0x7f85841757c0 rip=0x55a61b01bc4e;gva=0x7f85841f6100 rip=0x55a61b0146e9;gva=0x7f85841f611c rip=0x55a61b014726;gva=0x7f85843d911c rip=0x55a61b014726;gva=0x7f85843de380 rip=0x55a61b01457f
+fork 22 seed 22: coverage 0/60; slowest-plateau 22/50
+fork 22 seed 22: DR dr_conflicts=5 sites: gva=0x7fda4ff8ee58 rip=0x561039656be2;gva=0x7fda4ff89104 rip=0x56103964f5ba;gva=0x7fda5016c480 rip=0x56103964f57f;gva=0x7fda50173f00 rip=0x56103964f57f;gva=0x7fda501af004 rip=0x56103964f5ba
+fork 23 seed 23: coverage 0/60; slowest-plateau 23/50
+fork 23 seed 23: DR dr_conflicts=20 sites: gva=0x562f77fcbd00 rip=0x562f77fc57a2;gva=0x562f77fcb5e0 rip=0x562f77fc6920;gva=0x562f77fcb740 rip=0x562f77fc6956;gva=0x562f77fcbb40 rip=0x562f77fc6b82;gva=0x562f77fcbd80 rip=0x562f77fc6ba4;gva=0x7f2bd8531104 rip=0x562f77fc3a4c;gva=0x562f77fcbee0 rip=0x562f77fc6bdb;gva=0x7f2bd84ef64c rip=0x562f77fc5c4e
+fork 24 seed 24: coverage 0/60; slowest-plateau 24/50
+fork 24 seed 24: DR dr_conflicts=8 sites: gva=0x7fcebe8db618 rip=0x560913ef9678;gva=0x7fcebe8e1f08 rip=0x560913ef9678;gva=0x7fcebeb09680 rip=0x560913ef979c;gva=0x7fcebeb4782c rip=0x560913efbc4e;gva=0x7fcebe8dc104 rip=0x560913ef45ba;gva=0x7fcebe8e0000 rip=0x560913ef457f;gva=0x7fcebeb0c480 rip=0x560913ef457f;gva=0x7fcebeb45d10 rip=0x560913ef45ba
+fork 25 seed 25: coverage 0/60; slowest-plateau 25/50
+fork 25 seed 25: DR dr_conflicts=9 sites: gva=0x560b5eded2c8 rip=0x560b5ede2bbd;gva=0x7f8196b907c0 rip=0x560b5ede6c4e;gva=0x7f8196df95c0 rip=0x560b5ede6c4e;gva=0x7f8196c16d08 rip=0x560b5ede6c4e;gva=0x7f8196df9240 rip=0x560b5ede6c4e;gva=0x7f8196b87084 rip=0x560b5eddf726;gva=0x7f8196c11dbc rip=0x560b5eddf57f;gva=0x7f8196e39180 rip=0x560b5eddf57f
+fork 26 seed 26: coverage 0/60; slowest-plateau 26/50
+fork 26 seed 26: DR dr_conflicts=6 sites: gva=0x7f875e4bf300 rip=0x563bc376079c;gva=0x7f875e473b44 rip=0x563bc3762be2;gva=0x7f875e24b110 rip=0x563bc375b726;gva=0x7f875e24d084 rip=0x563bc375b726;gva=0x7f875e2db00c rip=0x563bc375b6e9;gva=0x7f875e4bde80 rip=0x563bc375b57f
+fork 27 seed 27: coverage 0/60; slowest-plateau 27/50
+fork 27 seed 27: DR dr_conflicts=5 sites: gva=0x7f58cd995880 rip=0x55d64ccaa79c;gva=0x7f58cda1a00c rip=0x55d64cca56e9;gva=0x7f58cda1d30c rip=0x55d64cca557f;gva=0x7f58cdbb1000 rip=0x55d64cca557f;gva=0x7f58cdbf911c rip=0x55d64cca5726
+fork 28 seed 28: coverage 0/60; slowest-plateau 28/50
+fork 28 seed 28: DR dr_conflicts=15 sites: gva=0x5592c8deccd1 rip=0x7f5e589ac389;gva=0x561a86957d00 rip=0x561a869517a2;gva=0x561a86957d80 rip=0x561a86952ba4;gva=0x561a869575e0 rip=0x561a86952920;gva=0x7f601cf38da8 rip=0x561a8694f79c;gva=0x561a86957a20 rip=0x561a8695298c;gva=0x7f601cd0fac0 rip=0x561a8694a5ba;gva=0x7f601cf7c084 rip=0x561a8694a5ba
+fork 29 seed 29: coverage 0/60; slowest-plateau 29/50
+fork 29 seed 29: DR dr_conflicts=13 sites: gva=0x55c958d1cd00 rip=0x55c958d167a2;gva=0x55c958d1cd80 rip=0x55c958d10633;gva=0x55c958d1ca20 rip=0x55c958d1798c;gva=0x55c958d1c5e0 rip=0x55c958d17920;gva=0x7f4e1c616680 rip=0x55c958d1479c;gva=0x55c958d1cee0 rip=0x55c958d17bdb;gva=0x7f4e1c3ea080 rip=0x55c958d0f6e9;gva=0x7f4e1c42e11c rip=0x55c958d0f726
+fork 30 seed 30: coverage 0/60; slowest-plateau 30/50
+fork 30 seed 30: DR dr_conflicts=6 sites: gva=0x7f1a876cc680 rip=0x558b5ca3279c;gva=0x7f1a876c9200 rip=0x558b5ca3279c;gva=0x7f1a874a8080 rip=0x558b5ca2d57f;gva=0x7f1a874e411c rip=0x558b5ca2d726;gva=0x7f1a874e4d80 rip=0x558b5ca2d57f;gva=0x7f1a8770a904 rip=0x558b5ca2d5ba
+fork 31 seed 31: coverage 0/60; slowest-plateau 31/50
+fork 31 seed 31: DR dr_conflicts=7 sites: gva=0x7fc062312d98 rip=0x5574c72a9678;gva=0x7fc0624f2200 rip=0x5574c72a979c;gva=0x7fc0624f214c rip=0x5574c72abc4e;gva=0x7fc0624aa11c rip=0x5574c72a4726;gva=0x7fc0624ab110 rip=0x5574c72a45ba;gva=0x7fc0624ed004 rip=0x5574c72a4726;gva=0x7fc06253301c rip=0x5574c72a4726
+fork 32 seed 32: coverage 0/60; slowest-plateau 32/50
+fork 32 seed 32: DR dr_conflicts=7 sites: gva=0x7f14720cc080 rip=0x55efabab079c;gva=0x55efabab93bc rip=0x55efabab407b;gva=0x7f1472338300 rip=0x55efabab0e5a;gva=0x7f14720c4110 rip=0x55efabaab726;gva=0x7f1472336e80 rip=0x55efabaab57f;gva=0x7f1472378180 rip=0x55efabaab57f;gva=0x7f147237c400 rip=0x55efabaab57f
+fork 33 seed 33: coverage 0/60; slowest-plateau 33/50
+fork 33 seed 33: DR dr_conflicts=6 sites: gva=0x7ff6e5cf8680 rip=0x5574c4fd879c;gva=0x7ff6e5b15d08 rip=0x5574c4fdabe2;gva=0x7ff6e5aca69c rip=0x5574c4fd35ba;gva=0x7ff6e5b0e004 rip=0x5574c4fd35ba;gva=0x7ff6e5b15000 rip=0x5574c4fd357f;gva=0x7ff6e5d36904 rip=0x5574c4fd35ba
+fork 34 seed 34: coverage 0/60; slowest-plateau 34/50
+fork 34 seed 34: DR dr_conflicts=7 sites: gva=0x7f3693905200 rip=0x55ed1d4f1a4c;gva=0x7f3693905204 rip=0x55ed1d4f1a4c;gva=0x7f36936e0e58 rip=0x55ed1d4f3be2;gva=0x7f36936da104 rip=0x55ed1d4ec726;gva=0x7f3693725e00 rip=0x55ed1d4ec57f;gva=0x7f3693908380 rip=0x55ed1d4ec57f;gva=0x7f369394601c rip=0x55ed1d4ec726
+fork 35 seed 35: coverage 0/60; slowest-plateau 35/50
+fork 35 seed 35: DR dr_conflicts=5 sites: gva=0x7faabb1f8904 rip=0x55be02996678;gva=0x7faabb1b8100 rip=0x55be0299157f;gva=0x7faabb1fd100 rip=0x55be029916e9;gva=0x7faabb1ff080 rip=0x55be029916e9;gva=0x7faabb3d911c rip=0x55be02991726
+fork 36 seed 36: coverage 0/60; slowest-plateau 36/50
+fork 36 seed 36: DR dr_conflicts=6 sites: gva=0x7f82f9355ce4 rip=0x55d18b385be2;gva=0x7f82f9355d08 rip=0x55d18b385be2;gva=0x7f82f9355000 rip=0x55d18b37e57f;gva=0x7f82f94eb000 rip=0x55d18b37e57f;gva=0x7f82f9578180 rip=0x55d18b37e57f;gva=0x7f82f957b080 rip=0x55d18b37e6e9
+fork 37 seed 37: coverage 0/60; slowest-plateau 37/50
+fork 37 seed 37: DR dr_conflicts=7 sites: gva=0x7fcb8ea01f00 rip=0x564fd6866678;gva=0x7fcb8ec26200 rip=0x564fd686679c;gva=0x7fcb8ec2614c rip=0x564fd6868c4e;gva=0x7fcb8ebde11c rip=0x564fd6861726;gva=0x7fcb8ec29000 rip=0x564fd686157f;gva=0x7fcb8ec67900 rip=0x564fd686157f;gva=0x7fcb8ec67904 rip=0x564fd68615ba
+fork 38 seed 38: coverage 0/60; slowest-plateau 38/50
+fork 38 seed 38: DR dr_conflicts=12 sites: gva=0x56140be9b5e0 rip=0x56140be96920;gva=0x56140be9bd80 rip=0x56140be96ba4;gva=0x56140be9bb40 rip=0x56140be96b82;gva=0x7fdea9fc6e58 rip=0x56140be95be2;gva=0x7fdeaa00a00c rip=0x56140be8e6e9;gva=0x7fdeaa00a200 rip=0x56140be8e57f
+fork 39 seed 39: coverage 0/60; slowest-plateau 39/50
+fork 39 seed 39: DR dr_conflicts=5 sites: gva=0x7f81328d2200 rip=0x560449a2ee5a;gva=0x7f813283e104 rip=0x560449a295ba;gva=0x7f813283e804 rip=0x560449a295ba;gva=0x7f8132887000 rip=0x560449a296e9;gva=0x7f8132af6200 rip=0x560449a2957f
+fork 40 seed 40: coverage 0/60; slowest-plateau 40/50
+fork 40 seed 40: DR dr_conflicts=13 sites: gva=0x5592c8deccd1 rip=0x7f5e589ac389;gva=0x55dbbe637f80 rip=0x55dbbe62b800;gva=0x55dbbe6375e0 rip=0x55dbbe632920;gva=0x7f8109503f00 rip=0x55dbbe62f678;gva=0x7f8109548d8c rip=0x55dbbe62f678;gva=0x7f81094bf080 rip=0x55dbbe62fe5a;gva=0x7f8109503180 rip=0x55dbbe62a57f;gva=0x7f8109547200 rip=0x55dbbe62a57f
+fork 41 seed 41: coverage 0/60; slowest-plateau 41/50
+fork 41 seed 41: DR dr_conflicts=8 sites: gva=0x5592c8decd4e rip=0x7f5e58a6c58d;gva=0x7f3217ca6d98 rip=0x56042d1e4678;gva=0x7f3217e89680 rip=0x56042d1e479c;gva=0x7f3217e86140 rip=0x56042d1e6ebb;gva=0x7f3217c5c104 rip=0x56042d1df5ba;gva=0x7f3217ca6e00 rip=0x56042d1df57f;gva=0x7f3217e3f110 rip=0x56042d1df5ba;gva=0x7f3217ec5d10 rip=0x56042d1df5ba
+fork 42 seed 42: coverage 0/60; slowest-plateau 42/50
+fork 42 seed 42: DR dr_conflicts=7 sites: gva=0x5592c8decd4e rip=0x7f5e58a6c58d;gva=0x5592c8deccd1 rip=0x7f5e589ac389;gva=0x7fd3028f07fc rip=0x562bee48ebe2;gva=0x7fd30268b100 rip=0x562bee4876e9;gva=0x7fd302869080 rip=0x562bee4876e9;gva=0x7fd3028eed10 rip=0x562bee4875ba;gva=0x7fd3028f001c rip=0x562bee487726
+fork 43 seed 43: coverage 0/60; slowest-plateau 43/50
+fork 43 seed 43: DR dr_conflicts=6 sites: gva=0x7fde8538e400 rip=0x55b908b1979c;gva=0x7fde855fa300 rip=0x55b908b1979c;gva=0x7fde85388084 rip=0x55b908b14726;gva=0x7fde853d9880 rip=0x55b908b1457f;gva=0x7fde85412dbc rip=0x55b908b1457f;gva=0x7fde8563a180 rip=0x55b908b1457f
+fork 44 seed 44: coverage 0/60; slowest-plateau 44/50
+fork 44 seed 44: DR dr_conflicts=4 sites: gva=0x7f24599c2dbc rip=0x55f3b181557f;gva=0x7f2459b5d000 rip=0x55f3b181557f;gva=0x7f2459ba511c rip=0x55f3b1815726;gva=0x7f2459baa380 rip=0x55f3b181557f
+fork 45 seed 45: coverage 0/60; slowest-plateau 45/50
+fork 45 seed 45: DR dr_conflicts=15 sites: gva=0x558e63163d00 rip=0x558e6315d7a2;gva=0x558e63163ee0 rip=0x558e6315ebdb;gva=0x558e63163d80 rip=0x558e6315eba4;gva=0x558e631635e0 rip=0x558e6315e920;gva=0x7f4133132f00 rip=0x558e6315b678;gva=0x558e63163b40 rip=0x558e6315eb82;gva=0x7f4133179100 rip=0x558e631566e9;gva=0x7f413330d000 rip=0x558e6315657f
+fork 46 seed 46: coverage 0/60; slowest-plateau 46/50
+fork 46 seed 46: DR dr_conflicts=4 sites: gva=0x7fd1f4081110 rip=0x560e7fc2f726;gva=0x7fd1f40c6184 rip=0x560e7fc2f5ba;gva=0x7fd1f42f5000 rip=0x560e7fc2f57f;gva=0x7fd1f433301c rip=0x560e7fc2f726
+fork 47 seed 47: coverage 0/60; slowest-plateau 47/50
+fork 47 seed 47: DR dr_conflicts=5 sites: gva=0x7fed768c904c rip=0x560e224f9c4e;gva=0x7fed768c2510 rip=0x560e224f25ba;gva=0x7fed76a5e000 rip=0x560e224f257f;gva=0x7fed76ae8080 rip=0x560e224f257f;gva=0x7fed76aea01c rip=0x560e224f25ba
+fork 48 seed 48: coverage 0/60; slowest-plateau 48/50
+fork 48 seed 48: DR dr_conflicts=5 sites: gva=0x7f4b87b48800 rip=0x55b888f8e79c;gva=0x7f4b87919110 rip=0x55b888f89726;gva=0x7f4b879a2900 rip=0x55b888f8957f;gva=0x7f4b879a511c rip=0x55b888f89726;gva=0x7f4b87bcb904 rip=0x55b888f895ba
+fork 49 seed 49: coverage 0/60; slowest-plateau 49/50
+fork 49 seed 49: DR dr_conflicts=6 sites: gva=0x55e4da7743bc rip=0x55e4da76f07b;gva=0x7fe67f2047d8 rip=0x55e4da76dbe2;gva=0x7fe67f179000 rip=0x55e4da76657f;gva=0x7fe67f17c110 rip=0x55e4da7665ba;gva=0x7fe67f202d00 rip=0x55e4da76657f;gva=0x7fe67f206180 rip=0x55e4da76657f
+fork 50 seed 50: coverage 0/60; slowest-plateau 50/50
+fork 50 seed 50: DR dr_conflicts=5 sites: gva=0x7f5d80fbe4fc rip=0x56418d3dec4e;gva=0x7f5d80f28c00 rip=0x56418d3d757f;gva=0x7f5d80f2a100 rip=0x56418d3d757f;gva=0x7f5d80f2a104 rip=0x56418d3d75ba;gva=0x7f5d80fb2900 rip=0x56418d3d757f
+blackscholes: reached 0/20 in 50 forks -> bug_ids: 
+streamcluster: reached 0/20 in 50 forks -> bug_ids: 
+fluidanimate: reached 0/20 in 50 forks -> bug_ids: 
+TOTAL bedrock coverage: 0/60 (boot_seed=0, 50 forks, 0 late-inject aborts)
